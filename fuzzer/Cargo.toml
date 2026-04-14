@@ -1,0 +1,26 @@
+[package]
+name = "th9800-fuzzer"
+version = "0.1.0"
+authors = ["x"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+[[bin]]
+name = "th9800-fuzzer"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = "0.51"
+heapless = "0.8"
+
+[build-dependencies]
+embuild = "0.33"

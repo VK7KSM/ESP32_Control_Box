@@ -1,0 +1,9 @@
+# 独立桌面模拟器项目配置
+# 覆盖父目录 ../.cargo/config.toml 中的 ESP32 目标设置
+
+[build]
+target = "x86_64-pc-windows-msvc"
+
+# 覆盖父目录的 build-std（桌面不需要从源码构建 std）
+[unstable]
+build-std = []

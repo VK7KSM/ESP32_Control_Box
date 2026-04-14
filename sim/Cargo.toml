@@ -1,0 +1,12 @@
+[package]
+name = "elfradio-sim"
+version = "0.1.0"
+edition = "2021"
+
+# 这是独立的桌面仿真项目，与 ESP32 固件完全隔离
+# 使用系统默认 stable toolchain（不受 ../rust-toolchain.toml 影响）
+
+[dependencies]
+embedded-graphics = "0.8"
+embedded-graphics-simulator = { version = "0.6", default-features = false }
+profont = "0.7"

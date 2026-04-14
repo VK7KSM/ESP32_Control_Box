@@ -1,0 +1,29 @@
+/.vscode
+/.embuild
+/target
+/Cargo.lock
+
+# 子项目编译产物（体积巨大）
+/examples/elfradio-box/target/
+/calibrate/target/
+/fuzzer/target/
+/sim/target/
+
+# 运行时生成文件
+/examples/elfradio-box/recordings/
+
+# 本地工具 / IDE 数据
+/tmp/
+/.claude/
+**/.codegraph/
+/.cargo/settings.local.json
+__pycache__/
+*.pyc
+
+# 含本机绝对路径的文档（不对外发布）
+/CLAUDE.md
+/AGENTS.md
+/TH9800-原始数据真值表.md
+/ElfRadio_PC通信问题说明.md
+/TH-9800-协议未定项交接给Claude.md
+/TH-9800 面板通信协议逆向分析总结报告（整合修正版）v4.0.md

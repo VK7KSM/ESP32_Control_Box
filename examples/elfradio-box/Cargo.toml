@@ -1,0 +1,15 @@
+[package]
+name = "elfradio-box"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm = "0.28"
+serialport = "4.9"
+cpal = "0.15"
+hound = "3.5"
+chrono = "0.4"
+rfd   = "0.14"
+rodio = { version = "0.17", default-features = false, features = ["symphonia-all"] }
+msedge-tts = "0.2"
+nnnoiseless = "0.5"

@@ -1,0 +1,24 @@
+[package]
+name = "elfradio-calibrate"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[[bin]]
+name = "elfradio-calibrate"
+harness = false
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = "0.51"
+embedded-graphics = "0.8"
+display-interface-spi = "0.5"
+mipidsi = "0.8"
+profont = "0.7"
+
+[build-dependencies]
+embuild = "0.33"

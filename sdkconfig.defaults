@@ -1,0 +1,23 @@
+# Rust often needs a bit of an extra main task stack size compared to C (the default is 3K)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16000
+
+# Use this to set FreeRTOS kernel tick frequency to 1000 Hz (100 Hz by default).
+# This allows to use 1 ms granularity for thread sleeps (10 ms by default).
+#CONFIG_FREERTOS_HZ=1000
+
+# Workaround for https://github.com/espressif/esp-idf/issues/7631
+#CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
+#CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=n
+
+# 原生 USB OTG 口已被 TinyUSB CDC-ACM 接管，禁用辅助 console
+# 不能只删除此行——Kconfig 默认值仍为 USB_SERIAL_JTAG，会占住 USB PHY 阻止 TinyUSB 初始化
+# 主 console 保持 UART0（走 CH343，不受影响）
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# TinyUSB CDC-ACM 设备模式（原生 USB OTG 口专门给上位机通信）
+CONFIG_TINYUSB_CDC_ENABLED=y
+
+# ESP32-S3 N16R8 Octal PSRAM 启用（8MB，双缓冲帧缓冲分配到 PSRAM）
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y

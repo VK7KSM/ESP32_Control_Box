@@ -1,0 +1,22 @@
+[build]
+target = "xtensa-esp32s3-espidf"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = [ "--cfg",  "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU="esp32s3"
+# Note: this variable is not used by the pio builder (`cargo build --features pio`)
+ESP_IDF_VERSION = "v5.3.3"
+# TinyUSB 头文件与 esp-idf-sys bindgen 不兼容（两个问题）：
+# 1. osal_freertos.h 的 taskENTER_CRITICAL() 在 Xtensa 需要 mux 参数，CFG_TUSB_MCU 未传入 bindgen
+# 2. cdc_desc_func_* 结构体 packed+align 冲突导致 Rust 编译失败 (E0588)
+# 解决：-U 阻止 esp-idf-sys 静态 bindings.h 包含 TinyUSB 头文件
+# TinyUSB 组件仍由 CMake 正常编译链接，Rust 侧使用 pc_comm.rs 手动 FFI 声明
+BINDGEN_EXTRA_CLANG_ARGS = "-UESP_IDF_COMP_ESPRESSIF__ESP_TINYUSB_ENABLED"
+
