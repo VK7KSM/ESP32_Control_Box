@@ -6,15 +6,18 @@
 use std::path::PathBuf;
 
 pub struct AppConfig {
-    pub tts_voice:  String,
-    pub denoise_db: f32,
+    pub tts_voice:        String,
+    pub denoise_db:       f32,
+    /// 上次成功烧录的固件版本（如 "v0.1.0"），空字符串表示未记录
+    pub firmware_version: String,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            tts_voice:  crate::tts::DEFAULT_VOICE.to_string(),
-            denoise_db: 0.0,
+            tts_voice:        crate::tts::DEFAULT_VOICE.to_string(),
+            denoise_db:       0.0,
+            firmware_version: String::new(),
         }
     }
 }
@@ -41,8 +44,9 @@ pub fn load_config() -> AppConfig {
         let key   = parts.next().unwrap_or("").trim();
         let value = parts.next().unwrap_or("").trim();
         match key {
-            "tts_voice"  => cfg.tts_voice  = value.to_string(),
-            "denoise_db" => cfg.denoise_db = value.parse().unwrap_or(0.0),
+            "tts_voice"        => cfg.tts_voice        = value.to_string(),
+            "denoise_db"       => cfg.denoise_db       = value.parse().unwrap_or(0.0),
+            "firmware_version" => cfg.firmware_version = value.to_string(),
             _ => {}
         }
     }
@@ -51,8 +55,8 @@ pub fn load_config() -> AppConfig {
 
 pub fn save_config(cfg: &AppConfig) -> Result<(), String> {
     let content = format!(
-        "# elfRadio BOX 配置文件\ntts_voice={}\ndenoise_db={}\n",
-        cfg.tts_voice, cfg.denoise_db
+        "# elfRadio BOX 配置文件\ntts_voice={}\ndenoise_db={}\nfirmware_version={}\n",
+        cfg.tts_voice, cfg.denoise_db, cfg.firmware_version
     );
     std::fs::write(config_path(), content)
         .map_err(|e| format!("保存配置失败: {}", e))

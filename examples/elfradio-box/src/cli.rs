@@ -13,6 +13,16 @@ use crate::state::SharedState;
 use crate::audio;
 use crate::tts;
 
+// ===== 收听选项 =====
+
+#[derive(Debug)]
+pub struct ListenOptions {
+    pub duration:     Option<std::time::Duration>,  // --duration N[s|m|h]
+    pub count:        Option<u32>,                  // --count N（录完 N 次后停止）
+    pub idle_timeout: Option<std::time::Duration>,  // --idle N[s|m]（无信号 N 时间后停止）
+    pub audio:        bool,                         // --audio（开启直通播放）
+}
+
 // ===== 命令枚举 =====
 
 #[derive(Debug)]
@@ -31,6 +41,16 @@ pub enum CliCommand {
     PttOff,                                       // 强制关闭 PTT
     PttTx(String),                                // PTT + 播放音频文件
     Tts { text: String, voice: Option<String> }, // TTS 合成 + PTT 发射
+
+    // ── 固件管理（不需要 OTG 串口）──────────────────────────────
+    Flash {
+        yes:        bool,           // --yes 跳过所有交互确认
+        flash_port: Option<String>, // --flash-port 指定 UART 烧录口
+    },
+    FlashCheck,                     // flash --check 仅查询版本
+
+    // ── 被动收听（长期运行，无 TUI）──────────────────────────────
+    Listen(ListenOptions),
 }
 
 // ===== 参数解析 =====
@@ -199,6 +219,60 @@ pub fn parse_args() -> Result<CliArgs, String> {
             CliCommand::Tts { text, voice }
         }
 
+        "flash" | "firmware" | "update" => {
+            let mut yes        = false;
+            let mut flash_port: Option<String> = None;
+            let mut check_only = false;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--yes" | "-y"    => { yes = true; i += 1; }
+                    "--check"         => { check_only = true; i += 1; }
+                    "--flash-port"    => {
+                        i += 1;
+                        if i >= args.len() { return Err("--flash-port 后需要串口名，如 COM9".into()); }
+                        flash_port = Some(args[i].clone());
+                        i += 1;
+                    }
+                    _ => { i += 1; }  // 忽略未知选项
+                }
+            }
+            if check_only { CliCommand::FlashCheck }
+            else          { CliCommand::Flash { yes, flash_port } }
+        }
+
+        "listen" | "rx" | "monitor-rx" => {
+            let mut duration:     Option<std::time::Duration> = None;
+            let mut count:        Option<u32>                 = None;
+            let mut idle_timeout: Option<std::time::Duration> = None;
+            let mut audio = false;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--duration" | "-d" => {
+                        i += 1;
+                        if i >= args.len() { return Err("--duration 后需要时长，如 30m / 2h / 3600s".into()); }
+                        duration = Some(parse_duration(&args[i])?);
+                        i += 1;
+                    }
+                    "--count" | "-n" => {
+                        i += 1;
+                        if i >= args.len() { return Err("--count 后需要整数".into()); }
+                        count = Some(args[i].parse::<u32>()
+                            .map_err(|_| format!("--count 必须是正整数，收到: {}", args[i]))?);
+                        i += 1;
+                    }
+                    "--idle" | "-i" => {
+                        i += 1;
+                        if i >= args.len() { return Err("--idle 后需要时长，如 10m".into()); }
+                        idle_timeout = Some(parse_duration(&args[i])?);
+                        i += 1;
+                    }
+                    "--audio" => { audio = true; i += 1; }
+                    _ => { i += 1; }
+                }
+            }
+            CliCommand::Listen(ListenOptions { duration, count, idle_timeout, audio })
+        }
+
         other => return Err(format!("未知命令: {}，运行 'elfradio-box help' 查看帮助", other)),
     };
 
@@ -211,6 +285,27 @@ fn parse_side(s: &str) -> Result<u8, String> {
         "L" | "LEFT" => Ok(0),
         "R" | "RIGHT" => Ok(1),
         other => Err(format!("侧边必须是 L 或 R，收到: {}", other)),
+    }
+}
+
+/// 解析时长字符串：支持 30m / 2h / 90s / 3600（默认秒）
+pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    if let Some(n) = s.strip_suffix('h') {
+        n.parse::<u64>()
+            .map(|v| std::time::Duration::from_secs(v * 3600))
+            .map_err(|_| format!("时长格式错误: {}（示例: 30m / 2h / 90s）", s))
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.parse::<u64>()
+            .map(|v| std::time::Duration::from_secs(v * 60))
+            .map_err(|_| format!("时长格式错误: {}（示例: 30m / 2h / 90s）", s))
+    } else if let Some(n) = s.strip_suffix('s') {
+        n.parse::<u64>()
+            .map(std::time::Duration::from_secs)
+            .map_err(|_| format!("时长格式错误: {}（示例: 30m / 2h / 90s）", s))
+    } else {
+        s.parse::<u64>()
+            .map(std::time::Duration::from_secs)
+            .map_err(|_| format!("时长格式错误: {}（示例: 30m / 2h / 90s）", s))
     }
 }
 
@@ -263,6 +358,30 @@ pub fn print_help() {
 ━━━ 电源 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   power-toggle             电台开/关机（GPIO8 脉冲 1.2 秒）
 
+━━━ 固件管理 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  flash [选项]             从 GitHub 下载最新固件并烧录 ESP32
+                            （不需要 OTG 线，只需插入 UART 调试线）
+                            --yes              跳过所有确认提示（自动化脚本专用）
+                            --flash-port <P>   指定 UART 烧录口（如 COM9），省略则自动检测
+  flash --check            仅查询 GitHub 最新版本，不下载不烧录
+                            例: flash
+                            例: flash --yes
+                            例: flash --yes --flash-port COM9
+
+━━━ 被动收听 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  listen [选项]            被动监听电台信号，打滚动日志，自动保存 RX 录音到 recordings/
+                            多个终止条件同时有效，任意一个先触发即停止
+                            Ctrl+C 随时终止（会先保存正在进行的录音再退出）
+                            --duration, -d <N[s|m|h]>  运行时长（如 30m, 1h, 3600s）
+                            --count,    -n <N>          录完 N 次信号后停止
+                            --idle,     -i <N[s|m]>    最后一次信号结束 N 时间内无新活动则停止
+                            --audio                    开启接收音频直通（CM108 → PC 耳机）
+                            例: listen                  → 无限监听，Ctrl+C 结束
+                            例: listen -d 30m           → 运行 30 分钟后结束
+                            例: listen -n 5             → 录到 5 次信号后结束
+                            例: listen -d 1h --idle 20m → 最多 1 小时，20 分钟无信号提前结束
+                            例: listen --audio -d 2h    → 开音频直通，运行 2 小时
+
 ━━━ 示例 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   elfradio-box --port COM8 monitor
   elfradio-box --port COM8 set-freq L 433550
@@ -270,6 +389,10 @@ pub fn print_help() {
   elfradio-box --port COM8 ptt 5
   elfradio-box --port COM8 ptt-tx cq.wav
   elfradio-box --port COM8 power-toggle
+  elfradio-box flash --check
+  elfradio-box flash --yes
+  elfradio-box --port COM8 listen -d 30m
+  elfradio-box --port COM8 listen -n 3 --audio
 
   台长呼号: VK7KSM   73!"#.cyan());
     println!();
@@ -285,8 +408,10 @@ pub fn run_command(
     event_rx: &mpsc::Receiver<SerialEvent>,
 ) -> Result<(), String> {
     match cmd {
-        CliCommand::Help | CliCommand::Monitor => {
-            // 这两个命令在 main.rs 中特殊处理，不应到达这里
+        CliCommand::Help | CliCommand::Monitor
+        | CliCommand::Flash { .. } | CliCommand::FlashCheck
+        | CliCommand::Listen(_) => {
+            // 这些命令在 main.rs 中特殊处理，不应到达这里
             unreachable!()
         }
 

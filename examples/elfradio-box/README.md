@@ -3,8 +3,8 @@
 业余无线电控制盒 PC 上位机，通过 USB 串口与 ESP32-S3 控制盒通信，实现对 TYT TH-9800 电台的软件控制。
 
 - **台长呼号**：VK7KSM
-- **串口连接**：自动检测 Espressif USB VID（0x303A），或通过 `--port` 手动指定（如 `COM3`、`COM8` 等，以设备管理器实际显示为准）
-- **通信协议**：`[0xAA][0x55][Type][LenLo][LenHi][Payload][CRC16-CCITT]`
+- **串口连接**：自动检测 Espressif USB VID（0x303A），或通过 `--port` 手动指定（如 `COM8` 等，以设备管理器实际显示为准）
+- **通信协议**：`[0xAA][0x55][Type][LenLo][LenHi][Payload][CRC16-CCITT_Lo][CRC16-CCITT_Hi]`
 
 ---
 
@@ -14,10 +14,16 @@
 
 ```bash
 cd /c/eh/examples/elfradio-box
-cargo build
+cargo build --release
 ```
 
-输出：`target/x86_64-pc-windows-msvc/debug/elfradio-box.exe`
+输出：`target/x86_64-pc-windows-msvc/release/elfradio-box.exe`
+
+### 部署
+
+```bash
+cp target/x86_64-pc-windows-msvc/release/elfradio-box.exe "/c/Users/x/OneDrive/桌面/elfradio-box/"
+```
 
 ### 运行方式
 
@@ -28,57 +34,94 @@ cargo build
 
 ---
 
+## 主菜单
+
+双击或不带参数运行时显示主菜单：
+
+```
+  [1] 监听模式     实时监听、显示状态、录音、PTT 发射
+  [2] 连接状态     ESP32 / 电台 / 声卡信息
+  [3] 设置         TTS 声线 / 降噪默认值
+  [4] 固件更新     联网检查并烧录最新 ESP32 固件
+  [0] 退出
+```
+
+ESP32 未连接时程序不退出，等待连接直到 Ctrl+C。
+
+---
+
 ## TUI 监听界面
 
-双击或运行 `elfradio-box.exe` 后，选择 **[1] 监听模式** 进入 TUI 实时界面。
-
-也可通过 CLI 直接进入，跳过主菜单：
+主菜单选 **[1]**，或 CLI 直接进入：
 
 ```
-elfradio-box.exe --port <串口号> monitor
+elfradio-box.exe [--port <串口号>] monitor
 ```
 
-### TUI 界面说明
+### 界面布局
 
 ```
-elfRadio  RIGHT MAIN  FM 433.550.000 MHz  HIGH  S3          OK 监听中  空闲
+elfRadio  RIGHT MAIN  FM 433.550.000 MHz  HIGH  S3  PgUp/PgDn  OK 监听中  空闲
 ──────────────────────────────────────────────────────────────────────────────
-（接收消息区：BUSY 录音保存记录等）
-
-
-
+┌─  001 RX  ─── 14:30:22 ──────────────────────────────────────────────────┐
+│ LEFT  433.550.000  LOW  DCS                                               │
+│  RX   OK  recordings/RX_20260415_143022_433_550_000_18s_seg1.wav (18s)   │
+└────────────────────────────────────────────────────────────────────────────┘
 
 ──────────────────────────────────────────────────────────────────────────────
-L:左频率 R:右频率  M:切MAIN  P:长按发射  O:开关机  ↑↓:旋钮  V+←→:音量  Q+←→:静噪  W+↑↓:功率  T+↑↓:亚音  Esc:退出
-Radio:OK PC:OK  L: VOL 60 % / SQL 25 %  R: VOL 0 % / SQL 0 %
+> 输入文字后按 Enter 发射（Tab 聚焦）
+──────────────────────────────────────────────────────────────────────────────
+L:左频  R:右频  M:MAIN  P:发射  F:文件  Tab:TTS  O:电源  ↑↓:旋钮  V+←→:音量  Q+←→:静噪  W+↑↓:功率  T+↑↓:亚音  N+←→:降噪  Esc:退出
+Radio:OK PC:OK  L: VOL 60% / SQL 25%  R: VOL 0% / SQL 0%  DNR:--
 ```
 
-### TUI 键盘操作
+### 键盘操作
 
 | 按键 | 功能 |
 |---|---|
 | `L` | 输入 LEFT 侧频率（6 位数字，自动切 MAIN）|
 | `R` | 输入 RIGHT 侧频率（6 位数字，自动切 MAIN）|
 | `M` | 切换 MAIN 侧（LEFT ↔ RIGHT）|
-| `P`（长按 0.3s）| PTT 发射，松开停止；最长 30 秒后自动停止（与 ESP32 看门狗同步）|
+| `P`（长按 0.3s）| PTT 发射，松开停止；标题栏倒计时 30s→0，到期自动停止 |
+| `F` | 弹出文件选择对话框，PTT + 播放（支持 WAV/MP3/OGG/FLAC/AAC/M4A，最长 30s）|
+| `Tab` | 聚焦底部 TTS 文字输入框（再按 Tab 或点击其他区域失焦）|
+| `Enter`（输入框聚焦时）| TTS 合成输入的文字 → PTT 发射，录音保存到 `recordings/` |
 | `O` + `Y` | 电台开关机（GPIO8 脉冲）|
 | `↑` / `↓` | MAIN 侧旋钮步进（调频）|
-| `V` + `←` / `→` | 音量 ±5% |
+| `←` / `→` | 音量 ±5%（裸键）|
+| `V` + `←` / `→` | 音量 ±5%（修饰键模式，与裸键等效）|
 | `Q` + `←` / `→` | 静噪 ±5% |
 | `W` + `↑` / `↓` | 功率循环（LOW → MID → HIGH）|
 | `T` + `↑` / `↓` | 亚音模式循环（OFF → ENC → T/R → DCS）|
-| `Esc` | 返回主菜单 |
+| `N` + `←` / `→` | 降噪强度 ±10（0=关闭，10-100=启用 RNNoise）|
+| `PgUp` / `PgDn` | 消息区翻页（历史无限保留，重连后不丢失）|
+| `Esc` | 先清 TTS 输入框；再按退出 TUI，返回主菜单 |
 
-### 状态栏说明
+### 标题栏状态
 
-- 右上角：`OK 监听中  空闲` / `RX 接收中`（蓝底）/ `TX 发射中 30s`（红底，含倒计时）
-  - TX 倒计时每秒更新（30→29→...→1），30 秒到自动停止发射
-- 底部：`Radio:OK` 电台在线 / `PC:OK` 上位机在线 / 左右侧 VOL/SQL 百分比
+- 右侧：`空闲` / `RX 接收中`（蓝底）/ `TX 发射中 28s`（红底，含秒级倒计时）
+- 倒计时 30s 到期自动停止发射（与 ESP32 PTT 看门狗同步）
 
-### 自动录音
+### 自动 RX 录音
 
-检测到 USB Audio 输入设备（连接电台扬声器输出）时自动启用。  
-信号持续超过 0.3 秒后保存为 `recordings/` 目录下的 WAV 文件（48kHz 单声道）。
+- 需要 CM108 USB Audio 输入设备（连接电台扬声器输出）
+- BUSY 信号出现时自动开始录音，信号消失后 2 秒内无续发则保存
+- 单次录音 ≥ 0.3 秒才保存，否则丢弃（防噪声误触发）
+- 每 300 秒自动分段保存，防止单文件过大
+- 文件保存到 `recordings/` 目录（WAV 48kHz 单声道）
+
+### TTS 文字发射
+
+1. 按 `Tab` 聚焦底部输入框（或鼠标点击）
+2. 输入中英文文字（支持 ←→/Home/End/Del/Backspace）
+3. 按 `Enter` → Edge TTS 合成（默认声线：zh-TW-HsiaoChenNeural）
+4. 合成完毕后自动 PTT 发射，录音保存到 `recordings/`
+
+声线可在主菜单 **[3] 设置** 中修改，持久化到 `elfradio-box.cfg`。
+
+### 断线重连
+
+TUI 常驻不退出。串口断开时底部显示"等待重连..."，重连后历史消息和滚动位置完整保留。
 
 ---
 
@@ -86,241 +129,284 @@ Radio:OK PC:OK  L: VOL 60 % / SQL 25 %  R: VOL 0 % / SQL 0 %
 
 ### 串口说明
 
-程序启动时**自动检测** Espressif USB 设备（VID 0x303A）。若检测失败或有多个串口，使用 `--port` 手动指定：
-
-```
-elfradio-box.exe --port <串口号> <命令>
-```
-
-串口号以 Windows **设备管理器 → 端口（COM 和 LPT）** 中显示的为准（如 COM3、COM9 等）。
-
-> 以下示例中 `<串口号>` 请替换为实际串口号（如 `COM3`、`COM9`），或省略 `--port` 选项让程序自动检测。
-
-### 用法格式
+程序启动时**自动检测** Espressif USB 设备（VID 0x303A，排除 JTAG 口）。若检测失败或有多个串口，用 `--port` 手动指定：
 
 ```
 elfradio-box.exe [--port <串口号>] <命令> [参数...]
 ```
 
-**全局选项**：
-- `--port <PORT>` — 指定串口，省略则自动检测 Espressif VID（0x303A）
+> 以下示例中 `--port COM8` 替换为实际串口号，或省略让程序自动检测。
 
 ---
 
-### 命令参考
+### 帮助
 
-#### 帮助
-
-```
+```bash
 elfradio-box.exe help
 ```
 
-打印完整帮助信息，**无需连接串口**，直接退出。
+打印完整帮助，**无需串口**，直接退出。
 
 ---
 
-#### 进入监听模式
+### TUI 监听模式
 
-```
-elfradio-box.exe --port <串口号> monitor
+```bash
+elfradio-box.exe --port COM8 monitor
 ```
 
-跳过主菜单，直接进入 TUI 实时监听界面。按 `Esc` 退出。
+跳过主菜单，直接进入 TUI 实时监听界面（功能完整，自动重连）。
 
 ---
 
-#### 频率设置
+### 频率设置
 
-```
-elfradio-box.exe --port <串口号> set-freq <L|R> <NNNNNN>
+```bash
+elfradio-box.exe --port COM8 set-freq <L|R> <NNNNNN>
 ```
 
-- `L` / `R`：左侧或右侧
 - `NNNNNN`：6 位纯数字，单位 kHz，**无小数点**
-
-自动切换 MAIN 到目标侧后逐位输入频率，等待电台响应后读取确认频率。
-
-**示例**：
+- 自动切换 MAIN 到目标侧后逐位发送频率，等待电台响应后读取确认
 
 ```bash
-# 设置 LEFT 频率为 433.550 MHz
-elfradio-box.exe --port <串口号> set-freq L 433550
-
-# 设置 RIGHT 频率为 145.500 MHz
-elfradio-box.exe --port <串口号> set-freq R 145500
-
-# 设置 RIGHT 频率为 146.525 MHz（全国呼叫频率）
-elfradio-box.exe --port <串口号> set-freq R 146525
+elfradio-box.exe --port COM8 set-freq L 433550   # → 433.550 MHz
+elfradio-box.exe --port COM8 set-freq R 145500   # → 145.500 MHz
+elfradio-box.exe --port COM8 set-freq R 146525   # → 146.525 MHz（全国呼叫）
 ```
 
 ---
 
-#### 切换 MAIN 侧
-
-```
-elfradio-box.exe --port <串口号> main <L|R>
-```
-
-将 MAIN（主操作侧）切换到 LEFT 或 RIGHT。若已经是目标侧则直接返回成功。
+### 切换 MAIN 侧
 
 ```bash
-elfradio-box.exe --port <串口号> main L
-elfradio-box.exe --port <串口号> main R
+elfradio-box.exe --port COM8 main <L|R>
+```
+
+```bash
+elfradio-box.exe --port COM8 main L
+elfradio-box.exe --port COM8 main R
 ```
 
 ---
 
-#### 旋钮步进
-
-```
-elfradio-box.exe --port <串口号> knob <up|down> [N]
-```
-
-对 MAIN 侧进行旋钮步进，`N` 为步进格数（默认 1，最大 50）。  
-步进后读取并显示当前频率。
+### 旋钮步进
 
 ```bash
-# 频率上调 1 格（约 12.5kHz）
-elfradio-box.exe --port <串口号> knob up
+elfradio-box.exe --port COM8 knob <up|down> [N]
+```
 
-# 频率下调 5 格
-elfradio-box.exe --port <串口号> knob down 5
+对 MAIN 侧步进 N 格（默认 1，最大 50），步进后显示当前频率。
 
-# 上调 10 格（~125kHz）
-elfradio-box.exe --port <串口号> knob up 10
+```bash
+elfradio-box.exe --port COM8 knob up        # +1 格
+elfradio-box.exe --port COM8 knob down 5    # -5 格
+elfradio-box.exe --port COM8 knob up 10     # +10 格
 ```
 
 ---
 
-#### 音量
-
-```
-elfradio-box.exe --port <串口号> set-vol <0-100>
-```
-
-设置音量百分比（0 = 最小，100 = 最大）。
+### 音量
 
 ```bash
-elfradio-box.exe --port <串口号> set-vol 60
-elfradio-box.exe --port <串口号> set-vol 0    # 静音
+elfradio-box.exe --port COM8 set-vol <0-100>
+```
+
+```bash
+elfradio-box.exe --port COM8 set-vol 60
+elfradio-box.exe --port COM8 set-vol 0     # 静音
 ```
 
 ---
 
-#### 静噪
-
-```
-elfradio-box.exe --port <串口号> set-sql <0-100>
-```
-
-设置静噪门限百分比（0 = 全开，100 = 最紧）。
+### 静噪
 
 ```bash
-elfradio-box.exe --port <串口号> set-sql 25
-elfradio-box.exe --port <串口号> set-sql 0    # 关闭静噪（全噪）
+elfradio-box.exe --port COM8 set-sql <0-100>
+```
+
+```bash
+elfradio-box.exe --port COM8 set-sql 25
+elfradio-box.exe --port COM8 set-sql 0     # 关闭静噪（全噪）
 ```
 
 ---
 
-#### 功率等级
-
-```
-elfradio-box.exe --port <串口号> set-power <L|R> <low|mid|high>
-```
-
-设置指定侧的发射功率。程序循环按 LOW 键直到达到目标功率，最多循环 5 次。
+### 功率等级
 
 ```bash
-elfradio-box.exe --port <串口号> set-power L low    # LOW 约 5W
-elfradio-box.exe --port <串口号> set-power L mid    # MID 约 10-25W
-elfradio-box.exe --port <串口号> set-power L high   # HIGH 约 50W
+elfradio-box.exe --port COM8 set-power <L|R> <low|mid|high>
 ```
 
-> **注意**：TH-9800 功率档位为 LOW/MID/HIGH（状态报告中为 "LOW"/"MID"/"HIGH"）。
-
----
-
-#### 亚音模式循环
-
-```
-elfradio-box.exe --port <串口号> tone
-```
-
-循环切换亚音模式（每次发送 P3 键）：`OFF → ENC → T/R → DCS → OFF → ...`
+程序循环按 LOW 键直到达到目标功率（最多 5 次）。
 
 ```bash
-elfradio-box.exe --port <串口号> tone    # 切换一次
-elfradio-box.exe --port <串口号> tone    # 再切换一次
+elfradio-box.exe --port COM8 set-power L low    # ≈5W
+elfradio-box.exe --port COM8 set-power L mid    # ≈10-25W
+elfradio-box.exe --port COM8 set-power L high   # ≈50W
 ```
 
 ---
 
-#### PTT 发射（定时）
-
-```
-elfradio-box.exe --port <串口号> ptt <秒数>
-```
-
-PTT 发射指定秒数后自动释放（范围 **1-30 秒**）。  
-**上限 30 秒**：ESP32 固件内置看门狗，超过 30 秒强制切断发射，防止电台过热或长时间占用频率。发射期间每秒打印倒计时。
+### 亚音模式循环
 
 ```bash
-# 发射 5 秒后自动停止
-elfradio-box.exe --port <串口号> ptt 5
+elfradio-box.exe --port COM8 tone
+```
 
-# 发射 10 秒（如发送 CQ 调用）
-elfradio-box.exe --port <串口号> ptt 10
+每次发送 P3 键，循环切换：`OFF → ENC → T/R → DCS → OFF → ...`
+
+---
+
+### PTT 发射（定时）
+
+```bash
+elfradio-box.exe --port COM8 ptt <秒数>
+```
+
+范围 **1-30 秒**（ESP32 硬限制），发射期间每秒打印倒计时。
+
+```bash
+elfradio-box.exe --port COM8 ptt 5     # 发射 5 秒
+elfradio-box.exe --port COM8 ptt 10    # 发射 10 秒
 ```
 
 ---
 
-#### 强制关闭 PTT
-
-```
-elfradio-box.exe --port <串口号> ptt-off
-```
-
-立即发送 PTT 释放命令。用于异常情况下 PTT 卡死时的紧急关闭。
+### 强制关闭 PTT
 
 ```bash
-elfradio-box.exe --port <串口号> ptt-off
+elfradio-box.exe --port COM8 ptt-off
+```
+
+PTT 卡死时紧急关闭。
+
+---
+
+### PTT + 播放音频文件
+
+```bash
+elfradio-box.exe --port COM8 ptt-tx <文件路径>
+```
+
+开启 PTT → 播放文件到 CM108 USB Audio 输出（电台麦克风输入）→ 播完自动松开。
+
+- **支持格式**：WAV / MP3 / OGG / FLAC / AAC / M4A（via rodio/symphonia）
+- **自动截断**：超过 30 秒的文件截断到 30 秒
+- **多声道**：自动平均混合为单声道
+
+```bash
+elfradio-box.exe --port COM8 ptt-tx cq_call.wav
+elfradio-box.exe --port COM8 ptt-tx announcement.mp3
 ```
 
 ---
 
-#### PTT + 播放音频文件
-
-```
-elfradio-box.exe --port <串口号> ptt-tx <file.wav>
-```
-
-开启 PTT → 将 WAV 文件播放到 USB Audio 输出设备（需连接电台麦克风输入）→ 播完自动松开 PTT。
-
-- 支持 WAV 格式（i16 或 f32）
-- 自动重采样到设备原生采样率
-- 音频输出到名称含 "USB Audio" 的设备
+### TTS 文字转语音发射
 
 ```bash
-# 播放 CQ 呼叫录音进行发射
-elfradio-box.exe --port <串口号> ptt-tx cq_call.wav
-
-# 播放欢迎语音
-elfradio-box.exe --port <串口号> ptt-tx welcome.wav
+elfradio-box.exe --port COM8 tts [--voice <声线>] <文字>
 ```
+
+在线调用 Microsoft Edge TTS 合成音频 → 保存到 `recordings/` → PTT 发射。
+
+- **默认声线**：`zh-TW-HsiaoChenNeural`（台湾女声）
+- **合成文件**：保存为 `recordings/YYYYMMDD_HHMMSS_tts.mp3`
+
+```bash
+elfradio-box.exe --port COM8 tts "各位好，这里是 VK7KSM，CQ CQ"
+elfradio-box.exe --port COM8 tts --voice zh-CN-XiaoxiaoNeural "Hello, this is VK7KSM"
+elfradio-box.exe --port COM8 tts --voice zh-CN-YunxiNeural "测试播报"
+```
+
+**常用声线：**
+
+| 声线 | 语言 | 性别 |
+|---|---|---|
+| `zh-TW-HsiaoChenNeural` | 台湾中文 | 女（默认）|
+| `zh-CN-XiaoxiaoNeural` | 普通话 | 女 |
+| `zh-CN-YunxiNeural` | 普通话 | 男 |
+| `en-US-GuyNeural` | 英文 | 男 |
 
 ---
 
-#### 电台开关机
-
-```
-elfradio-box.exe --port <串口号> power-toggle
-```
-
-触发 GPIO8 控制的 PC817 光耦脉冲（1.2 秒），模拟按下电台电源键。  
-电台开机时执行此命令 → 关机；电台关机时执行此命令 → 开机。
+### 电台开关机
 
 ```bash
-elfradio-box.exe --port <串口号> power-toggle
+elfradio-box.exe --port COM8 power-toggle
+```
+
+触发 GPIO8 → PC817 光耦脉冲（1.2 秒），模拟电源键。
+
+---
+
+### 固件更新
+
+```bash
+# 仅查询 GitHub 最新版本（不需要 OTG 串口，无需 --port）
+elfradio-box.exe flash --check
+
+# 交互式下载并烧录（需 UART 调试线，不需要 OTG 线）
+elfradio-box.exe flash
+
+# 全自动非交互（自动确认，适合脚本）
+elfradio-box.exe flash --yes
+
+# 指定 UART 烧录口（自动检测失败时用）
+elfradio-box.exe flash --yes --flash-port COM9
+```
+
+- **不需要 OTG 线**（`--port` 参数对此命令无效）
+- 需要 **UART 调试线**（CH343/CH340，常接 GPIO43/44）
+- 烧录成功后自动记录版本到 `elfradio-box.cfg`
+- `flash --check` 退出码：`0` = 已是最新，`2` = 有新版本
+
+---
+
+### 被动收听（CLI 录音监听）
+
+```bash
+elfradio-box.exe [--port COM8] listen [选项]
+```
+
+长时间运行，打滚动日志，BUSY 信号出现时自动保存 RX 录音到 `recordings/`。  
+**多个终止条件同时有效，任意一个先触发即停止。**
+
+| 选项 | 说明 |
+|---|---|
+| `-d`, `--duration <时长>` | 运行时长，如 `30m` `2h` `3600s` `1800`（默认秒）|
+| `-n`, `--count <N>` | 录完 N 次信号后停止 |
+| `-i`, `--idle <时长>` | 最后一次信号结束后 N 时间无新活动则停止 |
+| `--audio` | 开启接收音频直通（CM108 → PC 耳机，默认关闭）|
+| `Ctrl+C` | 优雅终止（先保存正在进行的录音再退出）|
+
+```bash
+# 无限监听，Ctrl+C 停止
+elfradio-box.exe --port COM8 listen
+
+# 运行 30 分钟后自动结束
+elfradio-box.exe --port COM8 listen -d 30m
+
+# 录满 5 次信号后停止
+elfradio-box.exe --port COM8 listen -n 5
+
+# 最多 1 小时，20 分钟无信号提前结束
+elfradio-box.exe --port COM8 listen -d 1h --idle 20m
+
+# 开耳机直通，运行 2 小时
+elfradio-box.exe --port COM8 listen --audio -d 2h
+```
+
+**输出示例：**
+```
+[14:30:22] 开始监听  电台在线  LEFT:433.550.000 RIGHT:146.525.000  时长上限:30m
+────────────────────────────────────────────────────────────────────────────
+[14:30:45] ← LEFT 433.550.000 FM  S:7  录音中...
+[14:31:03] ✓ [0001] 已保存: recordings/RX_20260415_143045_433_550_000_18s_seg1.wav  (18.0s)
+[14:35:12] ← RIGHT 146.525.000 FM  S:5  录音中...
+[14:35:21] ✓ [0002] 已保存: recordings/RX_20260415_143512_146_525_000_9s_seg1.wav  (9.2s)
+[14:00:22]  30m  达到时长上限，自动结束
+────────────────────────────────────────────────────────────────────────────
+[15:00:22] 监听结束  运行时间: 30m  共保存录音: 2 次
 ```
 
 ---
@@ -332,39 +418,47 @@ elfradio-box.exe --port <串口号> power-toggle
 | `打开 <串口号> 失败: 拒绝访问` | 串口被其他程序占用 | 关闭其他上位机实例或 miniterm |
 | `未找到 ESP32 串口` | ESP32 未通电或驱动未安装 | 检查 USB 连接，查看设备管理器 |
 | `未收到状态报告` | ESP32 固件未烧录或串口不对 | 检查固件版本，确认串口号 |
-| `未找到 USB Audio 输出设备` | ptt-tx 需要 USB Audio | 检查 CM108 声卡连接 |
+| `无法初始化音频录音: ...` | CM108 未连接或被占用 | 检查 USB Audio 声卡连接；listen/TUI 仍可显示状态 |
 | `功率循环 5 次后未达到目标` | 电台通信异常 | 手动核查当前功率，重试 |
+| `未检测到 UART 烧录口` | flash 命令找不到 CH343/CH340 | 插入 UART 调试线，或用 `--flash-port` 指定 |
+| `音频播放失败: ...` | ptt-tx 文件格式不支持或路径有误 | 确认文件路径，支持格式：WAV/MP3/OGG/FLAC/AAC/M4A |
 
 ---
 
 ## 脚本示例
 
-### 全自动播报（Shell 脚本）
+### 定时自动播报
 
 ```bash
 #!/bin/bash
-# 将 PORT 替换为实际串口号（设备管理器中查看，如 COM3、COM9）
-PORT=<串口号>
+PORT=COM8
 EXE="./elfradio-box.exe"
 
 # 设置频率和功率
 $EXE --port $PORT set-freq L 433550
 $EXE --port $PORT set-power L low
 
-# 发射 CQ
-$EXE --port $PORT ptt-tx cq.wav
-
-# 等待 5 秒后再次发射
-sleep 5
-$EXE --port $PORT ptt-tx cq.wav
+# TTS 播报
+$EXE --port $PORT tts "各位好，这里是 VK7KSM，CQ CQ，请回答"
 ```
 
-### 预设配置（批处理）
+### 定时收听守候（守频2小时，无信号10分钟后结束）
+
+```bash
+elfradio-box.exe --port COM8 listen -d 2h --idle 10m --audio
+```
+
+### 夜间录音（全自动，第二天查看）
+
+```bash
+elfradio-box.exe --port COM8 listen -d 8h
+```
+
+### 预设配置批处理
 
 ```bat
 @echo off
-:: 将 PORT 替换为实际串口号（设备管理器中查看，如 COM3、COM9）
-set PORT=<串口号>
+set PORT=COM8
 set EXE=elfradio-box.exe
 
 echo 设置左侧：VHF 144MHz 中继频率
@@ -377,22 +471,50 @@ echo 设置左侧：VHF 144MHz 中继频率
 echo 完成！
 ```
 
+### 固件自动更新（CI/自动化）
+
+```bash
+elfradio-box.exe flash --check
+if [ $? -eq 2 ]; then
+    echo "发现新版本，自动升级..."
+    elfradio-box.exe flash --yes
+fi
+```
+
 ---
 
 ## 注意事项
 
-1. **串口独占**：同一时刻只能有一个程序打开串口。TUI 监听模式运行时不能同时执行其他 CLI 命令，否则会提示"拒绝访问"。
-2. **PTT 安全**：`ptt <秒>` 命令上限 **30 秒**（ESP32 看门狗硬限制，超时强制切断）。超过 30 秒的发射需求请重复调用或使用 `ptt-tx` 播放音频文件。
-3. **频率格式**：`set-freq` 仅接受 6 位纯数字（kHz）。433.550 MHz → 填 `433550`；145.000 MHz → 填 `145000`。
-4. **功率循环方向**：TH-9800 LOW 键固定按 LOW→MID→HIGH 方向循环，`set-power` 最多需要 3 次按键。
+1. **串口独占**：同一时刻只能有一个程序打开串口（OTG 口）。TUI/listen 运行时不能同时执行其他 CLI 命令。
+2. **PTT 安全**：`ptt <秒>` 上限 **30 秒**（ESP32 看门狗硬限制）。超过 30 秒的发射需求请使用 `ptt-tx` 或 `tts`。
+3. **频率格式**：`set-freq` 仅接受 6 位纯数字（kHz）。433.550 MHz → `433550`；145.000 MHz → `145000`。
+4. **两条 USB 线**：OTG 线（GPIO19/20）用于上位机通信；UART 调试线（CH343）用于固件烧录和日志读取。两者独立，互不影响。
+5. **flash 不需要 OTG 线**：`flash` 命令走 UART 调试线，不需要上位机通信串口连接，也不需要 `--port` 参数。
+6. **上电顺序**：先 ESP32（USB），再电台（13.8V）。绝对不要在 ESP32 未通电时给电台上电（RJ-12 带电会倒灌损坏电路）。
+
+---
+
+## 配置文件
+
+`elfradio-box.cfg`（与 exe 同目录）：
+
+```ini
+# elfRadio BOX 配置文件
+tts_voice=zh-TW-HsiaoChenNeural    # TTS 合成声线
+denoise_db=0                        # 降噪强度（0=关闭，10-100=启用）
+firmware_version=v0.1.0             # 上次成功烧录的固件版本
+```
+
+通过主菜单 **[3] 设置** 修改并保存，或直接手动编辑。
 
 ---
 
 ## 开发信息
 
 - **语言**：Rust（x86_64-pc-windows-msvc）
-- **主要依赖**：`crossterm`（TUI）、`serialport`（串口）、`cpal`（音频）、`hound`（WAV）
-- **固件仓库**：`C:\eh\`（ESP32-S3 固件，Xtensa Rust）
-- **通信协议文档**：`C:\eh\CLAUDE.md` → "PC 上位机通信开发记录"
+- **主要依赖**：`crossterm`（TUI）、`serialport`（串口）、`cpal`（音频）、`hound`（WAV）、`rodio/symphonia`（多格式音频）、`msedge-tts`（TTS）、`nnnoiseless`（RNNoise 降噪）、`rfd`（文件对话框）、`espflash`（固件烧录）、`ctrlc`（Ctrl+C 处理）、`ureq`（HTTP）
+- **固件仓库**：`VK7KSM/ESP32_Control_Box`（GitHub）
+- **ESP32 固件源码**：`C:\eh\`（Xtensa Rust）
+- **通信协议文档**：`C:\eh\PC_API.md`
 
 73 de VK7KSM

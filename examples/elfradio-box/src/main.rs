@@ -11,6 +11,8 @@ mod ui;
 mod cli;
 mod tts;
 mod config;
+mod firmware;
+mod listen;
 
 use crossterm::style::Stylize;
 use std::sync::mpsc;
@@ -74,6 +76,29 @@ fn main() {
     // ── monitor：直接进 TUI（指定端口，跳过主菜单）─────────────────
     if matches!(cli_args.command, cli::CliCommand::Monitor) {
         run_interactive(cli_args.port.as_deref(), true);
+        return;
+    }
+
+    // ── flash / flash-check：不需要 OTG 串口，只需 UART 调试线 ────
+    if let cli::CliCommand::Flash { ref yes, ref flash_port } = cli_args.command {
+        ui::print_banner();
+        println!();
+        run_firmware_update_cli(*yes, flash_port.as_deref());
+        return;
+    }
+    if matches!(cli_args.command, cli::CliCommand::FlashCheck) {
+        ui::print_banner();
+        println!();
+        run_firmware_check_cli();
+        return;
+    }
+
+    // ── listen：需要 OTG 串口，长期运行，无 TUI ──────────────────────
+    if let cli::CliCommand::Listen(opts) = cli_args.command {
+        ui::print_banner();
+        println!();
+        let port_name = resolve_port_or_wait(cli_args.port.as_deref());
+        listen::run_listen(&port_name, opts);  // 内部调用 exit()，不会返回
         return;
     }
 
@@ -141,11 +166,9 @@ fn main() {
 
 // ── 交互主菜单模式 ─────────────────────────────────────────────────
 
-fn run_interactive(forced_port: Option<&str>, direct_tui: bool) {
-    ui::print_banner();
-    println!();
-
-    let port_name = match forced_port {
+/// 解析并等待串口就绪：指定端口 → 自动检测 → 无限等待直到出现
+fn resolve_port_or_wait(forced: Option<&str>) -> String {
+    match forced {
         Some(p) => {
             ui::print_ok(&format!("使用指定串口: {}", p));
             p.to_string()
@@ -156,7 +179,6 @@ fn run_interactive(forced_port: Option<&str>, direct_tui: bool) {
                 name
             }
             None => {
-                // 未检测到 ESP32：等待出现（不立即退出），直到 Ctrl+C 或检测到设备
                 ui::print_info("未检测到 ESP32，等待连接... (Ctrl+C 退出)");
                 loop {
                     std::thread::sleep(Duration::from_secs(2));
@@ -167,7 +189,14 @@ fn run_interactive(forced_port: Option<&str>, direct_tui: bool) {
                 }
             }
         },
-    };
+    }
+}
+
+fn run_interactive(forced_port: Option<&str>, direct_tui: bool) {
+    ui::print_banner();
+    println!();
+
+    let port_name = resolve_port_or_wait(forced_port);
 
     let shared = state::new_shared_state();
 
@@ -191,6 +220,7 @@ fn run_interactive(forced_port: Option<&str>, direct_tui: bool) {
         println!("  {} 监听模式     实时监听、显示状态、录音、PTT 发射", "[1]".yellow().bold());
         println!("  {} 连接状态     ESP32 / 电台 / 声卡信息", "[2]".yellow().bold());
         println!("  {} 设置         TTS 声线 / 降噪默认值", "[3]".yellow().bold());
+        println!("  {} 固件更新     联网检查并烧录最新 ESP32 固件", "[4]".yellow().bold());
         println!();
         println!("  {} 退出", "[0]".yellow().bold());
         println!();
@@ -223,12 +253,337 @@ fn run_interactive(forced_port: Option<&str>, direct_tui: bool) {
                 println!();
                 run_settings();
             }
+            "4" => {
+                println!();
+                run_firmware_update();
+            }
             "0" | "q" => break,
             _ => {}
         }
     }
 
     println!("再见！ 73 de VK7KSM");
+}
+
+// ── CLI 版固件版本查询（仅查，不烧）────────────────────────────────
+
+fn run_firmware_check_cli() {
+    use crossterm::style::Stylize;
+
+    println!("  正在查询 GitHub 最新版本...");
+    let info = match firmware::check_latest() {
+        Ok(i) => i,
+        Err(e) => {
+            println!("  {} {}", " ERR".on_dark_red().white().bold(), e);
+            std::process::exit(1);
+        }
+    };
+
+    let cfg = config::load_config();
+    let local = if cfg.firmware_version.is_empty() { "（未记录）".to_string() } else { cfg.firmware_version.clone() };
+
+    println!("  本地已记录版本: {}", local.as_str().cyan());
+    println!("  GitHub 最新版本: {}", info.tag.as_str().yellow().bold());
+    println!("  固件下载地址:   {}", info.firmware_url.as_str().dark_grey());
+    println!();
+    if cfg.firmware_version == info.tag {
+        println!("  {} 当前已是最新版本", " OK ".on_dark_green().white().bold());
+        std::process::exit(0);  // exit(0) = 已是最新
+    } else {
+        println!("  {} 有新版本可用，运行 'flash' 命令升级", " !! ".on_dark_yellow().white().bold());
+        std::process::exit(2);  // exit(2) = 有新版本（方便脚本判断）
+    }
+}
+
+// ── CLI 版固件更新（下载 + 烧录，支持 --yes 非交互）────────────────
+
+fn run_firmware_update_cli(yes: bool, flash_port: Option<&str>) {
+    use crossterm::style::Stylize;
+
+    println!("{}", "─".repeat(60).dark_grey());
+    println!("  {} 固件更新（CLI 模式）", "elfRadio BOX".cyan().bold());
+    println!("{}", "─".repeat(60).dark_grey());
+    println!();
+
+    // 1. 读取本地已记录版本
+    let mut cfg = config::load_config();
+    let local_ver = if cfg.firmware_version.is_empty() {
+        "（未记录）".to_string()
+    } else {
+        cfg.firmware_version.clone()
+    };
+    println!("  本地已烧录版本: {}", local_ver.as_str().cyan());
+    println!();
+    print!("  正在检查 GitHub 最新版本...");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+
+    // 2. 查询 GitHub
+    let info = match firmware::check_latest() {
+        Ok(i) => i,
+        Err(e) => {
+            println!();
+            println!("  {} {}", " ERR".on_dark_red().white().bold(), e);
+            std::process::exit(1);
+        }
+    };
+    println!(" 完成");
+    println!();
+    if cfg.firmware_version == info.tag {
+        println!("  {} 当前已是最新版本 ({})", " OK ".on_dark_green().white().bold(), info.tag);
+        if !yes {
+            print!("  仍然烧录？(Y/其他=退出) > ");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            let ans = read_menu_line();
+            if ans.trim().to_lowercase() != "y" {
+                println!("  已取消。");
+                std::process::exit(0);
+            }
+        }
+    } else {
+        println!("  发现新版本: {}  （当前: {}）",
+            info.tag.as_str().yellow().bold(), local_ver.as_str().dark_grey());
+        if !yes {
+            print!("  是否下载并烧录？(Y/其他=取消) > ");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            let ans = read_menu_line();
+            if ans.trim().to_lowercase() != "y" {
+                println!("  已取消。");
+                std::process::exit(0);
+            }
+        }
+    }
+    println!("  固件来源: {}", info.firmware_url.as_str().dark_grey());
+
+    // 3. 下载固件
+    println!();
+    print!("  下载中... 0 KB");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let bin_path = match firmware::download_firmware(&info.firmware_url, |dl, total| {
+        let dl_kb   = dl   / 1024;
+        let total_s = if total > 0 { format!("{} KB", total / 1024) } else { "? KB".to_string() };
+        print!("\r  下载中... {} KB / {}    ", dl_kb, total_s);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }) {
+        Ok(p) => { println!(); println!("  {} 下载完成: {}", " OK ".on_dark_green().white().bold(), p.display()); p }
+        Err(e) => {
+            println!();
+            println!("  {} {}", " ERR".on_dark_red().white().bold(), e);
+            std::process::exit(1);
+        }
+    };
+
+    // 4. 检测 UART 烧录口
+    println!();
+    print!("  检测 UART 烧录口...");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let port = match flash_port {
+        Some(p) => { println!(" 使用指定: {}", p.yellow()); p.to_string() }
+        None    => match firmware::find_flash_port() {
+            Some(p) => { println!(" 找到: {}", p.as_str().yellow()); p }
+            None => {
+                println!();
+                println!("  {} 未检测到 UART 烧录口", " ERR".on_dark_red().white().bold());
+                println!("  请确认控制盒 UART 调试线已插入 PC，或用 --flash-port 指定");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // 5. 二次确认（--yes 时跳过）
+    if !yes {
+        println!();
+        print!("  即将向 {} 烧录固件 {}，ESP32 将重启。继续？(Y/n) > ",
+            port.as_str().yellow(), info.tag.as_str().yellow());
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        let confirm = read_menu_line();
+        if !confirm.trim().is_empty() && confirm.trim().to_lowercase() != "y" {
+            println!("  已取消。");
+            std::process::exit(0);
+        }
+    } else {
+        println!("  [--yes] 跳过确认，直接烧录 {} → {}", info.tag.as_str().yellow(), port.as_str().yellow());
+    }
+
+    // 6. 烧录
+    println!();
+    println!("{}", "─".repeat(60).dark_grey());
+    println!("  正在连接 ESP32 bootloader...");
+    let mut last_pct: usize = 0;
+    let result = firmware::flash_firmware(&bin_path, &port, |current, total| {
+        if total > 0 {
+            let pct = current * 100 / total;
+            if pct != last_pct {
+                last_pct = pct;
+                print!("\r  烧录中... {}% ({}/{} KB)    ",
+                    pct, current / 1024, total / 1024);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+        }
+    });
+    println!();
+    println!("{}", "─".repeat(60).dark_grey());
+    println!();
+
+    match result {
+        Ok(()) => {
+            println!("  {} 烧录完成！ESP32 正在重启...", " OK ".on_dark_green().white().bold());
+            cfg.firmware_version = info.tag.clone();
+            match config::save_config(&cfg) {
+                Ok(())  => println!("  已记录版本 {} 到配置文件", info.tag.as_str().cyan()),
+                Err(e)  => println!("  警告：版本记录失败: {}", e),
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            println!("  {} 烧录失败: {}", " ERR".on_dark_red().white().bold(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ── 交互菜单版固件更新（不变）──────────────────────────────────────
+
+fn run_firmware_update() {
+    use crossterm::style::Stylize;
+
+    println!("{}", "─".repeat(60).dark_grey());
+    println!("  {} 固件更新", "elfRadio BOX".cyan().bold());
+    println!("{}", "─".repeat(60).dark_grey());
+    println!();
+
+    // ── 1. 读取本地已记录版本 ────────────────────────────────────────
+    let mut cfg = config::load_config();
+    let local_ver = if cfg.firmware_version.is_empty() {
+        "（未记录）".to_string()
+    } else {
+        cfg.firmware_version.clone()
+    };
+    println!("  本地已烧录版本: {}", local_ver.as_str().cyan());
+    println!();
+    print!("  正在检查 GitHub 最新版本...");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+
+    // ── 2. 查询 GitHub Releases ──────────────────────────────────────
+    let info = match firmware::check_latest() {
+        Ok(i) => i,
+        Err(e) => {
+            println!();
+            println!("  {} {}", " ERR".on_dark_red().white().bold(), e);
+            println!("  按 Enter 返回...");
+            let _ = read_menu_line();
+            return;
+        }
+    };
+    println!(" 完成");
+    println!();
+    if cfg.firmware_version == info.tag {
+        println!("  {} 当前已是最新版本 ({})", " OK ".on_dark_green().white().bold(), info.tag);
+        println!("  仍可选择强制重新烧录。");
+    } else {
+        println!("  发现新版本: {}  （当前: {}）",
+            info.tag.as_str().yellow().bold(),
+            local_ver.as_str().dark_grey());
+    }
+    println!();
+    println!("  固件来源: {}", info.firmware_url.as_str().dark_grey());
+    println!();
+    print!("  是否下载并烧录？(Y/其他=取消) > ");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let ans = read_menu_line();
+    if ans.trim().to_lowercase() != "y" {
+        println!("  已取消。");
+        println!("  按 Enter 返回...");
+        let _ = read_menu_line();
+        return;
+    }
+
+    // ── 3. 下载固件 ──────────────────────────────────────────────────
+    println!();
+    print!("  下载中... 0 KB");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let bin_path = match firmware::download_firmware(&info.firmware_url, |dl, total| {
+        let dl_kb   = dl   / 1024;
+        let total_s = if total > 0 { format!("{} KB", total / 1024) } else { "? KB".to_string() };
+        print!("\r  下载中... {} KB / {}    ", dl_kb, total_s);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }) {
+        Ok(p) => { println!(); println!("  {} 下载完成: {}", " OK ".on_dark_green().white().bold(), p.display()); p }
+        Err(e) => {
+            println!();
+            println!("  {} {}", " ERR".on_dark_red().white().bold(), e);
+            println!("  按 Enter 返回...");
+            let _ = read_menu_line();
+            return;
+        }
+    };
+
+    // ── 4. 检测 UART 烧录口（VID≠0x303A 的 USB 串口 = CH343/CH340 等 UART 桥）──────
+    println!();
+    print!("  检测 UART 烧录口...");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let port = match firmware::find_flash_port() {
+        Some(p) => { println!(" 找到: {}", p.as_str().yellow()); p }
+        None => {
+            println!();
+            println!("  {} 未检测到 UART 烧录口", " ERR".on_dark_red().white().bold());
+            println!("  请确认控制盒 UART 调试线（非 OTG 线）已插入 PC");
+            println!("  按 Enter 返回...");
+            let _ = read_menu_line();
+            return;
+        }
+    };
+
+    // ── 5. 再次确认 ──────────────────────────────────────────────────
+    println!();
+    print!("  即将向 {} 烧录固件 {}，ESP32 将重启。继续？(Y/n) > ",
+        port.as_str().yellow(), info.tag.as_str().yellow());
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let confirm = read_menu_line();
+    if !confirm.trim().is_empty() && confirm.trim().to_lowercase() != "y" {
+        println!("  已取消。");
+        println!("  按 Enter 返回...");
+        let _ = read_menu_line();
+        return;
+    }
+
+    // ── 6. 烧录 ──────────────────────────────────────────────────────
+    println!();
+    println!("{}", "─".repeat(60).dark_grey());
+    println!("  正在连接 ESP32 bootloader...");
+    let mut last_pct: usize = 0;
+    let result = firmware::flash_firmware(&bin_path, &port, |current, total| {
+        if total > 0 {
+            let pct = current * 100 / total;
+            if pct != last_pct {
+                last_pct = pct;
+                print!("\r  烧录中... {}% ({}/{} KB)    ",
+                    pct, current / 1024, total / 1024);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+        }
+    });
+    println!();  // 换行（清掉进度条 \r 行）
+    println!("{}", "─".repeat(60).dark_grey());
+    println!();
+
+    match result {
+        Ok(()) => {
+            println!("  {} 烧录完成！ESP32 正在重启...", " OK ".on_dark_green().white().bold());
+            // 记录已烧录版本
+            cfg.firmware_version = info.tag.clone();
+            match config::save_config(&cfg) {
+                Ok(()) => println!("  已记录版本 {} 到配置文件", info.tag.as_str().cyan()),
+                Err(e) => println!("  警告：版本记录失败: {}", e),
+            }
+        }
+        Err(e) => {
+            println!("  {} 烧录失败: {}", " ERR".on_dark_red().white().bold(), e);
+        }
+    }
+
+    println!();
+    println!("  按 Enter 返回...");
+    let _ = read_menu_line();
 }
 
 fn run_settings() {

@@ -13,3 +13,7 @@ rfd   = "0.14"
 rodio = { version = "0.17", default-features = false, features = ["symphonia-all"] }
 msedge-tts = "0.2"
 nnnoiseless = "0.5"
+ureq       = { version = "3", features = ["json"] }
+serde_json = "1"
+espflash   = { version = "4", default-features = false, features = ["serialport"] }
+ctrlc      = { version = "3", features = ["termination"] }
