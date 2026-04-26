@@ -872,6 +872,14 @@ fn inject_menu_set(state: &SharedState, menu_num: u8, target_val: &str, keep_men
     if !keep_menu_open {
         inject_key_wait(state, 0x20);
         std::thread::sleep(Duration::from_millis(500));
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let band = if s.right.is_main { &mut s.right } else { &mut s.left };
+        band.is_set = false;
+        band.menu_text.clear();
+        band.menu_in_value = false;
+        band.menu_exit_count = 0;
+        band.display_text.clear();
+        s.head_count = s.head_count.wrapping_add(1);
     }
 
     state.lock().unwrap_or_else(|e| e.into_inner()).macro_running = false;

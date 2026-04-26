@@ -253,7 +253,7 @@ pub fn draw_band<D: DrawTarget<Color = Rgb565>>(
         .fill_color(PANEL).stroke_color(BORDER).stroke_width(1).build())
         .draw(display).unwrap();
 
-    if state.display_text.is_empty() {
+    if !state.is_set && state.display_text.is_empty() {
         if !state.shift.is_empty() {
             Text::new(state.shift.as_str(), Point::new(8, y + 28), s9a).draw(display).unwrap();
         }
@@ -284,7 +284,37 @@ pub fn draw_band<D: DrawTarget<Color = Rgb565>>(
         (freq_str, "")
     };
 
-    if !state.display_text.is_empty() {
+    if state.is_set {
+        Text::new("SET", Point::new(8, y + 28), s9a).draw(display).unwrap();
+
+        let menu_name_buf = menu_name_from_state(state);
+        let menu_name = menu_name_buf.as_str();
+        Text::new(menu_name, Point::new(8, y + 48),
+            MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(AMBER).build())
+            .draw(display).unwrap();
+
+        if state.menu_in_value {
+            let menu_value = translate_menu_value(state.menu_text.as_str());
+            if !menu_value.is_empty() {
+                let value_x = (12 + menu_name.len() as i32 * 9).min(116);
+                Text::new(menu_value.as_str(), Point::new(value_x, y + 48),
+                    MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(CYAN).build())
+                    .draw(display).unwrap();
+            }
+        }
+    } else if !state.display_text.is_empty() && is_frequency_entry_text(state.display_text.as_str()) {
+        Text::new(state.mode.as_str(), Point::new(8, y + 48),
+            MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(CYAN).build())
+            .draw(display).unwrap();
+
+        Text::new(state.display_text.as_str(), Point::new(40, y + 48),
+            MonoTextStyleBuilder::new().font(&PROFONT_24_POINT).text_color(AMBER).build())
+            .draw(display).unwrap();
+
+        Text::with_alignment("MHz", Point::new(230, y + 48),
+            MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(CYAN).build(),
+            Alignment::Right).draw(display).unwrap();
+    } else if !state.display_text.is_empty() {
         Text::new(state.display_text.as_str(), Point::new(8, y + 48),
             MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(AMBER).build())
             .draw(display).unwrap();
@@ -365,6 +395,89 @@ pub fn draw_band<D: DrawTarget<Color = Rgb565>>(
         draw_cjk_badge(display, badge_rx, y5, &[&GLYPH_JING, &GLYPH_YIN], RED);
     }
 }
+
+fn is_frequency_entry_text(s: &str) -> bool {
+    let mut digits = 0usize;
+    for c in s.chars() {
+        if c >= '0' && c <= '9' {
+            digits += 1;
+        } else if c != '.' && c != '-' && c != ' ' {
+            return false;
+        }
+    }
+    digits >= 1
+}
+
+fn menu_name_from_state(state: &BandState) -> heapless::String<12> {
+    if let Some(num) = channel_menu_number(state.channel.as_str()) {
+        if num < MENU_NAMES.len() {
+            let mut out = heapless::String::new();
+            let _ = out.push_str(MENU_NAMES[num]);
+            return out;
+        }
+    }
+
+    let mut out = heapless::String::new();
+    let _ = out.push_str(state.menu_text.as_str());
+    out
+}
+
+fn channel_menu_number(ch: &str) -> Option<usize> {
+    let s = ch.strip_prefix("Ch:")?;
+    let mut n = 0usize;
+    let mut has_digit = false;
+    for b in s.bytes() {
+        if b >= b'0' && b <= b'9' {
+            n = n * 10 + (b - b'0') as usize;
+            has_digit = true;
+        }
+    }
+    if has_digit { Some(n) } else { None }
+}
+
+fn translate_menu_value(raw: &str) -> heapless::String<12> {
+    let mut compact: heapless::String<12> = heapless::String::new();
+    for c in raw.chars() {
+        if c > ' ' && c != '.' {
+            let _ = compact.push(c.to_ascii_uppercase());
+        }
+    }
+
+    let mapped = match compact.as_str() {
+        "25K" => Some("2.5kHz"),
+        "5K" | "50K" => Some("5.0kHz"),
+        "625K" => Some("6.25kHz"),
+        "75K" => Some("7.5kHz"),
+        "833K" => Some("8.33kHz"),
+        "10K" => Some("10kHz"),
+        "125K" => Some("12.5kHz"),
+        "15K" | "150K" => Some("15kHz"),
+        "250K" => Some("25kHz"),
+        "30K" | "300K" => Some("30kHz"),
+        "500K" => Some("50kHz"),
+        "100K" | "1000K" => Some("100kHz"),
+        "ON" | "BEPON" | "APOON" | "MUTEON" => Some("ON"),
+        "OFF" | "BEPOFF" | "APOOFF" | "MUTEOFF" => Some("OFF"),
+        _ => None,
+    };
+
+    let mut out = heapless::String::new();
+    if let Some(v) = mapped {
+        let _ = out.push_str(v);
+    } else {
+        let _ = out.push_str(raw);
+    }
+    out
+}
+
+const MENU_NAMES: [&str; 43] = [
+    "", "APO", "ARS", "BEEP", "CLK.SFT", "CWID", "CWID W", "DIMMER",
+    "DTMF", "DTMF W", "DW", "HYPER", "LOCK", "LOCKT", "MUTE", "NAME",
+    "NAR/WID", "OPN.MSG", "PON.MSG", "PTT.ID", "RF SQL", "RPT.MOD", "SCAN",
+    "SCN.M", "SHIFT", "SKIP", "SPLIT", "SQL.TYP", "STEP", "TBST", "TONE F",
+    "TONE M", "TOT", "TS MUT", "TS SPD", "VFO.BND", "VFO.LNK", "VOX",
+    "VOX.D", "VOX.G", "VOX.T", "W/N.DEV", "WX ALT",
+];
 
 // ===== 进度条 =====
 fn draw_bar<D: DrawTarget<Color = Rgb565>>(

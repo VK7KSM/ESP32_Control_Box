@@ -167,6 +167,16 @@ impl DownParser {
         let band = if is_right { &mut rs.right } else { &mut rs.left };
 
         match cmd {
+            // SET 图标：机头退出 SET 后可能先发图标 OFF，再发频率帧；这里同步清掉菜单显示状态
+            0x03 => {
+                if !is_on {
+                    band.is_set = false;
+                    band.menu_text.clear();
+                    band.menu_in_value = false;
+                    band.menu_exit_count = 0;
+                    band.display_text.clear();
+                }
+            }
             // MAIN 标记（互斥：设置一侧为 MAIN 时清除另一侧）
             0x14 => {
                 band.is_main = is_on;
@@ -498,7 +508,18 @@ impl UpParser {
     pub fn apply_to_state(&self, rs: &mut RadioState) {
         // ---- 按键检测日志（P[3]=0x00 表示有键按下，P[4]=键码）----
         if self.buf[6] == 0x00 {
-            log::info!("[上行按键] key=0x{:02X}", self.buf[7]);
+            let key = self.buf[7];
+            log::info!("[上行按键] key=0x{:02X}", key);
+            if key == 0x20 {
+                let band = if rs.right.is_main { &mut rs.right } else { &mut rs.left };
+                if band.is_set {
+                    band.is_set = false;
+                    band.menu_text.clear();
+                    band.menu_in_value = false;
+                    band.menu_exit_count = 0;
+                    band.display_text.clear();
+                }
+            }
         }
         // 注意：不在此处 log warn，SUM 信息已通过 log_diag 每 20 帧打印一次
         // 大量日志会阻塞 relay 线程导致 UART FIFO 溢出，电台卡死
