@@ -246,7 +246,7 @@ fn main() {
     {
         let s = shared.lock().unwrap();
         ui::draw_main_ui(&mut fb, &s.left, &s.right, s.radio_alive, s.pc_alive,
-            &s.wifi_state, s.wifi_ip.as_str());
+            &s.wifi_state, s.wifi_ip.as_str(), s.rigctld_clients);
     }
     flush_fb_dma(&mut fb);
     log::info!("UI 就绪，进入主循环");
@@ -259,6 +259,7 @@ fn main() {
     let mut last_pc_alive: bool = false;
     let mut last_wifi_state: state::WifiState = state::WifiState::NoCredentials;
     let mut last_wifi_ip: heapless::String<16> = heapless::String::new();
+    let mut last_rigctld_clients: u32 = 0;
     let mut no_data_ticks:   u32 = 0;
     let mut last_redraw_us: u64 = 0;
     const MIN_REDRAW_INTERVAL_US: u64 = 200_000;  // 200ms = 5fps cap（PSRAM 帧缓冲 + WiFi 共享 DMA 时容易拥塞，状态显示 5fps 已足够）
@@ -272,34 +273,36 @@ fn main() {
             let radio_changed = s.body_count != last_body_count || s.head_count != last_head_count;
             let pc_changed = s.pc_alive != last_pc_alive;
             let wifi_changed = s.wifi_state != last_wifi_state || s.wifi_ip != last_wifi_ip;
+            let rc_changed = s.rigctld_clients != last_rigctld_clients;
 
-            if (radio_changed || pc_changed || wifi_changed) && can_redraw {
+            if (radio_changed || pc_changed || wifi_changed || rc_changed) && can_redraw {
                 last_body_count = s.body_count;
                 last_head_count = s.head_count;
                 last_pc_alive = s.pc_alive;
                 last_wifi_state = s.wifi_state.clone();
                 last_wifi_ip.clear();
                 let _ = last_wifi_ip.push_str(s.wifi_ip.as_str());
+                last_rigctld_clients = s.rigctld_clients;
                 no_data_ticks = 0;
-                let (left, right, alive, pc, ws, ip) = (
+                let (left, right, alive, pc, ws, ip, rc) = (
                     s.left.clone(), s.right.clone(),
                     s.radio_alive, s.pc_alive,
-                    s.wifi_state.clone(), s.wifi_ip.clone()
+                    s.wifi_state.clone(), s.wifi_ip.clone(), s.rigctld_clients
                 );
                 drop(s);
-                ui::draw_main_ui(&mut fb, &left, &right, alive, pc, &ws, ip.as_str());
+                ui::draw_main_ui(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), rc);
                 flush_fb_dma(&mut fb);
                 last_redraw_us = now_us;
-            } else if !radio_changed && !pc_changed && !wifi_changed {
+            } else if !radio_changed && !pc_changed && !wifi_changed && !rc_changed {
                 no_data_ticks += 1;
                 if no_data_ticks == 300 {  // 300 × 50ms = 15s
                     s.radio_alive = false;
-                    let (left, right, pc, ws, ip) = (
+                    let (left, right, pc, ws, ip, rc) = (
                         s.left.clone(), s.right.clone(), s.pc_alive,
-                        s.wifi_state.clone(), s.wifi_ip.clone()
+                        s.wifi_state.clone(), s.wifi_ip.clone(), s.rigctld_clients
                     );
                     drop(s);
-                    ui::draw_main_ui(&mut fb, &left, &right, false, pc, &ws, ip.as_str());
+                    ui::draw_main_ui(&mut fb, &left, &right, false, pc, &ws, ip.as_str(), rc);
                     flush_fb_dma(&mut fb);
                 }
             }

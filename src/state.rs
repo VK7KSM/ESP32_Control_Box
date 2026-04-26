@@ -182,9 +182,14 @@ pub struct RadioState {
     pub sql_changed: bool,          // PC 刚设置新静噪，同上
     pub main_probed: bool,          // 已执行过 MAIN 探测（启动后一次性触发，防重入）
     // ===== rigctld set_freq 异步步进目标 =====
-    // None = 无目标；Some(hz) = 后台 stepper 线程正向 MAIN 侧注入旋钮帧逼近此频率
-    // get_freq 优先返回此值（让 WSJT-X 立即看到 set_freq 生效，不等实际步进完成）
     pub rigctld_target_hz: Option<u64>,
+    // ===== rigctld 连接状态 =====
+    pub rigctld_clients: u32,       // 当前活跃 rigctld 客户端数（>0 → IP 显示橙色）
+    pub rigctld_ctcss_tone: u32,    // 最后设置的 CTCSS 频率（0.1 Hz 单位，0=OFF）
+    pub rigctld_initial_freq_done: bool, // DTrac 首个频率已写入电台
+    pub rigctld_step_ready: bool,        // TH-9800 STEP 已设为 2.5kHz
+    pub rigctld_setup_running: bool,     // rigctld 初始设置线程正在运行
+    pub rigctld_last_step_us: u64,       // 最近一次 DTrac 追踪旋钮注入时间
 }
 
 impl RadioState {
@@ -216,6 +221,12 @@ impl RadioState {
             sql_changed: false,
             main_probed: false,
             rigctld_target_hz: None,
+            rigctld_clients: 0,
+            rigctld_ctcss_tone: 0,
+            rigctld_initial_freq_done: false,
+            rigctld_step_ready: false,
+            rigctld_setup_running: false,
+            rigctld_last_step_us: 0,
         }
     }
 }

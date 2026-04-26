@@ -136,6 +136,7 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
     pc_alive: bool,
     wifi_state: &WifiState,
     wifi_ip: &str,
+    rigctld_clients: u32,
 ) where D::Error: core::fmt::Debug,
 {
     display.clear(BG).unwrap();
@@ -166,9 +167,9 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
         .into_styled(PrimitiveStyleBuilder::new().fill_color(PANEL).build())
         .draw(display).unwrap();
 
-    // 左下角：WiFi 状态 / IP
+    // 左下角：WiFi 状态 / IP（rigctld 客户端连接时 IP 显示橙色）
     let (wifi_text, wifi_color): (&str, Rgb565) = match wifi_state {
-        WifiState::Connected    => (wifi_ip, CYAN),
+        WifiState::Connected    => (wifi_ip, if rigctld_clients > 0 { AMBER } else { CYAN }),
         WifiState::Connecting   => ("WiFi:connect..", AMBER),
         WifiState::NoCredentials => ("WiFi:no setup", GRAY),
         WifiState::Failed       => ("WiFi:fail", GRAY),

@@ -320,10 +320,18 @@ impl DownParser {
 
             // 收到频率帧 → 机头已回到频率区，ESP32 同帧清空文本显示
             band.display_text.clear();
-            band.is_set = false;
-            band.menu_text.clear();
-            band.menu_in_value = false;
-            band.menu_exit_count = 0;
+            // 延迟退出菜单模式（CTCSS 显示时频率/文本帧交替，连续 2 帧才算真退出）
+            if band.is_set {
+                band.menu_exit_count = band.menu_exit_count.saturating_add(1);
+                if band.menu_exit_count >= 2 {
+                    band.is_set = false;
+                    band.menu_text.clear();
+                    band.menu_in_value = false;
+                    band.menu_exit_count = 0;
+                }
+            } else {
+                band.menu_exit_count = 0;
+            }
 
             // 108-136 MHz = 民用航空 AM 波段（TH-9800 实测），直接按频率赋值，不依赖 cmd=0x10
             band.mode.clear();
@@ -363,15 +371,34 @@ impl DownParser {
             }
         }
 
-        band.is_set = false;
-        band.menu_text.clear();
-        band.menu_in_value = false;
-        band.menu_exit_count = 0;
+        // had_channel=true → 上一帧是 Len=06（顶级菜单滚动）
+        // had_channel=false → 直接收到 Len=09（已进入值编辑）
+        let had_channel = self.got_channel[side_idx];
         self.got_channel[side_idx] = false;
 
         if detected_power {
             band.display_text.clear();
             return;
+        }
+
+        // 非频率 + 稳定显示标志 (flag bit6) + 非功率文本 → 菜单名称或菜单值
+        if !is_freq && (flag & 0x40) != 0 {
+            let mt_start = raw.iter().position(|&c| c > b' ').unwrap_or(6);
+            if mt_start < 6 {
+                let mut new_text: heapless::String<12> = heapless::String::new();
+                for &c in &raw[mt_start..] {
+                    if c > b' ' && c < 0x7F { let _ = new_text.push(c as char); }
+                }
+                if !new_text.is_empty() {
+                    if new_text != band.menu_text {
+                        band.menu_text = new_text;
+                    }
+                    band.is_set = true;
+                    band.menu_exit_count = 0;
+                    // had_channel=true → 顶级菜单（Len=06+Len=09 成对）；false → 值编辑（仅 Len=09）
+                    band.menu_in_value = !had_channel;
+                }
+            }
         }
 
         let first = raw.iter().position(|&c| c > b' ');
