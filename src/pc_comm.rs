@@ -10,8 +10,8 @@ use crate::state::{PowerLevel, RadioState, SharedState};
 use crate::uart::{build_key_frame, build_knob_frame};
 use esp_idf_svc::sys::*;
 
-const SYNC0: u8 = 0xAA;
-const SYNC1: u8 = 0x55;
+pub const SYNC0: u8 = 0xAA;
+pub const SYNC1: u8 = 0x55;
 
 // PC → ESP32
 const CMD_HEARTBEAT: u8 = 0x01;
@@ -23,14 +23,17 @@ const CMD_SET_VOL: u8 = 0x25;
 const CMD_SET_SQL: u8 = 0x26;
 const CMD_SET_PTT: u8 = 0x27;
 const CMD_POWER_TOGGLE: u8 = 0x28;
+const CMD_SET_WIFI_CRED: u8 = 0x29;
+const CMD_WIFI_SCAN:     u8 = 0x2A;
 
 // ESP32 → PC
-const RPT_HEARTBEAT_ACK: u8 = 0x81;
-const RPT_STATE: u8 = 0x82;
-const RPT_ERROR: u8 = 0x85;
+pub const RPT_HEARTBEAT_ACK: u8 = 0x81;
+pub const RPT_STATE:         u8 = 0x82;
+pub const RPT_ERROR:         u8 = 0x85;
+pub const RPT_WIFI_SCAN:     u8 = 0x86;
 
-const PTT_TIMEOUT_US: u64 = 30_000_000;
-const PC_HEARTBEAT_TIMEOUT_US: u64 = 3_000_000;
+pub const PTT_TIMEOUT_US: u64 = 30_000_000;
+pub const PC_HEARTBEAT_TIMEOUT_US: u64 = 3_000_000;
 
 // ===== TinyUSB minimal FFI (manual declarations) =====
 
@@ -69,7 +72,7 @@ unsafe extern "C" {
 }
 
 // ===== CRC16-CCITT =====
-fn crc16_ccitt(data: &[u8]) -> u16 {
+pub fn crc16_ccitt(data: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
     for &b in data {
         crc ^= (b as u16) << 8;
@@ -157,7 +160,36 @@ fn send_error(msg: &str) {
     send_frame(RPT_ERROR, &bytes[..len]);
 }
 
-fn send_state_report(rs: &RadioState) {
+/// 推送 WiFi 扫描结果（payload 可达 ~600 字节，使用 Vec 而非栈）
+/// 格式: [count:u8] [{ssid_len:u8, ssid[N], rssi:i8, auth:u8}]*
+fn send_wifi_scan_frame(items: &[crate::state::WifiAp]) {
+    unsafe { if !tusb_cdc_acm_initialized(TINYUSB_CDC_ACM_0) { return; } }
+    let mut payload: Vec<u8> = Vec::with_capacity(1 + items.len() * 35);
+    let count = items.len().min(16) as u8;
+    payload.push(count);
+    for ap in items.iter().take(16) {
+        let ssid = ap.ssid.as_bytes();
+        let slen = ssid.len().min(32);
+        payload.push(slen as u8);
+        payload.extend_from_slice(&ssid[..slen]);
+        payload.push(ap.rssi as u8);
+        payload.push(ap.auth);
+    }
+    let len = payload.len() as u16;
+    let mut frame: Vec<u8> = Vec::with_capacity(5 + payload.len() + 2);
+    frame.extend_from_slice(&[SYNC0, SYNC1, RPT_WIFI_SCAN, (len & 0xFF) as u8, (len >> 8) as u8]);
+    frame.extend_from_slice(&payload);
+    let crc = crc16_ccitt(&frame);
+    frame.push((crc & 0xFF) as u8);
+    frame.push((crc >> 8) as u8);
+    unsafe {
+        let _ = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, frame.as_ptr(), frame.len());
+        let _ = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 50);
+    }
+}
+
+/// 构造 60 字节 STATE_REPORT payload（不含帧头帧尾）
+pub fn make_state_payload(rs: &RadioState) -> [u8; 60] {
     let mut p = [0u8; 60];
     let mut flags: u8 = 0;
     if rs.radio_alive { flags |= 0x01; }
@@ -211,7 +243,117 @@ fn send_state_report(rs: &RadioState) {
     p[57] = ((rs.head_count >> 16) & 0xFF) as u8;
     p[58] = ((rs.head_count >> 24) & 0xFF) as u8;
     p[59] = (rs.pc_count & 0xFF) as u8;
+    p
+}
+
+fn send_state_report(rs: &RadioState) {
+    let p = make_state_payload(rs);
     send_frame(RPT_STATE, &p);
+}
+
+/// 构造 WIFI_SCAN payload 字节流（不含帧头帧尾）
+pub fn make_scan_payload(items: &[crate::state::WifiAp]) -> Vec<u8> {
+    let mut payload: Vec<u8> = Vec::with_capacity(1 + items.len() * 35);
+    let count = items.len().min(16) as u8;
+    payload.push(count);
+    for ap in items.iter().take(16) {
+        let ssid = ap.ssid.as_bytes();
+        let slen = ssid.len().min(32);
+        payload.push(slen as u8);
+        payload.extend_from_slice(&ssid[..slen]);
+        payload.push(ap.rssi as u8);
+        payload.push(ap.auth);
+    }
+    payload
+}
+
+/// 编码完整帧 (SYNC + Type + Len + Payload + CRC) 到 Vec
+pub fn encode_frame_vec(typ: u8, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() as u16;
+    let mut frame: Vec<u8> = Vec::with_capacity(5 + payload.len() + 2);
+    frame.extend_from_slice(&[SYNC0, SYNC1, typ, (len & 0xFF) as u8, (len >> 8) as u8]);
+    frame.extend_from_slice(payload);
+    let crc = crc16_ccitt(&frame);
+    frame.push((crc & 0xFF) as u8);
+    frame.push((crc >> 8) as u8);
+    frame
+}
+
+/// 处理 PC 命令的纯逻辑层（无 USB 依赖），返回需要发回的帧列表 [(typ, payload), ...]
+/// 调用者负责把这些帧通过相应通道（USB / TCP）发出。
+/// PowerToggle / SetWifiCred 内部 sleep 或 esp_restart()，会阻塞调用线程（USB pc_comm 或 TCP handler）。
+pub fn dispatch_command(
+    cmd: PcCommand,
+    state: &SharedState,
+    power_pin_num: i32,
+    now_us: u64,
+) -> Vec<(u8, Vec<u8>)> {
+    let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
+    match cmd {
+        PcCommand::Heartbeat => {
+            let mut s = state.lock().unwrap();
+            s.pc_alive = true;
+            s.pc_count = s.pc_count.wrapping_add(1);
+            s.pc_last_hb_us = now_us;
+            drop(s);
+            out.push((RPT_HEARTBEAT_ACK, Vec::new()));
+        }
+        PcCommand::GetState => {
+            let snap = state.lock().unwrap().clone();
+            out.push((RPT_STATE, make_state_payload(&snap).to_vec()));
+        }
+        PcCommand::RawKeyPress(key) => {
+            state.lock().unwrap().key_override = Some(key);
+        }
+        PcCommand::RawKeyRelease => {
+            state.lock().unwrap().key_release = true;
+        }
+        PcCommand::RawKnob(step) => {
+            state.lock().unwrap().knob_inject = Some(step);
+        }
+        PcCommand::SetVol(pct) => {
+            let mut s = state.lock().unwrap();
+            if pct == 0xFF { s.vol_override = None; }
+            else { s.vol_override = Some((20 + (pct as u32) * 940 / 100) as u16); s.vol_changed = true; }
+        }
+        PcCommand::SetSql(pct) => {
+            let mut s = state.lock().unwrap();
+            if pct == 0xFF { s.sql_override = None; }
+            else { s.sql_override = Some((20 + (pct as u32) * 980 / 100) as u16); s.sql_changed = true; }
+        }
+        PcCommand::SetPtt(on) => {
+            let mut s = state.lock().unwrap();
+            s.ptt_override = on;
+            if on { s.ptt_start_us = now_us; }
+        }
+        PcCommand::PowerToggle => {
+            log::info!("[PC通信] 收到开关机指令，GPIO{} 脉冲 1.2s", power_pin_num);
+            unsafe { gpio_set_level(power_pin_num, 1); }
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            unsafe { gpio_set_level(power_pin_num, 0); }
+            log::info!("[PC通信] GPIO{} 脉冲结束", power_pin_num);
+        }
+        PcCommand::WifiScan => {
+            state.lock().unwrap().scan_request = true;
+            log::info!("[PC通信] 收到 WiFi 扫描请求");
+        }
+        PcCommand::SetWifiCred { ssid, psk } => {
+            log::info!("[PC通信] 收到 WiFi 配网：SSID=\"{}\" PSK={}字节", ssid.as_str(), psk.len());
+            match write_wifi_creds_raw(ssid.as_str(), psk.as_str()) {
+                Ok(()) => {
+                    log::info!("[PC通信] WiFi 凭据已写入 NVS，1 秒后重启");
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    unsafe { esp_restart(); }
+                }
+                Err(e) => {
+                    log::error!("[PC通信] 写 NVS 失败: {}", e);
+                    let msg = format!("WiFi NVS 写入失败: {}", e);
+                    out.push((RPT_ERROR, msg.as_bytes().to_vec()));
+                }
+            }
+        }
+    }
+    out
 }
 
 enum ParseState { WaitSync0, WaitSync1, WaitType, WaitLenLo, WaitLenHi, Payload, WaitCrcLo, WaitCrcHi }
@@ -226,6 +368,8 @@ pub enum PcCommand {
     SetSql(u8),
     SetPtt(bool),
     PowerToggle,
+    SetWifiCred { ssid: heapless::String<32>, psk: heapless::String<64> },
+    WifiScan,
 }
 
 pub struct PcParser {
@@ -288,21 +432,39 @@ impl PcParser {
             CMD_SET_SQL if self.len >= 2 => Some(PcCommand::SetSql(self.payload[1])),
             CMD_SET_PTT if self.len >= 1 => Some(PcCommand::SetPtt(self.payload[0] != 0)),
             CMD_POWER_TOGGLE => Some(PcCommand::PowerToggle),
+            CMD_SET_WIFI_CRED if self.len >= 2 => {
+                // [ssid_len:1][ssid][psk_len:1][psk]
+                let plen = self.len as usize;
+                let p = &self.payload[..plen];
+                let slen = p[0] as usize;
+                if slen > 32 || slen + 2 > plen { return None; }
+                let psk_len_off = 1 + slen;
+                let pl = p[psk_len_off] as usize;
+                if pl > 64 || psk_len_off + 1 + pl > plen { return None; }
+                let ssid_bytes = &p[1..1+slen];
+                let psk_bytes  = &p[psk_len_off+1..psk_len_off+1+pl];
+                let mut ssid: heapless::String<32> = heapless::String::new();
+                let mut psk:  heapless::String<64> = heapless::String::new();
+                let _ = ssid.push_str(core::str::from_utf8(ssid_bytes).ok()?);
+                let _ = psk.push_str(core::str::from_utf8(psk_bytes).ok()?);
+                Some(PcCommand::SetWifiCred { ssid, psk })
+            }
+            CMD_WIFI_SCAN => Some(PcCommand::WifiScan),
             _ => None,
         }
     }
 }
 
 pub fn pc_comm_thread(
-    uart_host: &esp_idf_svc::hal::uart::UartDriver<'_>,
+    _uart_host: &esp_idf_svc::hal::uart::UartDriver<'_>,
     state: SharedState,
     power_pin_num: i32,
 ) {
     let mut parser = PcParser::new();
     let mut rx_buf = [0u8; 64];
     let init_us = unsafe { esp_timer_get_time() } as u64;
-    let mut last_hb_us = init_us;
     let mut last_report_us = init_us;
+    let mut last_pushed_scan_seq: u32 = 0;
 
     log::info!("[PC通信] TinyUSB CDC-ACM 线程启动");
 
@@ -315,8 +477,11 @@ pub fn pc_comm_thread(
                 if tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, rx_buf.as_mut_ptr(), rx_buf.len(), &mut rx_size) == ESP_OK && rx_size > 0 {
                     for i in 0..rx_size {
                         if let Some(cmd) = parser.feed(rx_buf[i]) {
-                            if matches!(cmd, PcCommand::Heartbeat) { last_hb_us = now_us; }
-                            handle_command(cmd, uart_host, &state, power_pin_num, now_us);
+                            // dispatch_command 内部已处理 Heartbeat 设置 pc_last_hb_us
+                            let frames = dispatch_command(cmd, &state, power_pin_num, now_us);
+                            for (typ, payload) in frames {
+                                send_frame(typ, &payload);
+                            }
                         }
                     }
                 }
@@ -331,23 +496,26 @@ pub fn pc_comm_thread(
             } else {
                 false
             }
-        }; // 锁在此释放，再调 write_flush 不阻塞中继线程
+        };
         if ptt_expired { send_error("PTT timeout"); }
 
-        if (now_us - last_hb_us) > PC_HEARTBEAT_TIMEOUT_US {
+        // 共享心跳超时检查（任意通道有心跳即视为 PC 在线）
+        let pc_timed_out = {
+            let s = state.lock().unwrap();
+            s.pc_alive && (now_us.saturating_sub(s.pc_last_hb_us)) > PC_HEARTBEAT_TIMEOUT_US
+        };
+        if pc_timed_out {
             let mut s = state.lock().unwrap();
-            if s.pc_alive {
-                s.pc_alive = false;
-                s.ptt_override = false;
-                s.vol_override = None;
-                s.sql_override = None;
-                s.key_override = None;
-                s.key_release = false;
-                s.knob_inject = None;
-                s.vol_changed = false;
-                s.sql_changed = false;
-                s.macro_running = false;
-            }
+            s.pc_alive = false;
+            s.ptt_override = false;
+            s.vol_override = None;
+            s.sql_override = None;
+            s.key_override = None;
+            s.key_release = false;
+            s.knob_inject = None;
+            s.vol_changed = false;
+            s.sql_changed = false;
+            s.macro_running = false;
         }
 
         // 仅在 PC 已连接（收到心跳）时才发送周期性报告，避免无人接收时 write_flush 空转
@@ -364,56 +532,54 @@ pub fn pc_comm_thread(
             last_report_us = now_us;
         }
 
+        // WiFi 扫描结果推送：检测 scan_seq 变化（仅当 PC 在线）
+        let scan_to_send = {
+            let s = state.lock().unwrap();
+            if s.pc_alive && s.scan_seq != last_pushed_scan_seq && !s.scanning {
+                last_pushed_scan_seq = s.scan_seq;
+                Some(s.scan_results.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(items) = scan_to_send {
+            log::info!("[PC通信] 推送 WiFi 扫描结果: {} 个 AP", items.len());
+            send_wifi_scan_frame(&items);
+        }
+
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
-fn handle_command(cmd: PcCommand, uart_host: &esp_idf_svc::hal::uart::UartDriver<'_>, state: &SharedState, power_pin_num: i32, now_us: u64) {
-    match cmd {
-        PcCommand::Heartbeat => {
-            let mut s = state.lock().unwrap();
-            s.pc_alive = true;
-            s.pc_count = s.pc_count.wrapping_add(1);
-            drop(s);
-            send_ack();
-        }
-        PcCommand::GetState => {
-            let snapshot = state.lock().unwrap().clone();
-            send_state_report(&snapshot);
-        }
-        PcCommand::RawKeyPress(key) => {
-            let mut s = state.lock().unwrap();
-            s.key_override = Some(key);
-        }
-        PcCommand::RawKeyRelease => {
-            let mut s = state.lock().unwrap();
-            s.key_release = true;
-        }
-        PcCommand::RawKnob(step) => {
-            let mut s = state.lock().unwrap();
-            s.knob_inject = Some(step);
-        }
-        PcCommand::SetVol(pct) => {
-            let mut s = state.lock().unwrap();
-            if pct == 0xFF { s.vol_override = None; }
-            else { s.vol_override = Some((20 + (pct as u32) * 940 / 100) as u16); s.vol_changed = true; }
-        }
-        PcCommand::SetSql(pct) => {
-            let mut s = state.lock().unwrap();
-            if pct == 0xFF { s.sql_override = None; }
-            else { s.sql_override = Some((20 + (pct as u32) * 980 / 100) as u16); s.sql_changed = true; }
-        }
-        PcCommand::SetPtt(on) => {
-            let mut s = state.lock().unwrap();
-            s.ptt_override = on;
-            if on { s.ptt_start_us = now_us; }
-        }
-        PcCommand::PowerToggle => {
-            log::info!("[PC通信] 收到开关机指令，GPIO{} 脉冲 1.2s", power_pin_num);
-            unsafe { gpio_set_level(power_pin_num, 1); }
-            std::thread::sleep(std::time::Duration::from_millis(1200));
-            unsafe { gpio_set_level(power_pin_num, 0); }
-            log::info!("[PC通信] GPIO{} 脉冲结束", power_pin_num);
-        }
+// handle_command 已被 dispatch_command 替代
+
+/// 用 ESP-IDF 裸 NVS API 写入 SSID/PSK，namespace="wifi"
+/// 与 wifi.rs 中 EspNvs::new 同 namespace；nvs_flash_init 已由 EspDefaultNvsPartition::take 完成
+pub fn write_wifi_creds_raw(ssid: &str, psk: &str) -> Result<(), String> {
+    use core::ffi::c_char;
+    let ns = b"wifi\0";
+    let key_ssid = b"ssid\0";
+    let key_psk  = b"psk\0";
+
+    let mut handle: nvs_handle_t = 0;
+    unsafe {
+        let r = nvs_open(ns.as_ptr() as *const c_char, nvs_open_mode_t_NVS_READWRITE, &mut handle);
+        if r != ESP_OK { return Err(format!("nvs_open={}", r)); }
+
+        // 用零结尾的临时 buffer 写入（nvs_set_str 需要 NUL terminator）
+        let mut ssid_buf = [0u8; 33];
+        ssid_buf[..ssid.len()].copy_from_slice(ssid.as_bytes());
+        let r = nvs_set_str(handle, key_ssid.as_ptr() as *const c_char, ssid_buf.as_ptr() as *const c_char);
+        if r != ESP_OK { nvs_close(handle); return Err(format!("nvs_set_str(ssid)={}", r)); }
+
+        let mut psk_buf = [0u8; 65];
+        psk_buf[..psk.len()].copy_from_slice(psk.as_bytes());
+        let r = nvs_set_str(handle, key_psk.as_ptr() as *const c_char, psk_buf.as_ptr() as *const c_char);
+        if r != ESP_OK { nvs_close(handle); return Err(format!("nvs_set_str(psk)={}", r)); }
+
+        let r = nvs_commit(handle);
+        nvs_close(handle);
+        if r != ESP_OK { return Err(format!("nvs_commit={}", r)); }
     }
+    Ok(())
 }

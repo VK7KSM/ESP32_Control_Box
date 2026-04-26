@@ -13,6 +13,10 @@ mod uart;
 mod ui;
 mod pc_comm;
 mod macro_engine;
+mod wifi;
+mod discovery;
+mod pc_tcp;
+mod rigctld;
 
 use esp_idf_svc::hal::prelude::*;
 use esp_idf_svc::hal::rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse, TxRmtDriver};
@@ -144,14 +148,14 @@ fn main() {
         log::info!("ST7789 DMA 面板初始化完成");
     }
 
-    // ===== 双帧缓冲分配（PSRAM）=====
-    let mut fb = [framebuf::FrameBuf::new(), framebuf::FrameBuf::new()];
-    let mut fb_idx: usize = 0;  // 当前绘制用的缓冲索引
-    log::info!("双帧缓冲已分配 (2 × {}KB)", 240 * 320 * 2 / 1024);
+    // ===== 单帧缓冲（内部 SRAM，DMA-capable）=====
+    // PSRAM 与 WiFi 共享 GDMA 通道导致 LCD DMA 严重抖动；改用内部 SRAM
+    let mut fb = framebuf::FrameBuf::new();
+    log::info!("单帧缓冲已分配 ({}KB 内部 SRAM)", 240 * 320 * 2 / 1024);
 
     // ===== 开机画面 =====
-    ui::draw_splash(&mut fb[0]);
-    flush_fb_dma(&mut fb[0]);
+    ui::draw_splash(&mut fb);
+    flush_fb_dma(&mut fb);
     // 点亮背光（60% 亮度）
     let max_duty = backlight.get_max_duty();
     backlight.set_duty(max_duty * 60 / 100).unwrap();
@@ -224,51 +228,79 @@ fn main() {
         .expect("PC 通信线程启动失败");
     log::info!("PC 通信线程已启动");
 
+    // ===== WiFi STA 后台线程 =====
+    wifi::start_wifi_thread(peripherals.modem, shared.clone());
+    log::info!("WiFi 线程已启动");
+
+    // ===== LAN 设备发现（UDP 4534）=====
+    discovery::start_discovery_thread(shared.clone());
+
+    // ===== PC 通信 LAN 通道（TCP 4533，CRC16 协议与 USB 字节级一致）=====
+    pc_tcp::start_pc_tcp_thread(shared.clone(), 8);
+
+    // ===== Hamlib rigctld 文本协议服务器（TCP 4532）+ 频率步进线程 =====
+    rigctld::start_rigctld_thread(shared.clone());
+    rigctld::start_freq_stepper_thread(shared.clone());
+
     // ===== 初始绘制 =====
     {
         let s = shared.lock().unwrap();
-        ui::draw_main_ui(&mut fb[fb_idx], &s.left, &s.right, s.radio_alive, s.pc_alive);
+        ui::draw_main_ui(&mut fb, &s.left, &s.right, s.radio_alive, s.pc_alive,
+            &s.wifi_state, s.wifi_ip.as_str());
     }
-    flush_fb_dma(&mut fb[fb_idx]);
-    fb_idx = 1 - fb_idx;  // 切换到另一个缓冲
+    flush_fb_dma(&mut fb);
     log::info!("UI 就绪，进入主循环");
 
     // ===== 主循环: 双缓冲 + DMA 异步 =====
+    // - sleep 20ms（100Hz tick 下 = 2 tick 真实让出，IDLE0 不饿 → 无 watchdog）
+    // - 重绘最小间隔 50ms（20fps 上限，避免 SPI DMA queue 饱和）
     let mut last_body_count: u32 = 0;
     let mut last_head_count: u32 = 0;
     let mut last_pc_alive: bool = false;
+    let mut last_wifi_state: state::WifiState = state::WifiState::NoCredentials;
+    let mut last_wifi_ip: heapless::String<16> = heapless::String::new();
     let mut no_data_ticks:   u32 = 0;
+    let mut last_redraw_us: u64 = 0;
+    const MIN_REDRAW_INTERVAL_US: u64 = 200_000;  // 200ms = 5fps cap（PSRAM 帧缓冲 + WiFi 共享 DMA 时容易拥塞，状态显示 5fps 已足够）
 
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let now_us = unsafe { esp_timer_get_time() } as u64;
+        let can_redraw = now_us.saturating_sub(last_redraw_us) >= MIN_REDRAW_INTERVAL_US;
 
         if let Ok(mut s) = shared.try_lock() {
             let radio_changed = s.body_count != last_body_count || s.head_count != last_head_count;
             let pc_changed = s.pc_alive != last_pc_alive;
+            let wifi_changed = s.wifi_state != last_wifi_state || s.wifi_ip != last_wifi_ip;
 
-            if radio_changed || pc_changed {
+            if (radio_changed || pc_changed || wifi_changed) && can_redraw {
                 last_body_count = s.body_count;
                 last_head_count = s.head_count;
                 last_pc_alive = s.pc_alive;
+                last_wifi_state = s.wifi_state.clone();
+                last_wifi_ip.clear();
+                let _ = last_wifi_ip.push_str(s.wifi_ip.as_str());
                 no_data_ticks = 0;
-                let (left, right, alive, pc) = (
+                let (left, right, alive, pc, ws, ip) = (
                     s.left.clone(), s.right.clone(),
-                    s.radio_alive, s.pc_alive
+                    s.radio_alive, s.pc_alive,
+                    s.wifi_state.clone(), s.wifi_ip.clone()
                 );
                 drop(s);
-                // 画到当前缓冲 → swap 字节序 → DMA 提交（自动等上帧完成）→ 切换缓冲
-                ui::draw_main_ui(&mut fb[fb_idx], &left, &right, alive, pc);
-                flush_fb_dma(&mut fb[fb_idx]);
-                fb_idx = 1 - fb_idx;
-            } else {
+                ui::draw_main_ui(&mut fb, &left, &right, alive, pc, &ws, ip.as_str());
+                flush_fb_dma(&mut fb);
+                last_redraw_us = now_us;
+            } else if !radio_changed && !pc_changed && !wifi_changed {
                 no_data_ticks += 1;
-                if no_data_ticks == 3000 {
+                if no_data_ticks == 300 {  // 300 × 50ms = 15s
                     s.radio_alive = false;
-                    let (left, right, pc) = (s.left.clone(), s.right.clone(), s.pc_alive);
+                    let (left, right, pc, ws, ip) = (
+                        s.left.clone(), s.right.clone(), s.pc_alive,
+                        s.wifi_state.clone(), s.wifi_ip.clone()
+                    );
                     drop(s);
-                    ui::draw_main_ui(&mut fb[fb_idx], &left, &right, false, pc);
-                    flush_fb_dma(&mut fb[fb_idx]);
-                    fb_idx = 1 - fb_idx;
+                    ui::draw_main_ui(&mut fb, &left, &right, false, pc, &ws, ip.as_str());
+                    flush_fb_dma(&mut fb);
                 }
             }
         }

@@ -11,7 +11,7 @@ use embedded_graphics::primitives::{Line, PrimitiveStyleBuilder, Rectangle, Roun
 use embedded_graphics::text::{Alignment, Text};
 use profont::{PROFONT_24_POINT, PROFONT_14_POINT, PROFONT_12_POINT, PROFONT_9_POINT};
 
-use crate::state::{BandState, PowerLevel};
+use crate::state::{BandState, PowerLevel, WifiState};
 
 // ===== 配色 =====
 pub const BG:     Rgb565 = Rgb565::BLACK;
@@ -51,93 +51,6 @@ pub const GLYPH_XIN: [u16; 16] = [0x0840, 0x0820, 0x0BFE, 0x1000, 0x1000, 0x31FC
 pub const GLYPH_DAO: [u16; 16] = [0x0208, 0x2110, 0x1000, 0x17FC, 0x0080, 0x03F8, 0xF208, 0x13F8, 0x1208, 0x13F8, 0x1208, 0x13F8, 0x1208, 0x2800, 0x47FE, 0x0000]; // 道
 pub const GLYPH_JIAN: [u16; 16] = [0x2010, 0x2010, 0x3B7C, 0x2114, 0x41FE, 0x7A14, 0xA27C, 0x2710, 0xF97C, 0x2510, 0x25FE, 0x2210, 0x2A10, 0x3500, 0x28FE, 0x0000]; // 键
 pub const GLYPH_PAN: [u16; 16] = [0x0200, 0x0400, 0x1FF0, 0x1110, 0x1090, 0xFFFE, 0x1010, 0x1210, 0x2150, 0x4020, 0x3FF8, 0x2448, 0x2448, 0x2448, 0xFFFE, 0x0000]; // 盘
-
-/// 将协议原始菜单值翻译为人类易读字段（基于官方说明书）
-fn translate_menu_value(raw: &str) -> &str {
-    let exact: Option<&'static str> = match raw {
-        // #1 APO 自动关机时间（协议格式：XYH = X.YH，如 "05H"=0.5H，"10H"=1.0H）
-        "05H"    => Some("0.5H"),
-        "10H"    => Some("1.0H"),
-        "15H"    => Some("1.5H"),
-        "20H"    => Some("2.0H"),
-        // #3 ARTS
-        "INRNG"  => Some("IN RANGE"),
-        "ALWAYS" => Some("ALWAYS"),
-        // #6 DIMMER
-        "DIMOFF" => Some("OFF"),
-        // #8 DCS.N/R
-        "TRXN"   => Some("NORMAL"),
-        "TXR"    => Some("TX REV"),
-        "RXR"    => Some("RX REV"),
-        "TRXR"   => Some("TX+RX REV"),
-        // #9 DSP.MOD
-        "DSPFRQ" => Some("FREQUENCY"),
-        "DSPNAM" => Some("NAME"),
-        // #13 HYPER / #15 LOCK
-        "MANUAL" => Some("MANUAL"),
-        "AUTO"   => Some("AUTO"),
-        // #14 KEY.MOD
-        "KEY1"   => Some("KEY 1"),
-        "KEY2"   => Some("KEY 2"),
-        // #16 LOCKT
-        "BANDR"  => Some("RIGHT BAND"),
-        "BANDL"  => Some("LEFT BAND"),
-        "BOTH"   => Some("BOTH BANDS"),
-        // #17 MUTE（协议可能保留斜杠）
-        "TX"     => Some("TX ONLY"),
-        "RX"     => Some("RX ONLY"),
-        "TXRX"   => Some("TX & RX"),
-        "TX/RX"  => Some("TX & RX"),
-        // #24 RPT.MOD
-        "RPTOFF" => Some("OFF"),
-        "RPT-"   => Some("- SHIFT"),
-        "RPT+"   => Some("+ SHIFT"),
-        // #25 SCAN
-        "TIME"   => Some("TIME"),
-        "BUSY"   => Some("BUSY"),
-        // #26 SCAN MODE
-        "MEM"    => Some("MEMORY"),
-        "MSM"    => Some("PREF MEM"),
-        // #29 SPK 静噪模式
-        "SQ"     => Some("CARRIER"),
-        "CTC"    => Some("CTCSS"),
-        "TON"    => Some("TONE SQL"),
-        "C+T"    => Some("CTC+TONE"),
-        "C/T"    => Some("CTC/TONE"),
-        // #31 TONE M
-        "ENC"    => Some("ENCODE"),
-        "ENCDEC" => Some("ENC+DEC"),
-        "DCS"    => Some("DCS"),
-        // #34 WID.NAR
-        "WIDE"   => Some("WIDE"),
-        "NARROW" => Some("NARROW"),
-        // #42 HSD.TYP
-        "2TONE"  => Some("2-TONE"),
-        "5TONE"  => Some("5-TONE"),
-        "DTMF"   => Some("DTMF"),
-        // PG P1-P4 可编程键功能名
-        "BAND"   => Some("BAND"),
-        "VFOMR"  => Some("VFO/MR"),
-        "TONE"   => Some("TONE"),
-        "LOW"    => Some("LOW PWR"),
-        "SCAN"   => Some("SCAN"),
-        "SQLOFF" => Some("SQL OFF"),
-        "TCALL"  => Some("T-CALL"),
-        "RPTR"   => Some("REPEATER"),
-        "PRI"    => Some("PRIORITY"),
-        "MHZ"    => Some("MHZ STEP"),
-        "REV"    => Some("REVERSE"),
-        "HOME"   => Some("HOME"),
-        _ => None,
-    };
-    if let Some(s) = exact { return s; }
-    // 通用后缀模式：以 ON 结尾 → "ON"，以 OFF 结尾 → "OFF"
-    if raw.len() > 2 && raw.ends_with("ON")  { return "ON"; }
-    if raw.len() > 3 && raw.ends_with("OFF") { return "OFF"; }
-    // 数字值（频率、时间、DCS码等）直接显示
-    raw
-}
-
 
 fn draw_cjk_16<D: DrawTarget<Color = Rgb565>>(display: &mut D, x: i32, y: i32, glyph: &[u16; 16], color: Rgb565)
 where D::Error: core::fmt::Debug,
@@ -221,6 +134,8 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
     right: &BandState,
     radio_alive: bool,
     pc_alive: bool,
+    wifi_state: &WifiState,
+    wifi_ip: &str,
 ) where D::Error: core::fmt::Debug,
 {
     display.clear(BG).unwrap();
@@ -251,8 +166,16 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
         .into_styled(PrimitiveStyleBuilder::new().fill_color(PANEL).build())
         .draw(display).unwrap();
 
-    Text::new("00:00:00", Point::new(6, 314),
-        MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(CYAN).build())
+    // 左下角：WiFi 状态 / IP
+    let (wifi_text, wifi_color): (&str, Rgb565) = match wifi_state {
+        WifiState::Connected    => (wifi_ip, CYAN),
+        WifiState::Connecting   => ("WiFi:connect..", AMBER),
+        WifiState::NoCredentials => ("WiFi:no setup", GRAY),
+        WifiState::Failed       => ("WiFi:fail", GRAY),
+        WifiState::Disabled     => ("WiFi:OFF", GRAY),
+    };
+    Text::new(wifi_text, Point::new(6, 314),
+        MonoTextStyleBuilder::new().font(&PROFONT_12_POINT).text_color(wifi_color).build())
         .draw(display).unwrap();
 
     // PC 状态
@@ -277,53 +200,6 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
             Alignment::Right).draw(display).unwrap();
     }
 }
-
-// ===== SET 菜单名称查表（按菜单编号 1-42 索引）=====
-static MENU_NAMES: [&str; 43] = [
-    "",                 // 0: 占位
-    "AUTO PWR OFF",     // 1  APO        - Automatic Power Off
-    "AUTO RPT SHFT",    // 2  ARS        - Auto Repeater Shift
-    "ARTS SYSTEM",      // 3  ARTS       - Auto Range Transponder
-    "KEY BEEP",         // 4  BEEP
-    "CPU CLK SHIFT",    // 5  CLK.SFT   - CPU Clock Shift
-    "BACKLIGHT",        // 6  DIMMER
-    "DCS CODE",         // 7  DCS.COD
-    "DCS NORMAL/REV",   // 8  DCS.N/R   - DCS Normal/Reverse
-    "DISPLAY MODE",     // 9  DSP.MOD   - Display Mode
-    "DTMF DELAY",       // 10 DTMF D    - DTMF Delay
-    "DTMF SPEED",       // 11 DTMF S    - DTMF Speed
-    "DTMF MEMORY",      // 12 DTMF W    - DTMF Memory
-    "HYPER MEMORY",     // 13 HYPER     - Hyper Memory
-    "KEY MODE",         // 14 KEY.MOD
-    "KEY LOCK",         // 15 LOCK
-    "PTT LOCK",         // 16 LOCKT
-    "AUDIO MUTE",       // 17 MUTE
-    "CHANNEL NAME",     // 18 NAME
-    "MIC P1 FUNC",      // 19 PG P1
-    "MIC P2 FUNC",      // 20 PG P2
-    "MIC P3 FUNC",      // 21 PG P3
-    "MIC P4 FUNC",      // 22 PG P4
-    "RF SQUELCH",       // 23 RF SQL
-    "RPT MODE",         // 24 RPT.MOD
-    "SCAN RESUME",      // 25 SCAN      - Scan Resume mode
-    "SCAN TYPE",        // 26 SCAN MODE - Scan memory type
-    "RPT SHIFT",        // 27 SHIFT     - Repeater shift offset
-    "FREQ STEP",        // 28 STEP
-    "SQUELCH MODE",     // 29 SPK       - Squelch mode
-    "CTCSS FREQ",       // 30 TONE F    - CTCSS Frequency
-    "TONE MODE",        // 31 TONE M
-    "TX TIMEOUT",       // 32 TOT       - Time Out Timer
-    "TALK AROUND",      // 33 TALKAR    - Talk Around
-    "BANDWIDTH",        // 34 WID.NAR
-    "X-BAND RPT",       // 35 X-RPT     - Cross-band Repeater
-    "AM MODE",          // 36 AM
-    "AUTO AM",          // 37 AUT.AM
-    "2-TONE",           // 38 2TONE
-    "5-TONE",           // 39 5TONE
-    "SCRAMBLE",         // 40 SCR
-    "COMPANDER",        // 41 COMP
-    "SIGNAL SQL",       // 42 HSD.TYP   - Hybrid Signal Squelch Type
-];
 
 // ===== 单个波段面板 (136px) =====
 pub fn draw_band<D: DrawTarget<Color = Rgb565>>(
@@ -357,19 +233,9 @@ pub fn draw_band<D: DrawTarget<Color = Rgb565>>(
         Text::new("MAIN", Point::new(badge_x + 3, y + 11), main_txt).draw(display).unwrap();
     }
 
-    // 右侧: MT + channel（菜单模式下 "Ch:" → "Menu:" 前缀）
+    // 右侧: MT + channel
     let mut title_rx = 234i32;
-    let mut ch_buf: heapless::String<12> = heapless::String::new();
-    let ch_disp = if state.is_set
-        && state.channel.as_str().len() > 3
-        && state.channel.as_str().starts_with("Ch:")
-    {
-        let _ = ch_buf.push_str("Menu:");
-        let _ = ch_buf.push_str(&state.channel.as_str()[3..]);
-        ch_buf.as_str()
-    } else {
-        state.channel.as_str()
-    };
+    let ch_disp = state.channel.as_str();
     Text::with_alignment(ch_disp, Point::new(title_rx, y + 12), s9g, Alignment::Right)
         .draw(display).unwrap();
     title_rx -= (ch_disp.len() as i32) * 6 + 2;
@@ -386,12 +252,7 @@ pub fn draw_band<D: DrawTarget<Color = Rgb565>>(
         .fill_color(PANEL).stroke_color(BORDER).stroke_width(1).build())
         .draw(display).unwrap();
 
-    if state.is_set {
-        // 菜单模式：左上角显示 "SET" 标签，不显示偏移/亚音
-        Text::new("SET", Point::new(8, y + 28),
-            MonoTextStyleBuilder::new().font(&PROFONT_9_POINT).text_color(CYAN).build())
-            .draw(display).unwrap();
-    } else {
+    if state.display_text.is_empty() {
         if !state.shift.is_empty() {
             Text::new(state.shift.as_str(), Point::new(8, y + 28), s9a).draw(display).unwrap();
         }
@@ -422,28 +283,10 @@ pub fn draw_band<D: DrawTarget<Color = Rgb565>>(
         (freq_str, "")
     };
 
-    if state.is_set {
-        // 菜单模式：查表显示英文名（按菜单编号），不显示 FM/AM 和 MHz
-        let menu_num = state.channel.as_str()
-            .get(3..)                                   // 跳过 "Ch:" 前缀
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let menu_name = MENU_NAMES.get(menu_num)
-            .copied()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(state.menu_text.as_str());       // fallback: 协议原始文本
-        // 菜单名：左对齐，PROFONT_14_POINT（与 FM/AM 字号一致），黄色
-        Text::new(menu_name, Point::new(8, y + 48),
+    if !state.display_text.is_empty() {
+        Text::new(state.display_text.as_str(), Point::new(8, y + 48),
             MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(AMBER).build())
             .draw(display).unwrap();
-
-        // 当前设置值：仅在进入设置项后显示，与 "MHz" 字号位置一致，蓝色
-        if state.menu_in_value && !state.menu_text.is_empty() {
-            let val_str = translate_menu_value(state.menu_text.as_str());
-            Text::with_alignment(val_str, Point::new(230, y + 48),
-                MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(CYAN).build(),
-                Alignment::Right).draw(display).unwrap();
-        }
     } else {
         // 正常模式：mode + freq + MHz
         Text::new(state.mode.as_str(), Point::new(8, y + 48),

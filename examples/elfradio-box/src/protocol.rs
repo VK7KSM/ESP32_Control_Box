@@ -17,11 +17,14 @@ pub const CMD_SET_VOL: u8 = 0x25;
 pub const CMD_SET_SQL: u8 = 0x26;
 pub const CMD_SET_PTT: u8 = 0x27;
 pub const CMD_POWER_TOGGLE: u8 = 0x28;
+pub const CMD_SET_WIFI_CRED: u8 = 0x29;  // Payload: [ssid_len:1][ssid:N][psk_len:1][psk:M]
+pub const CMD_WIFI_SCAN:     u8 = 0x2A;  // 触发 WiFi 扫描
 
 // ESP32 → PC
 pub const RPT_HEARTBEAT_ACK: u8 = 0x81;
 pub const RPT_STATE_REPORT: u8 = 0x82;
 pub const RPT_ERROR: u8 = 0x85;
+pub const RPT_WIFI_SCAN: u8 = 0x86;  // Payload: [count:u8] [{ssid_len:u8, ssid[N], rssi:i8, auth:u8}]*
 
 pub fn crc16_ccitt(data: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;

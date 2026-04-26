@@ -318,17 +318,12 @@ impl DownParser {
                 let _ = band.channel.push_str("VFO");
             }
 
-            // 收到频率帧 → 延迟退出菜单模式（CTCSS 显示时频率/文本帧交替，不能每次频率帧都清空）
-            if band.is_set {
-                band.menu_exit_count += 1;
-                if band.menu_exit_count >= 2 {
-                    band.is_set = false;
-                    band.menu_text.clear();
-                    band.menu_in_value = false;
-                }
-            } else {
-                band.menu_exit_count = 0;
-            }
+            // 收到频率帧 → 机头已回到频率区，ESP32 同帧清空文本显示
+            band.display_text.clear();
+            band.is_set = false;
+            band.menu_text.clear();
+            band.menu_in_value = false;
+            band.menu_exit_count = 0;
 
             // 108-136 MHz = 民用航空 AM 波段（TH-9800 实测），直接按频率赋值，不依赖 cmd=0x10
             band.mode.clear();
@@ -337,6 +332,9 @@ impl DownParser {
             } else {
                 let _ = band.mode.push_str("FM");
             }
+
+            self.got_channel[side_idx] = false;
+            return;
         }
         // 非频率文本（模式名、菜单名）不更新 freq 字段
 
@@ -365,25 +363,24 @@ impl DownParser {
             }
         }
 
-        let had_channel = self.got_channel[side_idx];
+        band.is_set = false;
+        band.menu_text.clear();
+        band.menu_in_value = false;
+        band.menu_exit_count = 0;
         self.got_channel[side_idx] = false;
 
-        // 非频率 + 稳定显示标志 + 非功率文本 → 可能是菜单名称/当前值
-        if !is_freq && (flag & 0x40) != 0 && !detected_power {
-            let text_start = raw.iter().position(|&c| c > b' ').unwrap_or(6);
-            if text_start < 6 {
-                let mut new_text: heapless::String<12> = heapless::String::new();
-                for &c in &raw[text_start..] {
-                    if c > b' ' && c < 0x7F { let _ = new_text.push(c as char); }
-                }
-                if !new_text.is_empty() {
-                    if new_text != band.menu_text {
-                        band.menu_text = new_text;
-                    }
-                    band.is_set = true;
-                    band.menu_exit_count = 0;  // 收到文本帧，重置退出计数
-                    // had_channel=true → 刚收到 Len=06（顶级菜单滚动）；false → 在设置值中
-                    band.menu_in_value = !had_channel;
+        if detected_power {
+            band.display_text.clear();
+            return;
+        }
+
+        let first = raw.iter().position(|&c| c > b' ');
+        let last = raw.iter().rposition(|&c| c > b' ');
+        if let (Some(first), Some(last)) = (first, last) {
+            band.display_text.clear();
+            for &c in &raw[first..=last] {
+                if c >= b' ' && c < 0x7F {
+                    let _ = band.display_text.push(c as char);
                 }
             }
         }

@@ -1,15 +1,64 @@
 // ===================================================================
-// 串口连接管理 + RX/TX 线程
+// 通信链路抽象层 (Transport)
+//   - Usb(SerialPort) — 现有 USB CDC-ACM 通道
+//   - Tcp(TcpStream)  — LAN 上的 ESP32（端口 4533，CRC16 协议字节级一致）
 //
-// 使用 Arc<Mutex<>> 共享串口（Windows USB CDC 的 try_clone 写入可能不可靠）
+// RX/TX 线程对 Transport 操作，业务代码不感知底层介质。
 // ===================================================================
 
 use crate::protocol::{self, ParseEvent, FrameParser};
 use crate::state::{self, SharedState};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-pub type SharedPort = Arc<Mutex<Box<dyn serialport::SerialPort>>>;
+/// 通信链路：USB 串口或 TCP socket
+pub enum Transport {
+    Serial(Box<dyn serialport::SerialPort>),
+    Tcp(TcpStream),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Transport::Serial(p) => p.read(buf),
+            Transport::Tcp(s)    => s.read(buf),
+        }
+    }
+}
+impl Write for Transport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Transport::Serial(p) => p.write(buf),
+            Transport::Tcp(s)    => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Transport::Serial(p) => p.flush(),
+            Transport::Tcp(s)    => s.flush(),
+        }
+    }
+}
+
+pub type SharedPort = Arc<Mutex<Transport>>;
+
+/// 选路目标
+#[derive(Debug, Clone)]
+pub enum TransportTarget {
+    Usb(String),       // COM 端口
+    Lan(String),       // IP 地址（"192.168.1.42"）
+}
+
+impl std::fmt::Display for TransportTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportTarget::Usb(p) => write!(f, "USB:{}", p),
+            TransportTarget::Lan(ip) => write!(f, "LAN:{}", ip),
+        }
+    }
+}
 
 /// 串口事件（RX 线程 → 主线程）
 pub enum SerialEvent {
@@ -39,9 +88,7 @@ pub fn list_ports() -> Vec<(String, String)> {
     }
 }
 
-/// 自动检测串口：只返回 Espressif OTG CDC-ACM 口
-/// 排除 USB JTAG/Serial debug 口（VID=0x303A PID=0x1001，打开会触发 ESP32 复位）
-/// 不做单一串口 fallback，避免误连 CH343 等非 ESP32 设备
+/// 自动检测 USB 串口：仅 Espressif OTG（VID=0x303A, PID≠0x1001）
 pub fn auto_detect_port() -> Option<String> {
     if let Ok(ports) = serialport::available_ports() {
         for p in &ports {
@@ -55,7 +102,20 @@ pub fn auto_detect_port() -> Option<String> {
     None
 }
 
-/// 打开串口，返回 Arc<Mutex> 共享句柄
+/// 自动选路：USB 优先，找不到则 LAN UDP 扫描
+/// 返回首个可用 target，都没有则 None
+pub fn auto_detect_any() -> Option<TransportTarget> {
+    if let Some(name) = auto_detect_port() {
+        return Some(TransportTarget::Usb(name));
+    }
+    // LAN 扫描（UDP 4534）
+    match crate::discovery::scan(2000) {
+        Ok(devs) if !devs.is_empty() => Some(TransportTarget::Lan(devs[0].ip.clone())),
+        _ => None,
+    }
+}
+
+/// 打开 USB 串口
 pub fn open_port(name: &str) -> Result<SharedPort, String> {
     let mut port = serialport::new(name, 115200)
         .timeout(Duration::from_millis(50))
@@ -69,10 +129,59 @@ pub fn open_port(name: &str) -> Result<SharedPort, String> {
         return Err(format!("设置 RTS 失败: {}", e));
     }
 
-    Ok(Arc::new(Mutex::new(port)))
+    Ok(Arc::new(Mutex::new(Transport::Serial(port))))
 }
 
-/// 向串口写帧（加锁 + flush）
+/// 打开 TCP 4533 连接到 ESP32
+pub fn open_tcp(ip: &str) -> Result<SharedPort, String> {
+    use std::net::SocketAddr;
+    let addr: SocketAddr = format!("{}:4533", ip).parse()
+        .map_err(|e| format!("IP 格式错误: {}", e))?;
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|e| format!("连接 {} 失败: {}", addr, e))?;
+    stream.set_read_timeout(Some(Duration::from_millis(50)))
+        .map_err(|e| format!("set_read_timeout: {}", e))?;
+    let _ = stream.set_nodelay(true);
+    Ok(Arc::new(Mutex::new(Transport::Tcp(stream))))
+}
+
+/// 按 target 打开链路
+pub fn open_target(t: &TransportTarget) -> Result<SharedPort, String> {
+    match t {
+        TransportTarget::Usb(name) => open_port(name),
+        TransportTarget::Lan(ip)   => open_tcp(ip),
+    }
+}
+
+/// 一次性同步操作：打开 Transport 直接拥有（不进 Arc<Mutex>），用于
+/// initial_state_check / WiFi 配网 / WiFi 扫描等单线程过程
+pub fn open_oneshot(t: &TransportTarget, read_timeout_ms: u64) -> Result<Transport, String> {
+    match t {
+        TransportTarget::Usb(name) => {
+            let mut port = serialport::new(name, 115200)
+                .timeout(Duration::from_millis(read_timeout_ms))
+                .open().map_err(|e| format!("打开 {} 失败: {}", name, e))?;
+            port.write_data_terminal_ready(false)
+                .map_err(|e| format!("DTR: {}", e))?;
+            port.write_request_to_send(false)
+                .map_err(|e| format!("RTS: {}", e))?;
+            Ok(Transport::Serial(port))
+        }
+        TransportTarget::Lan(ip) => {
+            use std::net::SocketAddr;
+            let addr: SocketAddr = format!("{}:4533", ip).parse()
+                .map_err(|e| format!("IP 格式: {}", e))?;
+            let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+                .map_err(|e| format!("连接 {} 失败: {}", addr, e))?;
+            stream.set_read_timeout(Some(Duration::from_millis(read_timeout_ms)))
+                .map_err(|e| format!("set_read_timeout: {}", e))?;
+            let _ = stream.set_nodelay(true);
+            Ok(Transport::Tcp(stream))
+        }
+    }
+}
+
+/// 写入帧（加锁 + flush）
 pub fn send_frame(port: &SharedPort, frame: &[u8]) {
     if let Ok(mut p) = port.lock() {
         let _ = p.write_all(frame);
@@ -80,14 +189,14 @@ pub fn send_frame(port: &SharedPort, frame: &[u8]) {
     }
 }
 
-/// RX 线程：读串口 → 解析帧 → 更新状态
+/// RX 线程
 pub fn spawn_rx_thread(
     port: SharedPort,
     shared: SharedState,
     event_tx: mpsc::Sender<SerialEvent>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("serial_rx".into())
+        .name("link_rx".into())
         .spawn(move || {
             let mut parser = FrameParser::new();
             let mut buf = [0u8; 256];
@@ -99,8 +208,14 @@ pub fn spawn_rx_thread(
                         Err(_) => { std::thread::sleep(Duration::from_millis(10)); continue; }
                     };
                     match p.read(&mut buf) {
+                        Ok(0) => {
+                            // TCP 端发 FIN 关闭
+                            let _ = event_tx.send(SerialEvent::Disconnected);
+                            break;
+                        }
                         Ok(n) => n,
-                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => 0,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut
+                                   || e.kind() == std::io::ErrorKind::WouldBlock => 0,
                         Err(_) => {
                             let _ = event_tx.send(SerialEvent::Disconnected);
                             break;
@@ -126,7 +241,7 @@ pub fn spawn_rx_thread(
                 }
             }
         })
-        .expect("Serial RX 线程启动失败")
+        .expect("Link RX 线程启动失败")
 }
 
 fn handle_frame(typ: u8, payload: &[u8], shared: &SharedState, event_tx: &mpsc::Sender<SerialEvent>) -> bool {
@@ -155,7 +270,7 @@ pub fn spawn_tx_thread(
     cmd_rx: mpsc::Receiver<Vec<u8>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("serial_tx".into())
+        .name("link_tx".into())
         .spawn(move || {
             let heartbeat = protocol::encode_frame(protocol::CMD_HEARTBEAT, &[]);
             let mut last_hb = std::time::Instant::now();
@@ -175,5 +290,5 @@ pub fn spawn_tx_thread(
                 }
             }
         })
-        .expect("Serial TX 线程启动失败")
+        .expect("Link TX 线程启动失败")
 }

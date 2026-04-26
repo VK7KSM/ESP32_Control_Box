@@ -51,6 +51,9 @@ pub enum CliCommand {
 
     // ── 被动收听（长期运行，无 TUI）──────────────────────────────
     Listen(ListenOptions),
+
+    // ── LAN 扫描（不需要串口）──────────────────────────────
+    Scan,
 }
 
 // ===== 参数解析 =====
@@ -97,6 +100,7 @@ pub fn parse_args() -> Result<CliArgs, String> {
 
     let command = match cmd_str.as_str() {
         "monitor" => CliCommand::Monitor,
+        "scan" | "lan-scan" => CliCommand::Scan,
 
         "set-freq" | "freq" => {
             if i + 1 >= args.len() {
@@ -410,7 +414,7 @@ pub fn run_command(
     match cmd {
         CliCommand::Help | CliCommand::Monitor
         | CliCommand::Flash { .. } | CliCommand::FlashCheck
-        | CliCommand::Listen(_) => {
+        | CliCommand::Listen(_) | CliCommand::Scan => {
             // 这些命令在 main.rs 中特殊处理，不应到达这里
             unreachable!()
         }

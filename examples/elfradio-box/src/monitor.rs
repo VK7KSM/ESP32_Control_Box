@@ -119,8 +119,28 @@ pub fn run_monitor_persistent(port_name: &str, shared: SharedState) {
     pstate.notification = Some(("等待控制盒连接...".to_string(), Instant::now(), true));
     draw_bottom_bar(tw, th, &Mode::Idle, &shared, &pstate);
 
+    // 把 port_name（可能是 "lan:1.2.3.4" 或 COM 名）转为初始 Target
+    let mut target: serial_link::TransportTarget = if port_name.starts_with("lan:") {
+        serial_link::TransportTarget::Lan(port_name.trim_start_matches("lan:").to_string())
+    } else if port_name.parse::<std::net::Ipv4Addr>().is_ok() {
+        serial_link::TransportTarget::Lan(port_name.to_string())
+    } else {
+        serial_link::TransportTarget::Usb(port_name.to_string())
+    };
+    let mut last_target_label = format!("{}", target);
+
     'outer: loop {
-        match serial_link::open_port(port_name) {
+        // 每次进入 open 前重新自动选路：USB 优先，USB 不可用就走 LAN
+        // 这样 USB 拔出 → LAN 接管，LAN 断 → USB 接管，全自动 failover
+        if let Some(t) = serial_link::auto_detect_any() {
+            let lbl = format!("{}", t);
+            if lbl != last_target_label {
+                pstate.notification = Some((format!("链路切换为 {}", lbl), Instant::now(), false));
+                last_target_label = lbl;
+            }
+            target = t;
+        }
+        match serial_link::open_target(&target) {
             Ok(port) => {
                 // 先重置共享状态，再绘制 UI（draw_title_bar 读取 radio_alive，必须先清零）
                 {

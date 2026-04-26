@@ -13,6 +13,7 @@ mod tts;
 mod config;
 mod firmware;
 mod listen;
+mod discovery;
 
 use crossterm::style::Stylize;
 use std::sync::mpsc;
@@ -24,6 +25,12 @@ use std::time::Duration;
 fn read_menu_line() -> String {
     use crossterm::{event::{self, Event, KeyCode, KeyEventKind}, terminal};
     let _ = terminal::enable_raw_mode();
+    // 等待 50ms 让 prompt 输出 + 事件队列稳定，避免 raw_mode 切换瞬间首字符丢失
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Drain 残留事件（前一次 read_menu_line 退出时 Enter 的 Release 事件等）
+    while event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+        let _ = event::read();
+    }
     let mut buf = String::new();
     loop {
         match event::read() {
@@ -93,6 +100,14 @@ fn main() {
         return;
     }
 
+    // ── scan：LAN 扫描，无需串口 ────────────────────────────────
+    if matches!(cli_args.command, cli::CliCommand::Scan) {
+        ui::print_banner();
+        println!();
+        run_lan_scan_cli();
+        return;
+    }
+
     // ── listen：需要 OTG 串口，长期运行，无 TUI ──────────────────────
     if let cli::CliCommand::Listen(opts) = cli_args.command {
         ui::print_banner();
@@ -115,9 +130,10 @@ fn main() {
     };
 
     let shared = state::new_shared_state();
-    let port = match serial_link::open_port(&port_name) {
+    let target = parse_target(&port_name);
+    let port = match serial_link::open_target(&target) {
         Ok(p) => {
-            ui::print_ok(&format!("串口 {} 已连接", port_name));
+            ui::print_ok(&format!("链路已连接: {}", target));
             p
         }
         Err(e) => {
@@ -166,29 +182,51 @@ fn main() {
 
 // ── 交互主菜单模式 ─────────────────────────────────────────────────
 
-/// 解析并等待串口就绪：指定端口 → 自动检测 → 无限等待直到出现
+/// 解析并等待链路就绪：指定 USB 端口/IP → 自动检测（USB 优先 → LAN 兜底）→ 无限等待
 fn resolve_port_or_wait(forced: Option<&str>) -> String {
     match forced {
         Some(p) => {
-            ui::print_ok(&format!("使用指定串口: {}", p));
+            ui::print_ok(&format!("使用指定: {}", p));
             p.to_string()
         }
-        None => match serial_link::auto_detect_port() {
-            Some(name) => {
-                ui::print_ok(&format!("自动检测到 ESP32: {}", name));
-                name
-            }
-            None => {
-                ui::print_info("未检测到 ESP32，等待连接... (Ctrl+C 退出)");
-                loop {
-                    std::thread::sleep(Duration::from_secs(2));
-                    if let Some(name) = serial_link::auto_detect_port() {
-                        ui::print_ok(&format!("自动检测到 ESP32: {}", name));
-                        break name;
+        None => {
+            ui::print_info("自动选路：USB 优先 → LAN 兜底");
+            match serial_link::auto_detect_any() {
+                Some(t) => {
+                    ui::print_ok(&format!("已选择: {}", t));
+                    target_to_str(&t)
+                }
+                None => {
+                    ui::print_info("未检测到 ESP32（USB 与 LAN 都无），等待连接... (Ctrl+C 退出)");
+                    loop {
+                        std::thread::sleep(Duration::from_secs(2));
+                        if let Some(t) = serial_link::auto_detect_any() {
+                            ui::print_ok(&format!("已选择: {}", t));
+                            break target_to_str(&t);
+                        }
                     }
                 }
             }
-        },
+        }
+    }
+}
+
+/// 把 forced/auto 字符串映射回 Target，支持 "192.168.x.x" / "lan:..." / 普通 COM 名
+fn parse_target(s: &str) -> serial_link::TransportTarget {
+    if s.starts_with("lan:") {
+        serial_link::TransportTarget::Lan(s.trim_start_matches("lan:").to_string())
+    } else if s.parse::<std::net::Ipv4Addr>().is_ok() {
+        serial_link::TransportTarget::Lan(s.to_string())
+    } else {
+        serial_link::TransportTarget::Usb(s.to_string())
+    }
+}
+
+/// 反向：Target 转回字符串（用于上层主菜单显示和后续 open）
+fn target_to_str(t: &serial_link::TransportTarget) -> String {
+    match t {
+        serial_link::TransportTarget::Usb(p) => p.clone(),
+        serial_link::TransportTarget::Lan(ip) => format!("lan:{}", ip),
     }
 }
 
@@ -221,6 +259,7 @@ fn run_interactive(forced_port: Option<&str>, direct_tui: bool) {
         println!("  {} 连接状态     ESP32 / 电台 / 声卡信息", "[2]".yellow().bold());
         println!("  {} 设置         TTS 声线 / 降噪默认值", "[3]".yellow().bold());
         println!("  {} 固件更新     联网检查并烧录最新 ESP32 固件", "[4]".yellow().bold());
+        println!("  {} WiFi 配网    输入 SSID/PSK，控制盒重启后自动连 WiFi", "[5]".yellow().bold());
         println!();
         println!("  {} 退出", "[0]".yellow().bold());
         println!();
@@ -257,12 +296,52 @@ fn run_interactive(forced_port: Option<&str>, direct_tui: bool) {
                 println!();
                 run_firmware_update();
             }
+            "5" => {
+                println!();
+                run_wifi_setup(&port_name);
+            }
             "0" | "q" => break,
             _ => {}
         }
     }
 
     println!("再见！ 73 de VK7KSM");
+}
+
+// ── LAN 扫描（CLI）──────────────────────────────────────────────────
+
+fn run_lan_scan_cli() {
+    use crossterm::style::Stylize;
+    println!("  正在 UDP 广播扫描 LAN 上的 ESP32 控制盒...（等 2 秒）");
+    let devs = match discovery::scan(2000) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("  {} 扫描失败: {}", " ERR".on_dark_red().white().bold(), e);
+            std::process::exit(1);
+        }
+    };
+    if devs.is_empty() {
+        println!();
+        println!("  未发现任何控制盒。检查项：");
+        println!("    1. 控制盒已开机且 WiFi 屏幕显示 IP");
+        println!("    2. PC 与控制盒在同一 LAN（不能跨 VLAN/AP 隔离）");
+        println!("    3. 防火墙未拦截 UDP 4534");
+        std::process::exit(2);
+    }
+    println!();
+    println!("  发现 {} 台控制盒：", devs.len().to_string().yellow().bold());
+    println!();
+    println!("  {:<16} {:<10} {:<10} {}", "IP", "Serial", "Ver", "Rig");
+    for d in &devs {
+        println!("  {:<16} {:<10} {:<10} {}",
+            d.ip.as_str().cyan(),
+            d.serial.as_str().yellow(),
+            d.version.as_str().dark_grey(),
+            d.rigtype.as_str().green(),
+        );
+    }
+    println!();
+    std::process::exit(0);
 }
 
 // ── CLI 版固件版本查询（仅查，不烧）────────────────────────────────
@@ -586,6 +665,223 @@ fn run_firmware_update() {
     let _ = read_menu_line();
 }
 
+struct ScanAp { ssid: String, rssi: i8, auth: u8 }
+
+fn auth_label(a: u8) -> &'static str {
+    match a {
+        0 => "开放",
+        1 => "WEP",
+        2 => "WPA",
+        3 => "WPA2",
+        4 => "WPA/WPA2",
+        5 => "WPA2-Ent",
+        6 => "WPA3",
+        7 => "WPA2/WPA3",
+        _ => "?",
+    }
+}
+
+fn rssi_bars(r: i8) -> &'static str {
+    if r >= -55 { "▂▃▅█" }
+    else if r >= -67 { "▂▃▅▁" }
+    else if r >= -75 { "▂▃▁▁" }
+    else { "▂▁▁▁" }
+}
+
+/// 发 CMD_WIFI_SCAN，等 ESP32 回 RPT_WIFI_SCAN（最多 wait_secs 秒）
+fn request_scan(port_name: &str, wait_secs: u64) -> Result<Vec<ScanAp>, String> {
+    use std::io::{Read, Write};
+    let target = parse_target(port_name);
+    let mut port = serial_link::open_oneshot(&target, 200)?;
+
+    // 先发心跳建立 pc_alive
+    let hb = protocol::encode_frame(protocol::CMD_HEARTBEAT, &[]);
+    let _ = port.write_all(&hb);
+    let _ = port.flush();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let scan_frame = protocol::encode_frame(protocol::CMD_WIFI_SCAN, &[]);
+    let _ = port.write_all(&scan_frame);
+    let _ = port.flush();
+
+    let mut parser = protocol::FrameParser::new();
+    let mut buf = [0u8; 1024];
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait_secs);
+    while std::time::Instant::now() < deadline {
+        // 持续发心跳保活
+        let _ = port.write_all(&hb);
+        let _ = port.flush();
+        match port.read(&mut buf) {
+            Ok(n) => {
+                for b in &buf[..n] {
+                    if let Some(evt) = parser.feed(*b) {
+                        if let protocol::ParseEvent::Frame { typ, payload } = evt {
+                            if typ == protocol::RPT_WIFI_SCAN {
+                                return Ok(decode_scan(&payload));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("串口读错误: {}", e)),
+        }
+    }
+    Err(format!("等待 RPT_WIFI_SCAN 超时（{}秒）", wait_secs))
+}
+
+fn decode_scan(p: &[u8]) -> Vec<ScanAp> {
+    if p.is_empty() { return vec![]; }
+    let count = p[0] as usize;
+    let mut items = Vec::with_capacity(count);
+    let mut i = 1;
+    for _ in 0..count {
+        if i >= p.len() { break; }
+        let slen = p[i] as usize;
+        i += 1;
+        if i + slen + 2 > p.len() { break; }
+        let ssid = String::from_utf8_lossy(&p[i..i+slen]).to_string();
+        i += slen;
+        let rssi = p[i] as i8;
+        i += 1;
+        let auth = p[i];
+        i += 1;
+        items.push(ScanAp { ssid, rssi, auth });
+    }
+    items
+}
+
+fn run_wifi_setup(port_name: &str) {
+    use crossterm::style::Stylize;
+    println!("{}", "─".repeat(60).dark_grey());
+    println!("  {} WiFi 配网", "elfRadio BOX".cyan().bold());
+    println!("{}", "─".repeat(60).dark_grey());
+    println!();
+    println!("  正在请求 ESP32 扫描周边 WiFi...（最多 8 秒）");
+
+    let aps = match request_scan(port_name, 12) {
+        Ok(list) if !list.is_empty() => list,
+        Ok(_) => {
+            ui::print_warn("ESP32 未扫描到任何 AP（可能 WiFi 天线未接好或周围无 2.4GHz 网络）");
+            println!("  按 Enter 返回...");
+            let _ = read_menu_line();
+            return;
+        }
+        Err(e) => {
+            ui::print_err(&format!("扫描失败: {}", e));
+            println!("  按 Enter 返回...");
+            let _ = read_menu_line();
+            return;
+        }
+    };
+
+    println!();
+    println!("  发现 {} 个 WiFi 网络：", aps.len().to_string().yellow().bold());
+    println!();
+    for (i, ap) in aps.iter().enumerate() {
+        println!("    {}  {}  {} dBm  {}  {}",
+            format!("[{}]", i+1).yellow().bold(),
+            rssi_bars(ap.rssi).cyan(),
+            format!("{:>3}", ap.rssi).dark_grey(),
+            format!("{:<10}", auth_label(ap.auth)).dark_cyan(),
+            ap.ssid.as_str().white(),
+        );
+    }
+    println!();
+    print!("  选择编号（或输入 m 手动输入 SSID，0 取消） > ");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let sel = read_menu_line();
+    let sel = sel.trim().to_string();
+
+    let ssid = if sel.eq_ignore_ascii_case("m") {
+        print!("  SSID > ");
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        read_menu_line().trim().to_string()
+    } else if sel == "0" || sel.is_empty() {
+        println!("  已取消。");
+        return;
+    } else {
+        match sel.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= aps.len() => aps[n-1].ssid.clone(),
+            _ => {
+                ui::print_err("无效编号");
+                println!("  按 Enter 返回...");
+                let _ = read_menu_line();
+                return;
+            }
+        }
+    };
+
+    if ssid.is_empty() || ssid.len() > 32 {
+        ui::print_err("SSID 长度无效");
+        println!("  按 Enter 返回...");
+        let _ = read_menu_line();
+        return;
+    }
+
+    print!("  PSK（密码，留空=开放 WiFi） > ");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let psk = read_menu_line().trim().to_string();
+    if psk.len() > 64 {
+        ui::print_err("PSK 超过 64 字节");
+        println!("  按 Enter 返回...");
+        let _ = read_menu_line();
+        return;
+    }
+    println!();
+    println!("  ─── 请核对（防止首字符丢失）──────────────");
+    println!("  SSID: \"{}\"  ({} 字节)", ssid.as_str().yellow(), ssid.len());
+    println!("  PSK : \"{}\"  ({} 字节)", psk.as_str().yellow(), psk.len());
+    println!();
+    print!("  确认烧录到控制盒？(Y/其他=取消) > ");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let confirm = read_menu_line();
+    if confirm.trim().to_lowercase() != "y" {
+        println!("  已取消。");
+        return;
+    }
+
+    let mut payload = Vec::with_capacity(2 + ssid.len() + psk.len());
+    payload.push(ssid.len() as u8);
+    payload.extend_from_slice(ssid.as_bytes());
+    payload.push(psk.len() as u8);
+    payload.extend_from_slice(psk.as_bytes());
+    let frame = protocol::encode_frame(protocol::CMD_SET_WIFI_CRED, &payload);
+
+    use std::io::Write;
+    let target = parse_target(port_name);
+    let mut port = match serial_link::open_oneshot(&target, 100) {
+        Ok(p) => p,
+        Err(e) => {
+            ui::print_err(&format!("打开链路失败: {}", e));
+            println!("  按 Enter 返回...");
+            let _ = read_menu_line();
+            return;
+        }
+    };
+
+    let hb = protocol::encode_frame(protocol::CMD_HEARTBEAT, &[]);
+    let _ = port.write_all(&hb);
+    let _ = port.flush();
+    std::thread::sleep(Duration::from_millis(200));
+
+    if port.write_all(&frame).is_err() {
+        ui::print_err("发送凭据帧失败");
+        println!("  按 Enter 返回...");
+        let _ = read_menu_line();
+        return;
+    }
+    let _ = port.flush();
+
+    println!();
+    ui::print_ok(&format!("已发送配网帧：SSID={} PSK={}字节", ssid.as_str().yellow(), psk.len()));
+    ui::print_info("控制盒应在 1 秒内重启，重启后会自动连接 WiFi");
+    ui::print_info("若屏幕左下角变为 IP 地址，则配网成功");
+    println!();
+    println!("  按 Enter 返回主菜单...");
+    let _ = read_menu_line();
+}
+
 fn run_settings() {
     let mut cfg = config::load_config();
     loop {
@@ -650,20 +946,18 @@ fn resolve_port(forced: Option<&str>) -> Option<String> {
     serial_link::auto_detect_port()
 }
 
-/// 主菜单启动前的一次性状态查询（同步、无线程、函数返回后串口 100% 释放）
+/// 主菜单启动前的一次性状态查询（同步、无线程、函数返回后链路 100% 释放）
 fn initial_state_check(port_name: &str, shared: &state::SharedState) {
+    use std::io::{Read, Write};
     ui::print_info("正在获取 ESP32 状态...");
-    let mut port = match serialport::new(port_name, 115_200)
-        .timeout(Duration::from_millis(100))
-        .open() {
+    let target = parse_target(port_name);
+    let mut port = match serial_link::open_oneshot(&target, 100) {
         Ok(p) => p,
         Err(_) => {
-            ui::print_warn("串口暂时不可用，跳过状态检测");
+            ui::print_warn("链路暂时不可用，跳过状态检测");
             return;
         }
     };
-    let _ = port.write_data_terminal_ready(false);
-    let _ = port.write_request_to_send(false);
 
     let mut parser = protocol::FrameParser::new();
     let mut buf = [0u8; 256];
