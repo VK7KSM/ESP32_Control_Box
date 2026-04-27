@@ -249,7 +249,6 @@ fn main() {
             &s.wifi_state, s.wifi_ip.as_str(), s.rigctld_clients);
     }
     flush_fb_dma(&mut fb);
-    log::info!("UI 就绪，进入主循环");
 
     // ===== 主循环: 双缓冲 + DMA 异步 =====
     // - sleep 20ms（100Hz tick 下 = 2 tick 真实让出，IDLE0 不饿 → 无 watchdog）

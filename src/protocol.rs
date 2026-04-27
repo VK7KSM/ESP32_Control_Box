@@ -167,16 +167,9 @@ impl DownParser {
         let band = if is_right { &mut rs.right } else { &mut rs.left };
 
         match cmd {
-            // SET 图标：机头退出 SET 后可能先发图标 OFF，再发频率帧；这里同步清掉菜单显示状态
-            0x03 => {
-                if !is_on {
-                    band.is_set = false;
-                    band.menu_text.clear();
-                    band.menu_in_value = false;
-                    band.menu_exit_count = 0;
-                    band.display_text.clear();
-                }
-            }
+            // SET 图标状态只作为显示来源，不用于判断手动菜单退出。
+            // 手动退出仍由 Len=09 频率帧的 menu_exit_count 判定；DTrac 自动宏在 rigctld.rs 内显式清理。
+            0x03 => {}
             // MAIN 标记（互斥：设置一侧为 MAIN 时清除另一侧）
             0x14 => {
                 band.is_main = is_on;
@@ -214,13 +207,23 @@ impl DownParser {
             }
             // DEC: CTCSS 解码器
             0x18 => {
+                let old = band.tone_type.clone();
                 band.tone_dec = is_on;
+                if is_on { band.tone_dcs = false; }
                 band.refresh_tone_type();
+                if old != band.tone_type {
+                    log::info!("[Tone] {} DEC={} -> {}", if is_right { "RIGHT" } else { "LEFT" }, is_on, band.tone_type.as_str());
+                }
             }
             // ENC: CTCSS 编码器
             0x19 => {
+                let old = band.tone_type.clone();
                 band.tone_enc = is_on;
+                if is_on { band.tone_dcs = false; }
                 band.refresh_tone_type();
+                if old != band.tone_type {
+                    log::info!("[Tone] {} ENC={} -> {}", if is_right { "RIGHT" } else { "LEFT" }, is_on, band.tone_type.as_str());
+                }
             }
             // BUSY 图标（来自 0x1C，bit7=侧, bit0=ON/OFF）
             0x1C => { band.is_busy = is_on; }
@@ -228,8 +231,16 @@ impl DownParser {
             0x1D => { band.s_level = (sts & 0x0F) as u32; }
             // DCS
             0x20 => {
+                let old = band.tone_type.clone();
                 band.tone_dcs = is_on;
+                if is_on {
+                    band.tone_enc = false;
+                    band.tone_dec = false;
+                }
                 band.refresh_tone_type();
+                if old != band.tone_type {
+                    log::info!("[Tone] {} DCS={} -> {}", if is_right { "RIGHT" } else { "LEFT" }, is_on, band.tone_type.as_str());
+                }
             }
             // AM 模式（CmdID=0x10）
             // 实测：航空 AM 波段（125.000 MHz）时发送，FM 时不发送
@@ -510,16 +521,6 @@ impl UpParser {
         if self.buf[6] == 0x00 {
             let key = self.buf[7];
             log::info!("[上行按键] key=0x{:02X}", key);
-            if key == 0x20 {
-                let band = if rs.right.is_main { &mut rs.right } else { &mut rs.left };
-                if band.is_set {
-                    band.is_set = false;
-                    band.menu_text.clear();
-                    band.menu_in_value = false;
-                    band.menu_exit_count = 0;
-                    band.display_text.clear();
-                }
-            }
         }
         // 注意：不在此处 log warn，SUM 信息已通过 log_diag 每 20 帧打印一次
         // 大量日志会阻塞 relay 线程导致 UART FIFO 溢出，电台卡死

@@ -141,8 +141,7 @@ fn wifi_main(modem: Modem, state: SharedState) {
 
     log::info!("[WiFi] 已启动 STA 模式");
 
-    // 启动后做一次扫描（不论有无凭据，都先收集列表）
-    do_scan(&mut wifi, &state);
+    // 启动后不主动扫描，避免无上位机时 WiFi scan 抢占 UART 中继；等待 PC 显式请求
 
     // 主循环：根据 NVS 凭据决定行为
     loop {
@@ -252,14 +251,11 @@ fn connect_loop(
 }
 
 fn idle_loop(wifi: &mut BlockingWifi<EspWifi<'static>>, state: &SharedState) {
-    let mut tick: u32 = 0;
     loop {
-        // 每秒检查 PC 扫描请求
+        // 无凭据时只响应 PC 显式扫描请求，不做后台周期扫描，避免影响 UART 中继
         std::thread::sleep(std::time::Duration::from_secs(1));
-        tick += 1;
         let want_scan = { state.lock().map(|s| s.scan_request).unwrap_or(false) };
-        if want_scan || tick % 30 == 0 {
-            // 显式或周期性扫描
+        if want_scan {
             do_scan(wifi, state);
         }
         // 检查是否有新凭据写入（PC 凭据写完会 esp_restart，但保险起见也轮询）

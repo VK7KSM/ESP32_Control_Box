@@ -253,8 +253,8 @@ pub fn draw_band<D: DrawTarget<Color = Rgb565>>(
         .fill_color(PANEL).stroke_color(BORDER).stroke_width(1).build())
         .draw(display).unwrap();
 
-    if !state.is_set && state.display_text.is_empty() {
-        if !state.shift.is_empty() {
+    if !state.is_set {
+        if state.display_text.is_empty() && !state.shift.is_empty() {
             Text::new(state.shift.as_str(), Point::new(8, y + 28), s9a).draw(display).unwrap();
         }
         if !state.tone_type.is_empty() {
@@ -408,7 +408,7 @@ fn is_frequency_entry_text(s: &str) -> bool {
     digits >= 1
 }
 
-fn menu_name_from_state(state: &BandState) -> heapless::String<12> {
+fn menu_name_from_state(state: &BandState) -> heapless::String<20> {
     if let Some(num) = channel_menu_number(state.channel.as_str()) {
         if num < MENU_NAMES.len() {
             let mut out = heapless::String::new();
@@ -435,8 +435,8 @@ fn channel_menu_number(ch: &str) -> Option<usize> {
     if has_digit { Some(n) } else { None }
 }
 
-fn translate_menu_value(raw: &str) -> heapless::String<12> {
-    let mut compact: heapless::String<12> = heapless::String::new();
+fn translate_menu_value(raw: &str) -> heapless::String<16> {
+    let mut compact: heapless::String<16> = heapless::String::new();
     for c in raw.chars() {
         if c > ' ' && c != '.' {
             let _ = compact.push(c.to_ascii_uppercase());
@@ -444,6 +444,59 @@ fn translate_menu_value(raw: &str) -> heapless::String<12> {
     }
 
     let mapped = match compact.as_str() {
+        "05H" => Some("0.5H"),
+        "10H" => Some("1.0H"),
+        "15H" => Some("1.5H"),
+        "20H" => Some("2.0H"),
+        "INRNG" => Some("IN RANGE"),
+        "ALWAYS" => Some("ALWAYS"),
+        "DIMOFF" => Some("OFF"),
+        "TRXN" => Some("NORMAL"),
+        "TXR" => Some("TX REV"),
+        "RXR" => Some("RX REV"),
+        "TRXR" => Some("TX+RX REV"),
+        "DSPFRQ" => Some("FREQUENCY"),
+        "DSPNAM" => Some("NAME"),
+        "MANUAL" => Some("MANUAL"),
+        "AUTO" => Some("AUTO"),
+        "KEY1" => Some("KEY 1"),
+        "KEY2" => Some("KEY 2"),
+        "BANDR" => Some("RIGHT BAND"),
+        "BANDL" => Some("LEFT BAND"),
+        "BOTH" => Some("BOTH BANDS"),
+        "TX" => Some("TX ONLY"),
+        "RX" => Some("RX ONLY"),
+        "TXRX" | "TX/RX" => Some("TX & RX"),
+        "RPTOFF" => Some("OFF"),
+        "RPT-" => Some("- SHIFT"),
+        "RPT+" => Some("+ SHIFT"),
+        "TIME" => Some("TIME"),
+        "BUSY" => Some("BUSY"),
+        "MEM" => Some("MEMORY"),
+        "MSM" => Some("PREF MEM"),
+        "SQ" => Some("CARRIER"),
+        "CTC" => Some("CTCSS"),
+        "TON" => Some("TONE SQL"),
+        "C+T" | "C/T" => Some("CTC+TONE"),
+        "ENC" => Some("ENCODE"),
+        "ENCDEC" => Some("ENC+DEC"),
+        "DCS" => Some("DCS"),
+        "WIDE" => Some("WIDE"),
+        "NARROW" => Some("NARROW"),
+        "2TONE" => Some("2-TONE"),
+        "5TONE" => Some("5-TONE"),
+        "DTMF" => Some("DTMF"),
+        "BAND" => Some("BAND"),
+        "VFOMR" => Some("VFO/MR"),
+        "TONE" => Some("TONE"),
+        "LOW" => Some("LOW PWR"),
+        "SCAN" => Some("SCAN"),
+        "SQLOFF" => Some("SQL OFF"),
+        "TCALL" => Some("T-CALL"),
+        "RPTR" => Some("REPEATER"),
+        "PRI" => Some("PRIORITY"),
+        "MHZ" => Some("MHZ STEP"),
+        "REV" => Some("REVERSE"),
         "25K" => Some("2.5kHz"),
         "5K" | "50K" => Some("5.0kHz"),
         "625K" => Some("6.25kHz"),
@@ -456,14 +509,16 @@ fn translate_menu_value(raw: &str) -> heapless::String<12> {
         "30K" | "300K" => Some("30kHz"),
         "500K" => Some("50kHz"),
         "100K" | "1000K" => Some("100kHz"),
-        "ON" | "BEPON" | "APOON" | "MUTEON" => Some("ON"),
-        "OFF" | "BEPOFF" | "APOOFF" | "MUTEOFF" => Some("OFF"),
         _ => None,
     };
 
     let mut out = heapless::String::new();
     if let Some(v) = mapped {
         let _ = out.push_str(v);
+    } else if compact.len() > 2 && compact.ends_with("ON") {
+        let _ = out.push_str("ON");
+    } else if compact.len() > 3 && compact.ends_with("OFF") {
+        let _ = out.push_str("OFF");
     } else {
         let _ = out.push_str(raw);
     }
@@ -471,12 +526,49 @@ fn translate_menu_value(raw: &str) -> heapless::String<12> {
 }
 
 const MENU_NAMES: [&str; 43] = [
-    "", "APO", "ARS", "BEEP", "CLK.SFT", "CWID", "CWID W", "DIMMER",
-    "DTMF", "DTMF W", "DW", "HYPER", "LOCK", "LOCKT", "MUTE", "NAME",
-    "NAR/WID", "OPN.MSG", "PON.MSG", "PTT.ID", "RF SQL", "RPT.MOD", "SCAN",
-    "SCN.M", "SHIFT", "SKIP", "SPLIT", "SQL.TYP", "STEP", "TBST", "TONE F",
-    "TONE M", "TOT", "TS MUT", "TS SPD", "VFO.BND", "VFO.LNK", "VOX",
-    "VOX.D", "VOX.G", "VOX.T", "W/N.DEV", "WX ALT",
+    "",
+    "AUTO PWR OFF",
+    "AUTO RPT SHFT",
+    "ARTS SYSTEM",
+    "KEY BEEP",
+    "CPU CLK SHIFT",
+    "BACKLIGHT",
+    "DCS CODE",
+    "DCS NORMAL/REV",
+    "DISPLAY MODE",
+    "DTMF DELAY",
+    "DTMF SPEED",
+    "DTMF MEMORY",
+    "HYPER MEMORY",
+    "KEY MODE",
+    "KEY LOCK",
+    "PTT LOCK",
+    "AUDIO MUTE",
+    "CHANNEL NAME",
+    "MIC P1 FUNC",
+    "MIC P2 FUNC",
+    "MIC P3 FUNC",
+    "MIC P4 FUNC",
+    "RF SQUELCH",
+    "RPT MODE",
+    "SCAN RESUME",
+    "SCAN TYPE",
+    "RPT SHIFT",
+    "FREQ STEP",
+    "SQUELCH MODE",
+    "CTCSS FREQ",
+    "TONE MODE",
+    "TX TIMEOUT",
+    "TALK AROUND",
+    "BANDWIDTH",
+    "X-BAND RPT",
+    "AM MODE",
+    "AUTO AM",
+    "2-TONE",
+    "5-TONE",
+    "SCRAMBLE",
+    "COMPANDER",
+    "SIGNAL SQL",
 ];
 
 // ===== 进度条 =====

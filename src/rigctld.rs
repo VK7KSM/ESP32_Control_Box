@@ -14,7 +14,7 @@
 // F set_freq 在本版用 stub（回 RPRT 0 不实际改频率），完整实现见 Task #9。
 // ===================================================================
 
-use crate::state::{SharedState, WifiState};
+use crate::state::{BandState, RadioState, SharedState, WifiState};
 use esp_idf_svc::sys::esp_timer_get_time;
 use std::io::{BufRead, BufReader, Write};
 use std::io::ErrorKind;
@@ -27,6 +27,10 @@ const PORT: u16 = 4532;
 const MAX_CLIENTS: usize = 4;
 const RIG_STEP_HZ: u64 = 2_500;
 const RIG_TRACK_INTERVAL_US: u64 = 5_000_000;
+const SAT_RX_SQL_OPEN_ADC: u16 = 20;
+const SAT_SETUP_RETRY_US: u64 = 10_000_000;
+const SAT_SETUP_SNAPSHOT_US: u64 = 800_000;
+const SAT_SETUP_MAX_ATTEMPTS: u8 = 20;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ToneMode {
@@ -34,6 +38,45 @@ enum ToneMode {
     Enc,
     EncDec,
     Dcs,
+}
+
+struct StepCandidate {
+    role: &'static str,
+    target: u64,
+    current_hz: u64,
+    delta_hz: i64,
+    is_left: bool,
+    is_sat_tx: bool,
+}
+
+fn make_sat_step_candidate(
+    role: &'static str,
+    target: Option<u64>,
+    band: &BandState,
+    is_left: bool,
+    last_step_us: u64,
+    now_us: u64,
+) -> Option<StepCandidate> {
+    if now_us.saturating_sub(last_step_us) < RIG_TRACK_INTERVAL_US {
+        return None;
+    }
+    let target = target?;
+    let current = freq_str_to_hz(band.freq.as_str()).unwrap_or(0);
+    if current == 0 {
+        return None;
+    }
+    let delta_hz = target as i64 - current as i64;
+    if delta_hz.unsigned_abs() < RIG_STEP_HZ / 2 {
+        return None;
+    }
+    Some(StepCandidate {
+        role,
+        target,
+        current_hz: current,
+        delta_hz,
+        is_left,
+        is_sat_tx: role == "TX",
+    })
 }
 
 // Hamlib RIG_OK = 0, errors negative
@@ -90,6 +133,48 @@ fn freq_stepper_main(state: SharedState) {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let now_us = unsafe { esp_timer_get_time() } as u64;
 
+        let no_clients = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.rigctld_clients == 0
+        };
+        if no_clients {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            continue;
+        }
+
+        let sat_setup = {
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            prepare_sat_setup_snapshot(&mut s, now_us);
+            adopt_stable_sat_targets(&mut s, now_us);
+            if s.rigctld_clients > 0
+                && s.rigctld_sat_active
+                && s.rigctld_sat_split_enabled
+                && s.rigctld_setup_snapshot_ready
+                && !s.rigctld_setup_running
+                && !s.macro_running
+                && s.rigctld_setup_attempts < SAT_SETUP_MAX_ATTEMPTS
+                && now_us >= s.rigctld_sat_retry_after_us
+                && (!s.rigctld_rx_initial_done || !s.rigctld_tx_initial_done || !s.rigctld_rx_step_ready || !s.rigctld_tx_step_ready)
+            {
+                match (s.rigctld_setup_rx_hz, s.rigctld_setup_tx_hz) {
+                    (Some(rx), Some(tx)) => {
+                        s.rigctld_setup_running = true;
+                        s.rigctld_setup_attempts = s.rigctld_setup_attempts.saturating_add(1);
+                        let session_id = s.rigctld_session_id;
+                        Some((rx, tx, s.rigctld_sat_rx_is_left, s.rigctld_sat_tx_is_left, session_id))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some((rx, tx, rx_is_left, tx_is_left, session_id)) = sat_setup {
+            sat_setup_one_stage(&state, rx, tx, rx_is_left, tx_is_left, session_id);
+            continue;
+        }
+
         let setup_target = {
             let s = state.lock().unwrap_or_else(|e| e.into_inner());
             if s.rigctld_clients > 0
@@ -109,70 +194,148 @@ fn freq_stepper_main(state: SharedState) {
             continue;
         }
 
+        let correction_target = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            if s.rigctld_clients > 0
+                && s.rigctld_sat_active
+                && s.rigctld_rx_initial_done
+                && s.rigctld_tx_initial_done
+                && s.rigctld_rx_step_ready
+                && s.rigctld_tx_step_ready
+                && !s.rigctld_setup_running
+                && !s.macro_running
+                && s.key_override.is_none()
+                && s.knob_inject.is_none()
+                && !s.ptt_override
+                && !s.left.is_tx
+                && !s.right.is_tx
+                && !s.left.is_set
+                && !s.right.is_set
+                && !side_is_main(&s, s.rigctld_sat_rx_is_left)
+            {
+                Some(s.rigctld_sat_rx_is_left)
+            } else {
+                None
+            }
+        };
+        if let Some(rx_is_left) = correction_target {
+            log::warn!("[SatSession] MAIN 偏离 RX {}，自动切回", side_name(rx_is_left));
+            inject_key_wait(&state, 0x10);
+            continue;
+        }
+
         // 读快照：无 rigctld client、宏运行、STEP 未就绪时都不追频
-        let (target, current_hz, main_is_left, last_step_us) = {
-            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let step = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
             if s.rigctld_clients == 0 {
-                s.rigctld_target_hz = None;
                 continue;
             }
-            if s.macro_running || s.rigctld_setup_running || !s.rigctld_step_ready {
+            if s.macro_running || s.rigctld_setup_running || s.knob_inject.is_some() || s.ptt_override || s.left.is_tx || s.right.is_tx {
                 continue;
             }
-            if now_us.saturating_sub(s.rigctld_last_step_us) < RIG_TRACK_INTERVAL_US {
-                continue;
+            if s.rigctld_sat_active {
+                if !s.rigctld_rx_step_ready || !s.rigctld_tx_step_ready {
+                    continue;
+                }
+                let rx_candidate = make_sat_step_candidate(
+                    "RX",
+                    s.rigctld_rx_target_hz,
+                    if s.rigctld_sat_rx_is_left { &s.left } else { &s.right },
+                    s.rigctld_sat_rx_is_left,
+                    s.rigctld_rx_last_step_us,
+                    now_us,
+                );
+                let tx_candidate = make_sat_step_candidate(
+                    "TX",
+                    s.rigctld_tx_target_hz,
+                    if s.rigctld_sat_tx_is_left { &s.left } else { &s.right },
+                    s.rigctld_sat_tx_is_left,
+                    s.rigctld_tx_last_step_us,
+                    now_us,
+                );
+                match (rx_candidate, tx_candidate) {
+                    (Some(rx), Some(tx)) => Some(if rx.delta_hz.unsigned_abs() >= tx.delta_hz.unsigned_abs() { rx } else { tx }),
+                    (Some(rx), None) => Some(rx),
+                    (None, Some(tx)) => Some(tx),
+                    (None, None) => continue,
+                }
+            } else {
+                if !s.rigctld_step_ready {
+                    continue;
+                }
+                if now_us.saturating_sub(s.rigctld_last_step_us) < RIG_TRACK_INTERVAL_US {
+                    continue;
+                }
+                let target = match s.rigctld_target_hz {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let band = if s.right.is_main { &s.right } else { &s.left };
+                let current = freq_str_to_hz(band.freq.as_str()).unwrap_or(0);
+                let delta_hz = target as i64 - current as i64;
+                if current == 0 || delta_hz.unsigned_abs() < RIG_STEP_HZ / 2 {
+                    continue;
+                }
+                Some(StepCandidate {
+                    role: "MAIN",
+                    target,
+                    current_hz: current,
+                    delta_hz,
+                    is_left: s.left.is_main,
+                    is_sat_tx: false,
+                })
             }
-            let target = match s.rigctld_target_hz {
-                Some(t) => t,
-                None => continue,
-            };
-            let band = if s.right.is_main { &s.right } else { &s.left };
-            let current = freq_str_to_hz(band.freq.as_str()).unwrap_or(0);
-            (target, current, s.left.is_main, s.rigctld_last_step_us)
         };
 
-        if current_hz == 0 {
-            continue;
-        }
-
-        let delta_hz = target as i64 - current_hz as i64;
-        if delta_hz.unsigned_abs() < RIG_STEP_HZ / 2 {
-            state.lock().unwrap_or_else(|e| e.into_inner()).rigctld_target_hz = None;
-            continue;
-        }
-
-        if now_us.saturating_sub(last_step_us) < RIG_TRACK_INTERVAL_US {
-            continue;
-        }
-
-        let (cw, ccw) = if main_is_left { (0x02u8, 0x01u8) } else { (0x82u8, 0x81u8) };
-        let step_byte = if delta_hz > 0 { cw } else { ccw };
+        let Some(step) = step else { continue; };
+        let (cw, ccw) = if step.is_left { (0x02u8, 0x01u8) } else { (0x82u8, 0x81u8) };
+        let step_byte = if step.delta_hz > 0 { cw } else { ccw };
 
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-        if s.knob_inject.is_none() && !s.macro_running && s.rigctld_step_ready {
+        if s.knob_inject.is_none() && !s.macro_running && !s.rigctld_setup_running && !s.ptt_override && !s.left.is_tx && !s.right.is_tx {
             s.knob_inject = Some(step_byte);
-            s.rigctld_last_step_us = now_us;
-            log::info!("[FreqStepper] 追踪步进 target={} current={} delta={}Hz", target, current_hz, delta_hz);
+            if s.rigctld_sat_active {
+                if step.is_sat_tx {
+                    s.rigctld_tx_last_step_us = now_us;
+                } else {
+                    s.rigctld_rx_last_step_us = now_us;
+                }
+            } else {
+                s.rigctld_last_step_us = now_us;
+            }
         }
     }
 }
 
+
 /// 键盘宏：MAIN 侧按 6 位数字键直接输入频率
 /// 频率格式：MHz×3 位 + kHz×3 位（如 145.500 MHz → "145500"）
 /// 假设当前在 VFO 模式（若在 MR 模式需先切 VFO，本版未实现）
-fn inject_freq_keyboard(state: &SharedState, target_hz: u64) {
+fn inject_freq_keyboard(state: &SharedState, target_hz: u64, session_id: Option<u32>) -> bool {
     let mhz = target_hz / 1_000_000;
     let khz = (target_hz % 1_000_000) / 1_000;
     let digits = format!("{:03}{:03}", mhz, khz);
     log::info!("[FreqStepper] 键盘输入: \"{}\"", digits);
 
     for ch in digits.chars() {
+        if let Some(id) = session_id {
+            if !session_alive(state, id) {
+                log::warn!("[FreqStepper] session #{} 已失效，取消键盘输入", id);
+                return false;
+            }
+        }
         let key = (ch as u8).saturating_sub(b'0');
         if key > 9 { continue; }
         // 等待前一次注入被消费
         let wait_start = std::time::Instant::now();
         let mut warned = false;
         loop {
+            if let Some(id) = session_id {
+                if !session_alive(state, id) {
+                    log::warn!("[FreqStepper] session #{} 等待按键时失效", id);
+                    return false;
+                }
+            }
             let busy = {
                 let s = state.lock().unwrap_or_else(|e| e.into_inner());
                 s.key_override.is_some() || s.key_release
@@ -192,6 +355,7 @@ fn inject_freq_keyboard(state: &SharedState, target_hz: u64) {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     log::info!("[FreqStepper] 键盘输入完成");
+    true
 }
 
 fn rigctld_main(state: SharedState) {
@@ -228,41 +392,60 @@ fn rigctld_main(state: SharedState) {
                         continue;
                     }
                     active.fetch_add(1, Ordering::SeqCst);
-                    // 更新连接计数；首次连接只重置 setup 状态，等待首个 set_freq 后再设置初始频率和 STEP
-                    {
-                        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-                        if s.rigctld_clients == 0 {
+                    let first_client = {
+                        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+                        s.rigctld_clients == 0
+                    };
+                    if first_client {
+                        {
+                            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                             s.rigctld_initial_freq_done = false;
                             s.rigctld_step_ready = false;
                             s.rigctld_setup_running = false;
                             s.rigctld_target_hz = None;
                             s.rigctld_last_step_us = 0;
-                            log::info!("[Rigctld] 首次连接，等待 DTrac 首个 set_freq 后执行初始设置");
+                            s.rigctld_sat_retry_after_us = 0;
+                            s.rigctld_setup_retry_after_us = 0;
+                            s.rigctld_setup_attempts = 0;
                         }
+                        begin_sat_session(&state);
+                        log::info!("[Rigctld] 首次连接，等待 DTrac 频率/split 命令后执行初始设置");
+                    }
+                    {
+                        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                         s.rigctld_clients = s.rigctld_clients.saturating_add(1);
                     }
                     let st = state.clone();
                     let act = active.clone();
                     log::info!("[Rigctld] 接受连接：{}", peer);
-                    std::thread::Builder::new()
+                    let spawn_result = std::thread::Builder::new()
                         .name(format!("rigctld_{}", peer.port()))
-                        .stack_size(8192)
+                        .stack_size(4096)
                         .spawn(move || {
                             handle_client(stream, &st);
                             act.fetch_sub(1, Ordering::SeqCst);
                             let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
                             s.rigctld_clients = s.rigctld_clients.saturating_sub(1);
-                            // 最后一个 client 断开 → 清频率追踪 target，避免 freq_stepper 持续追
                             if s.rigctld_clients == 0 {
                                 s.rigctld_target_hz = None;
-                                s.key_override = None;
-                                s.key_release = false;
-                                s.knob_inject = None;
                                 s.rigctld_setup_running = false;
+                                s.ptt_override = false;
+                                clear_sat_session(&mut s);
                             }
                             log::info!("[Rigctld] 连接 {} 已关闭，剩余 {} 客户端", peer, s.rigctld_clients);
-                        })
-                        .ok();
+                        });
+                    if let Err(e) = spawn_result {
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                        s.rigctld_clients = s.rigctld_clients.saturating_sub(1);
+                        if s.rigctld_clients == 0 {
+                            s.rigctld_target_hz = None;
+                            s.rigctld_setup_running = false;
+                            s.ptt_override = false;
+                            clear_sat_session(&mut s);
+                        }
+                        log::warn!("[Rigctld] handler 线程启动失败: {}，已回滚 client 计数", e);
+                    }
                 }
                 Err(e) => {
                     let still = { state.lock().unwrap_or_else(|e| e.into_inner()).wifi_state == WifiState::Connected };
@@ -308,14 +491,12 @@ fn handle_client(stream: TcpStream, state: &SharedState) {
         let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
         if trimmed.is_empty() { continue; }
         last_line_us = unsafe { esp_timer_get_time() } as u64;
-        log::info!("[Rigctld] ← {}", trimmed);
 
         let resp = match dispatch(trimmed, state) {
             DispatchOut::Reply(s) => s,
             DispatchOut::Quit => return,
         };
         if !resp.is_empty() {
-            log::info!("[Rigctld] → {} bytes", resp.len());
             let inner = reader.get_mut();
             if inner.write_all(resp.as_bytes()).is_err() { return; }
             let _ = inner.flush();
@@ -328,7 +509,53 @@ enum DispatchOut {
     Quit,
 }
 
+fn log_dtrac_command(line: &str, state: &SharedState) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let body = trimmed.strip_prefix('+').unwrap_or(trimmed);
+    let (cmd, args) = if let Some(rest) = body.strip_prefix("\\") {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        (parts.next().unwrap_or(""), parts.next().unwrap_or("").trim())
+    } else {
+        let mut chars = body.chars();
+        match chars.next() {
+            Some(c) => (body.get(..c.len_utf8()).unwrap_or(""), chars.as_str().trim()),
+            None => return,
+        }
+    };
+
+    let key_cmd = matches!(cmd,
+        "I" | "S" | "C" | "E" | "T" |
+        "set_split_freq" | "set_split_vfo" |
+        "set_ctcss_tone" | "set_ctcss_sql" | "set_tone" |
+        "set_ptt"
+    );
+
+    if key_cmd {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        log::info!(
+            "[DTracCmd] raw={:?} main={} rx={} pending={:?} target={:?} tx={} pending={:?} target={:?} ctcss={}",
+            trimmed,
+            if s.right.is_main { "RIGHT" } else { "LEFT" },
+            side_name(s.rigctld_sat_rx_is_left),
+            s.rigctld_rx_pending_hz,
+            s.rigctld_rx_target_hz,
+            side_name(s.rigctld_sat_tx_is_left),
+            s.rigctld_tx_pending_hz,
+            s.rigctld_tx_target_hz,
+            s.rigctld_ctcss_tone,
+        );
+    } else if trimmed.starts_with("\\") || trimmed.starts_with('+') {
+        log::info!("[DTracCmd] raw={:?} cmd={:?} args={:?}", trimmed, cmd, args);
+    }
+}
+
 fn dispatch(line: &str, state: &SharedState) -> DispatchOut {
+    log_dtrac_command(line, state);
+
     // 检测扩展响应前缀: '+' 或反斜杠长名
     let (extended, body): (bool, &str) = if let Some(stripped) = line.strip_prefix('+') {
         (true, stripped.trim())
@@ -369,8 +596,14 @@ fn handle_short(c: char, args: &str, ext: bool, state: &SharedState) -> Dispatch
         'T' => DispatchOut::Reply(set_ptt(args, ext, state)),
         'v' => DispatchOut::Reply(get_vfo(ext, state)),
         'V' => DispatchOut::Reply(set_vfo(args, ext, state)),
-        's' => DispatchOut::Reply(get_split_vfo(ext)),
-        'S' => DispatchOut::Reply(set_split_vfo(args, ext)),
+        's' => DispatchOut::Reply(get_split_vfo(ext, state)),
+        'S' => DispatchOut::Reply(set_split_vfo(args, ext, state)),
+        'i' => DispatchOut::Reply(get_split_freq(ext, state)),
+        'I' => DispatchOut::Reply(set_split_freq(args, ext, state)),
+        'c' => DispatchOut::Reply(get_ctcss_tone(ext, state)),
+        'C' => DispatchOut::Reply(set_ctcss_tone(args, ext, state)),
+        'e' => DispatchOut::Reply(get_ctcss_sql(ext, state)),
+        'E' => DispatchOut::Reply(set_ctcss_sql(args, ext, state)),
         'j' => DispatchOut::Reply(get_rit(ext)),
         'J' => DispatchOut::Reply(set_rit(args, ext)),
         '_' => DispatchOut::Reply(get_info(ext)),
@@ -394,12 +627,16 @@ fn handle_long(name: &str, args: &str, ext: bool, state: &SharedState) -> Dispat
         "set_ptt"      => DispatchOut::Reply(set_ptt(args, ext, state)),
         "get_vfo"      => DispatchOut::Reply(get_vfo(ext, state)),
         "set_vfo"      => DispatchOut::Reply(set_vfo(args, ext, state)),
-        "get_split_vfo"=> DispatchOut::Reply(get_split_vfo(ext)),
-        "set_split_vfo"=> DispatchOut::Reply(set_split_vfo(args, ext)),
+        "get_split_vfo"=> DispatchOut::Reply(get_split_vfo(ext, state)),
+        "set_split_vfo"=> DispatchOut::Reply(set_split_vfo(args, ext, state)),
+        "get_split_freq"=> DispatchOut::Reply(get_split_freq(ext, state)),
+        "set_split_freq"=> DispatchOut::Reply(set_split_freq(args, ext, state)),
         "get_rit"      => DispatchOut::Reply(get_rit(ext)),
         "set_rit"      => DispatchOut::Reply(set_rit(args, ext)),
         "get_info"     => DispatchOut::Reply(get_info(ext)),
         "get_vfo_info"   => DispatchOut::Reply(get_vfo_info(ext, state)),
+        "set_tone"       => DispatchOut::Reply(set_ctcss_tone(args, ext, state)),
+        "get_tone"       => DispatchOut::Reply(get_ctcss_tone(ext, state)),
         "get_ctcss_tone" => DispatchOut::Reply(get_ctcss_tone(ext, state)),
         "set_ctcss_tone" => DispatchOut::Reply(set_ctcss_tone(args, ext, state)),
         "get_ctcss_sql"  => DispatchOut::Reply(get_ctcss_sql(ext, state)),
@@ -410,11 +647,214 @@ fn handle_long(name: &str, args: &str, ext: bool, state: &SharedState) -> Dispat
 
 // ===== 工具函数 =====
 
-/// 取 MAIN 侧 BandState。若都不是 MAIN（罕见），返回 left
-fn main_band(state: &SharedState) -> crate::state::BandState {
+fn side_name(is_left: bool) -> &'static str {
+    if is_left { "LEFT" } else { "RIGHT" }
+}
+
+fn session_alive(state: &SharedState, session_id: u32) -> bool {
     let s = state.lock().unwrap_or_else(|e| e.into_inner());
-    if s.right.is_main { s.right.clone() }
-    else               { s.left.clone() }
+    s.rigctld_clients > 0 && s.rigctld_sat_active && s.rigctld_session_id == session_id
+}
+
+fn wait_pending_clear(state: &SharedState, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let busy = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.key_override.is_some() || s.key_release || s.knob_inject.is_some() || s.vol_changed || s.sql_changed
+        };
+        if !busy {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn clear_pending_injections(s: &mut RadioState) {
+    s.key_override = None;
+    s.key_release = false;
+    s.knob_inject = None;
+    s.vol_changed = false;
+    s.sql_changed = false;
+    s.sql_override_side_is_left = None;
+}
+
+fn queue_sql_inject(s: &mut RadioState, is_left: bool, adc: u16) {
+    s.sql_override = Some(adc);
+    s.sql_override_side_is_left = Some(is_left);
+    s.sql_changed = true;
+}
+
+fn restore_forced_rx_sql(state: &SharedState) {
+    let restore = {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        match (s.rigctld_rx_sql_forced_side.take(), s.rigctld_rx_sql_saved_adc.take()) {
+            (Some(side), Some(adc)) => {
+                clear_pending_injections(&mut s);
+                queue_sql_inject(&mut s, side, adc);
+                log::info!("[SatSession] 恢复上次 RX {} SQL ADC={}", side_name(side), adc);
+                true
+            }
+            _ => false,
+        }
+    };
+    if restore && !wait_pending_clear(state, Duration::from_secs(2)) {
+        log::warn!("[SatSession] 等待旧 SQL 恢复帧发送超时，继续新会话初始化");
+    }
+}
+
+fn reset_sat_setup_state(s: &mut RadioState) {
+    s.rigctld_rx_pending_hz = None;
+    s.rigctld_tx_pending_hz = None;
+    s.rigctld_rx_pending_since_us = 0;
+    s.rigctld_tx_pending_since_us = 0;
+    s.rigctld_setup_rx_hz = None;
+    s.rigctld_setup_tx_hz = None;
+    s.rigctld_setup_snapshot_ready = false;
+    s.rigctld_setup_attempts = 0;
+    s.rigctld_setup_retry_after_us = 0;
+    s.rigctld_rx_target_hz = None;
+    s.rigctld_tx_target_hz = None;
+    s.rigctld_rx_initial_attempted = false;
+    s.rigctld_tx_initial_attempted = false;
+    s.rigctld_rx_initial_done = false;
+    s.rigctld_tx_initial_done = false;
+    s.rigctld_rx_step_ready = false;
+    s.rigctld_tx_step_ready = false;
+    s.rigctld_sat_retry_after_us = 0;
+    s.rigctld_rx_last_step_us = 0;
+    s.rigctld_tx_last_step_us = 0;
+    s.rigctld_tx_ctcss_tone = 0;
+}
+
+fn begin_sat_session(state: &SharedState) {
+    restore_forced_rx_sql(state);
+    if !wait_pending_clear(state, Duration::from_secs(1)) {
+        log::warn!("[SatSession] 新会话开始前仍有旧 pending 注入，清空后继续");
+    }
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    clear_pending_injections(&mut s);
+    s.rigctld_session_id = s.rigctld_session_id.wrapping_add(1);
+    bind_sat_session(&mut s);
+}
+
+fn bind_sat_session(s: &mut RadioState) {
+    let rx_is_left = if s.left.is_main {
+        true
+    } else if s.right.is_main {
+        false
+    } else {
+        log::warn!("[SatSession #{}] MAIN 位置未知，暂按 LEFT 作为 RX；等待 MAIN 探测后下次连接会重新采样", s.rigctld_session_id);
+        true
+    };
+    let tx_is_left = !rx_is_left;
+    s.rigctld_sat_active = true;
+    s.rigctld_sat_split_enabled = false;
+    s.rigctld_sat_rx_is_left = rx_is_left;
+    s.rigctld_sat_tx_is_left = tx_is_left;
+    reset_sat_setup_state(s);
+    s.rigctld_setup_running = false;
+    log::info!("[SatSession #{}] 绑定本次 DTrac 会话: RX={} TX={}（连接时 MAIN 作为 RX）", s.rigctld_session_id, side_name(rx_is_left), side_name(tx_is_left));
+}
+
+fn clear_sat_session(s: &mut RadioState) {
+    reset_sat_setup_state(s);
+    s.rigctld_sat_active = false;
+    s.rigctld_sat_split_enabled = false;
+    s.rigctld_setup_running = false;
+    s.rigctld_rx_sql_forced_side = None;
+    s.rigctld_rx_sql_saved_adc = None;
+}
+
+fn clear_side_menu_display(s: &mut RadioState, is_left: bool) {
+    let band = if is_left { &mut s.left } else { &mut s.right };
+    band.is_set = false;
+    band.menu_text.clear();
+    band.menu_in_value = false;
+    band.menu_exit_count = 0;
+    band.display_text.clear();
+    s.head_count = s.head_count.wrapping_add(1);
+}
+
+fn prepare_sat_setup_snapshot(s: &mut RadioState, now_us: u64) {
+    if s.rigctld_setup_snapshot_ready || s.rigctld_setup_running {
+        return;
+    }
+    let (rx, tx, rx_since, tx_since) = match (
+        s.rigctld_rx_pending_hz,
+        s.rigctld_tx_pending_hz,
+        s.rigctld_rx_pending_since_us,
+        s.rigctld_tx_pending_since_us,
+    ) {
+        (Some(rx), Some(tx), rx_since, tx_since) if rx_since != 0 && tx_since != 0 => (rx, tx, rx_since, tx_since),
+        _ => return,
+    };
+    let newest = rx_since.max(tx_since);
+    if now_us.saturating_sub(newest) < SAT_SETUP_SNAPSHOT_US {
+        return;
+    }
+    s.rigctld_setup_rx_hz = Some(rx);
+    s.rigctld_setup_tx_hz = Some(tx);
+    s.rigctld_setup_snapshot_ready = true;
+    s.rigctld_rx_target_hz = Some(rx);
+    s.rigctld_tx_target_hz = Some(tx);
+    s.rigctld_rx_initial_attempted = false;
+    s.rigctld_tx_initial_attempted = false;
+    s.rigctld_rx_initial_done = false;
+    s.rigctld_tx_initial_done = false;
+    s.rigctld_rx_step_ready = false;
+    s.rigctld_tx_step_ready = false;
+    s.rigctld_sat_retry_after_us = 0;
+    log::info!(
+        "[SatSession #{}] 生成初始化快照 RX {}={} TX {}={}，后续 Doppler 不改写快照",
+        s.rigctld_session_id,
+        side_name(s.rigctld_sat_rx_is_left), rx,
+        side_name(s.rigctld_sat_tx_is_left), tx,
+    );
+}
+
+
+fn adopt_stable_sat_targets(s: &mut RadioState, now_us: u64) {
+    if let Some(rx) = s.rigctld_rx_pending_hz {
+        if s.rigctld_rx_target_hz != Some(rx)
+            && s.rigctld_rx_pending_since_us != 0
+            && now_us.saturating_sub(s.rigctld_rx_pending_since_us) >= RIG_TRACK_INTERVAL_US
+        {
+            s.rigctld_rx_target_hz = Some(rx);
+            log::info!("[SatSession] RX {} target 稳定 5s，采纳 {}{}",
+                side_name(s.rigctld_sat_rx_is_left), rx,
+                if s.rigctld_setup_snapshot_ready { "（后续 Doppler 更新）" } else { "（等待初始化快照）" });
+        }
+    }
+    if let Some(tx) = s.rigctld_tx_pending_hz {
+        if s.rigctld_tx_target_hz != Some(tx)
+            && s.rigctld_tx_pending_since_us != 0
+            && now_us.saturating_sub(s.rigctld_tx_pending_since_us) >= RIG_TRACK_INTERVAL_US
+        {
+            s.rigctld_tx_target_hz = Some(tx);
+            log::info!("[SatSession] TX {} target 稳定 5s，采纳 {}{}",
+                side_name(s.rigctld_sat_tx_is_left), tx,
+                if s.rigctld_setup_snapshot_ready { "（后续 Doppler 更新）" } else { "（等待初始化快照）" });
+        }
+    }
+}
+
+
+fn mode_band(state: &SharedState) -> crate::state::BandState {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if s.rigctld_sat_active {
+        if s.rigctld_sat_rx_is_left { s.left.clone() } else { s.right.clone() }
+    } else if s.right.is_main { s.right.clone() } else { s.left.clone() }
+}
+
+fn tx_band(state: &SharedState) -> crate::state::BandState {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if s.rigctld_sat_active {
+        if s.rigctld_sat_tx_is_left { s.left.clone() } else { s.right.clone() }
+    } else if s.right.is_main { s.right.clone() } else { s.left.clone() }
 }
 
 /// 把 freq 字符串如 "433.550.500" 解析为 Hz（u64）
@@ -465,6 +905,358 @@ fn parse_freq_args(args: &str) -> Option<(&str, u64)> {
     parsed
 }
 
+fn side_is_main(s: &RadioState, is_left: bool) -> bool {
+    if is_left { s.left.is_main } else { s.right.is_main }
+}
+
+fn wait_main_side(state: &SharedState, target_left: bool, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            if side_is_main(&s, target_left) {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn ensure_main_side(state: &SharedState, target_left: bool) -> bool {
+    {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if side_is_main(&s, target_left) {
+            return true;
+        }
+    }
+    log::info!("[SatSession] 切 MAIN 到 {}", side_name(target_left));
+    inject_key_wait(state, 0x10);
+    let ok = wait_main_side(state, target_left, Duration::from_secs(3));
+    if !ok {
+        log::warn!("[SatSession] 等待 MAIN 切到 {} 超时", side_name(target_left));
+    }
+    ok
+}
+
+fn side_tone_mode(s: &RadioState, is_left: bool) -> ToneMode {
+    let band = if is_left { &s.left } else { &s.right };
+    if band.tone_dcs {
+        ToneMode::Dcs
+    } else if band.tone_enc && band.tone_dec {
+        ToneMode::EncDec
+    } else if band.tone_enc {
+        ToneMode::Enc
+    } else {
+        ToneMode::Off
+    }
+}
+
+fn sat_clear_rx_tone_if_needed(state: &SharedState, rx_is_left: bool) -> bool {
+    let mode = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        side_tone_mode(&s, rx_is_left)
+    };
+    if mode == ToneMode::Off {
+        log::info!("[SatSession] RX {} 亚音已是 OFF", side_name(rx_is_left));
+        return true;
+    }
+    log::info!("[SatSession] RX {} 检测到残留亚音 {}，切到 OFF", side_name(rx_is_left), tone_mode_name(mode));
+    if !ensure_main_side(state, rx_is_left) {
+        log::warn!("[SatSession] RX {} 残留亚音清理失败：无法切 MAIN", side_name(rx_is_left));
+        return false;
+    }
+    let ok = inject_tone_mode(state, ToneMode::Off);
+    let final_mode = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        side_tone_mode(&s, rx_is_left)
+    };
+    if final_mode == ToneMode::Off {
+        log::info!("[SatSession] RX {} 残留亚音清理完成：{}", side_name(rx_is_left), tone_mode_name(final_mode));
+        true
+    } else {
+        log::warn!("[SatSession] RX {} 残留亚音清理未确认：{}", side_name(rx_is_left), tone_mode_name(final_mode));
+        ok && final_mode == ToneMode::Off
+    }
+}
+
+fn sat_apply_tx_ctcss(state: &SharedState, mode: ToneMode) {
+    let (tx_is_left, tone) = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        (s.rigctld_sat_tx_is_left, s.rigctld_tx_ctcss_tone)
+    };
+    if !ensure_main_side(state, tx_is_left) {
+        log::warn!("[SatSession] TX CTCSS 设置失败：无法切到 TX {}", side_name(tx_is_left));
+        return;
+    }
+    if tone == 0 {
+        let ok = inject_tone_mode(state, ToneMode::Off);
+        if !ok {
+            log::warn!("[SatSession] TX {} TONE OFF 未确认", side_name(tx_is_left));
+        }
+        return;
+    }
+    if let Some(idx) = CTCSS_TONES_TENTH_HZ.iter().position(|&t| t == tone) {
+        log::info!("[SatSession] TX {} 设置 CTCSS {}Hz", side_name(tx_is_left), tone as f32 / 10.0);
+        let tone_ok = inject_menu_set(state, 30, CTCSS_TONE_STRS[idx], false);
+        if tone_ok {
+            if !inject_tone_mode(state, mode) {
+                log::warn!("[SatSession] TX CTCSS TONE 模式未确认到 {}", tone_mode_name(mode));
+            }
+        } else {
+            log::warn!("[SatSession] TX CTCSS 频率未验证，跳过 TONE 模式按键，避免误取消亚音");
+        }
+        log::info!("[SatSession] TX CTCSS 设置{}", if tone_ok { "完成" } else { "未验证" });
+    } else {
+        log::warn!("[SatSession] TX CTCSS {} 不在 TH-9800 标准表中", tone);
+    }
+}
+
+fn sat_tx_ready_for_ctcss(s: &RadioState) -> bool {
+    s.rigctld_sat_active
+        && s.rigctld_tx_initial_done
+        && s.rigctld_tx_step_ready
+        && !s.rigctld_setup_running
+        && !s.macro_running
+}
+
+fn sat_open_rx_squelch(state: &SharedState, rx_is_left: bool) {
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if s.rigctld_rx_sql_forced_side == Some(rx_is_left) {
+        log::info!("[SatSession #{}] RX {} SQL=0 已在本会话打开，跳过重复注入", s.rigctld_session_id, side_name(rx_is_left));
+        return;
+    }
+    let saved = if rx_is_left { s.left.sql } else { s.right.sql };
+    s.rigctld_rx_sql_forced_side = Some(rx_is_left);
+    s.rigctld_rx_sql_saved_adc = Some(saved);
+    queue_sql_inject(&mut s, rx_is_left, SAT_RX_SQL_OPEN_ADC);
+    if rx_is_left {
+        s.left.sql = SAT_RX_SQL_OPEN_ADC;
+    } else {
+        s.right.sql = SAT_RX_SQL_OPEN_ADC;
+    }
+    s.head_count = s.head_count.wrapping_add(1);
+    log::info!("[SatSession #{}] RX {} 静噪设为 0%，保存原 ADC={}", s.rigctld_session_id, side_name(rx_is_left), saved);
+}
+
+struct SatSideSetupResult {
+    freq_input_done: bool,
+    step_verified: bool,
+}
+
+fn sat_setup_side(state: &SharedState, is_left: bool, target_hz: u64, role: &str, session_id: u32) -> SatSideSetupResult {
+    if !ensure_main_side(state, is_left) {
+        return SatSideSetupResult { freq_input_done: false, step_verified: false };
+    }
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.macro_running = true;
+        s.key_override = None;
+        s.key_release = false;
+        s.knob_inject = None;
+    }
+    log::info!("[SatSession] {} {} 键盘输入频率 {}", role, side_name(is_left), target_hz);
+    if !inject_freq_keyboard(state, target_hz, Some(session_id)) {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.macro_running = false;
+        return SatSideSetupResult { freq_input_done: false, step_verified: false };
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        clear_side_menu_display(&mut s, is_left);
+        s.macro_running = false;
+    }
+
+    log::info!("[SatSession] {} {} 设置 STEP=2.5kHz", role, side_name(is_left));
+    let step_verified = inject_menu_set(state, 28, "2.5", false);
+    SatSideSetupResult { freq_input_done: true, step_verified }
+}
+
+fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: bool, tx_is_left: bool, session_id: u32) {
+    if !session_alive(state, session_id) { return; }
+
+    let stage = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.rigctld_rx_initial_done {
+            Some(("RX_FREQ", rx_is_left, rx_hz))
+        } else if !s.rigctld_rx_step_ready {
+            Some(("RX_STEP", rx_is_left, rx_hz))
+        } else if !s.rigctld_tx_initial_done {
+            Some(("TX_FREQ", tx_is_left, tx_hz))
+        } else if !s.rigctld_tx_step_ready {
+            Some(("TX_STEP", tx_is_left, tx_hz))
+        } else {
+            None
+        }
+    };
+
+    let Some((stage, is_left, target_hz)) = stage else {
+        let main_ok = ensure_main_side(state, rx_is_left);
+        if main_ok && session_alive(state, session_id) {
+            sat_open_rx_squelch(state, rx_is_left);
+            let _ = wait_pending_clear(state, Duration::from_secs(2));
+        }
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.rigctld_session_id == session_id {
+            s.rigctld_setup_running = false;
+            log::info!("[SatSession #{}] 初始设置完成，MAIN 已恢复 RX {}", session_id, side_name(rx_is_left));
+        }
+        return;
+    };
+
+    log::info!("[SatSession #{}] 单阶段初始化 {} {}", session_id, stage, side_name(is_left));
+    let ok = match stage {
+        "RX_FREQ" | "TX_FREQ" => sat_setup_frequency_only(state, is_left, target_hz, stage, session_id),
+        "RX_STEP" | "TX_STEP" => sat_setup_step_only(state, is_left, stage, session_id),
+        _ => false,
+    };
+
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if s.rigctld_session_id != session_id {
+        s.rigctld_setup_running = false;
+        s.macro_running = false;
+        return;
+    }
+
+    let now = unsafe { esp_timer_get_time() } as u64;
+    match stage {
+        "RX_FREQ" => s.rigctld_rx_initial_done = ok,
+        "RX_STEP" => s.rigctld_rx_step_ready = ok,
+        "TX_FREQ" => s.rigctld_tx_initial_done = ok,
+        "TX_STEP" => s.rigctld_tx_step_ready = ok,
+        _ => {}
+    }
+    s.rigctld_setup_running = false;
+    s.rigctld_rx_last_step_us = now;
+    s.rigctld_tx_last_step_us = now;
+
+    if ok {
+        log::info!("[SatSession #{}] {} 完成", session_id, stage);
+    } else {
+        s.rigctld_sat_retry_after_us = now + SAT_SETUP_RETRY_US;
+        log::warn!("[SatSession #{}] {} 失败，仅重试当前阶段，{}s 后允许重试", session_id, stage, SAT_SETUP_RETRY_US / 1_000_000);
+    }
+}
+
+fn sat_setup_frequency_only(state: &SharedState, is_left: bool, target_hz: u64, role: &str, session_id: u32) -> bool {
+    if !ensure_main_side(state, is_left) {
+        return false;
+    }
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.macro_running = true;
+        s.key_override = None;
+        s.key_release = false;
+        s.knob_inject = None;
+    }
+    log::info!("[SatSession] {} {} 键盘输入频率 {}", role, side_name(is_left), target_hz);
+    let ok = inject_freq_keyboard(state, target_hz, Some(session_id));
+    std::thread::sleep(Duration::from_millis(800));
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    clear_side_menu_display(&mut s, is_left);
+    s.macro_running = false;
+    ok
+}
+
+fn sat_setup_step_only(state: &SharedState, is_left: bool, role: &str, _session_id: u32) -> bool {
+    if !ensure_main_side(state, is_left) {
+        return false;
+    }
+    log::info!("[SatSession] {} {} 设置 STEP=2.5kHz", role, side_name(is_left));
+    inject_menu_set(state, 28, "2.5", false)
+}
+
+fn sat_initial_setup(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: bool, tx_is_left: bool, session_id: u32) {
+    if !session_alive(state, session_id) { return; }
+    let rx_tone_ok = sat_clear_rx_tone_if_needed(state, rx_is_left);
+    if !rx_tone_ok {
+        log::warn!("[SatSession #{}] RX {} 残留亚音清理未确认，继续初始化但不提前打开 SQL", session_id, side_name(rx_is_left));
+    }
+    if !session_alive(state, session_id) { return; }
+    let rx = sat_setup_side(state, rx_is_left, rx_hz, "RX", session_id);
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.rigctld_session_id != session_id {
+            s.rigctld_setup_running = false;
+            s.macro_running = false;
+            return;
+        }
+        s.rigctld_rx_initial_attempted = rx.freq_input_done;
+        s.rigctld_rx_initial_done = rx.freq_input_done;
+        s.rigctld_rx_step_ready = rx.step_verified;
+        if !rx.freq_input_done {
+            s.rigctld_tx_initial_attempted = false;
+            s.rigctld_setup_running = false;
+            s.rigctld_sat_retry_after_us = unsafe { esp_timer_get_time() } as u64 + SAT_SETUP_RETRY_US;
+            log::warn!("[SatSession #{}] RX 初始频率输入失败，{}s 后才允许重试", session_id, SAT_SETUP_RETRY_US / 1_000_000);
+            return;
+        }
+        if !rx.step_verified {
+            s.rigctld_setup_running = false;
+            s.rigctld_sat_retry_after_us = unsafe { esp_timer_get_time() } as u64 + SAT_SETUP_RETRY_US;
+            log::warn!("[SatSession #{}] RX 频率已写入但 STEP 未验证，暂停自动重试 {}s", session_id, SAT_SETUP_RETRY_US / 1_000_000);
+            return;
+        }
+    }
+    if !session_alive(state, session_id) { return; }
+
+    let tx = sat_setup_side(state, tx_is_left, tx_hz, "TX", session_id);
+    let tx_ok = {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.rigctld_session_id != session_id {
+            s.rigctld_setup_running = false;
+            s.macro_running = false;
+            return;
+        }
+        s.rigctld_tx_initial_attempted = tx.freq_input_done;
+        s.rigctld_tx_initial_done = tx.freq_input_done;
+        s.rigctld_tx_step_ready = tx.step_verified;
+        let now = unsafe { esp_timer_get_time() } as u64;
+        s.rigctld_rx_last_step_us = now;
+        s.rigctld_tx_last_step_us = now;
+        if tx.freq_input_done && !tx.step_verified {
+            s.rigctld_setup_running = false;
+            s.rigctld_sat_retry_after_us = now + SAT_SETUP_RETRY_US;
+            log::warn!("[SatSession #{}] TX 频率已写入但 STEP 未验证，暂停自动重试 {}s", session_id, SAT_SETUP_RETRY_US / 1_000_000);
+        }
+        tx.freq_input_done && tx.step_verified
+    };
+
+    if tx_ok && session_alive(state, session_id) {
+        let tone = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.rigctld_tx_ctcss_tone
+        };
+        if tone > 0 {
+            log::warn!("[SatSession #{}] TX CTCSS {}Hz 已记录但暂不执行，避免菜单宏触发栈溢出重启", session_id, tone as f32 / 10.0);
+        }
+    }
+
+    let main_tx_ok = tx_ok && wait_main_side(state, tx_is_left, Duration::from_secs(1));
+    if main_tx_ok && session_alive(state, session_id) {
+        sat_open_rx_squelch(state, rx_is_left);
+        let sql_flushed = wait_pending_clear(state, Duration::from_secs(2));
+        if !sql_flushed {
+            log::warn!("[SatSession #{}] RX {} SQL=0 注入等待超时", session_id, side_name(rx_is_left));
+        }
+    }
+
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if s.rigctld_session_id != session_id {
+        s.rigctld_setup_running = false;
+        s.macro_running = false;
+        return;
+    }
+    s.rigctld_setup_running = false;
+    if main_tx_ok {
+        log::info!("[SatSession #{}] 初始设置完成，MAIN 保持 TX {}", session_id, side_name(tx_is_left));
+    } else {
+        log::warn!("[SatSession #{}] 初始设置未完成：rx_ok={} tx_ok={} main_tx_ok={}", session_id, rx.step_verified, tx_ok, main_tx_ok);
+    }
+}
 fn rigctld_initial_setup(state: &SharedState, target: u64) {
     log::info!("[RigctldSetup] 设置初始频率 {}", target);
     {
@@ -474,20 +1266,30 @@ fn rigctld_initial_setup(state: &SharedState, target: u64) {
         s.key_release = false;
         s.knob_inject = None;
     }
-    inject_freq_keyboard(state, target);
+    if !inject_freq_keyboard(state, target, None) {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.rigctld_setup_running = false;
+        s.macro_running = false;
+        return;
+    }
     std::thread::sleep(Duration::from_millis(1200));
     {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let main_is_left = s.left.is_main;
+        clear_side_menu_display(&mut s, main_is_left);
         s.rigctld_initial_freq_done = true;
         s.macro_running = false;
     }
 
-    let keep_menu_open = {
+    let has_pending_ctcss = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.rigctld_ctcss_tone > 0
     };
-    log::info!("[RigctldSetup] 初始频率完成，设置 STEP=2.5kHz，{}", if keep_menu_open { "后续设置亚音，保持 SET 菜单" } else { "无亚音，完成后退出到频率页" });
-    let step_ok = inject_menu_set(state, 28, "2.5", keep_menu_open);
+    if has_pending_ctcss {
+        log::warn!("[RigctldSetup] CTCSS 已记录但暂不执行，STEP 后退出 SET 菜单");
+    }
+    log::info!("[RigctldSetup] 初始频率完成，设置 STEP=2.5kHz，完成后退出到频率页");
+    let step_ok = inject_menu_set(state, 28, "2.5", false);
     {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.rigctld_step_ready = step_ok;
@@ -503,13 +1305,23 @@ fn rigctld_initial_setup(state: &SharedState, target: u64) {
 
 
 fn get_freq(ext: bool, state: &SharedState) -> String {
-    // 优先返回 set_freq 异步目标（让客户端立即看到 set_freq 生效，避免重发循环）
+    // split 会话中 get_freq 返回 RX 频率；普通模式返回 MAIN 目标/实际频率。
     let s = state.lock().unwrap_or_else(|e| e.into_inner());
-    let hz = match s.rigctld_target_hz {
-        Some(t) => t,
-        None => {
-            let band = if s.right.is_main { &s.right } else { &s.left };
-            freq_str_to_hz(band.freq.as_str()).unwrap_or(0)
+    let hz = if s.rigctld_sat_active {
+        match s.rigctld_rx_pending_hz.or(s.rigctld_rx_target_hz) {
+            Some(t) => t,
+            None => {
+                let band = if s.rigctld_sat_rx_is_left { &s.left } else { &s.right };
+                freq_str_to_hz(band.freq.as_str()).unwrap_or(0)
+            }
+        }
+    } else {
+        match s.rigctld_target_hz {
+            Some(t) => t,
+            None => {
+                let band = if s.right.is_main { &s.right } else { &s.left };
+                freq_str_to_hz(band.freq.as_str()).unwrap_or(0)
+            }
         }
     };
     drop(s);
@@ -535,21 +1347,48 @@ fn set_freq(args: &str, ext: bool, state: &SharedState) -> String {
         return RPRT_EINVAL.to_string();
     }
 
+    let now_us = unsafe { esp_timer_get_time() } as u64;
+    let mut sat_log: Option<bool> = None;
+    let mut throttled_log = false;
     let start_setup = {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-        s.rigctld_target_hz = Some(target);
-        if !s.rigctld_initial_freq_done && !s.rigctld_setup_running {
-            s.rigctld_setup_running = true;
-            true
-        } else {
+        if s.rigctld_sat_active {
+            let changed = s.rigctld_rx_pending_hz != Some(target);
+            let due = s.rigctld_rx_pending_since_us == 0
+                || now_us.saturating_sub(s.rigctld_rx_pending_since_us) >= RIG_TRACK_INTERVAL_US;
+            if changed || due {
+                s.rigctld_rx_pending_hz = Some(target);
+                s.rigctld_rx_pending_since_us = now_us;
+                sat_log = Some(s.rigctld_sat_rx_is_left);
+            }
+            if s.rigctld_setup_snapshot_ready {
+                s.rigctld_rx_target_hz = Some(target);
+            }
+            s.rigctld_target_hz = None;
             false
+        } else {
+            let changed = s.rigctld_target_hz != Some(target);
+            let due = now_us.saturating_sub(s.rigctld_last_step_us) >= RIG_TRACK_INTERVAL_US;
+            s.rigctld_target_hz = Some(target);
+            throttled_log = changed || due;
+            if throttled_log {
+                s.rigctld_last_step_us = now_us;
+            }
+            if !s.rigctld_initial_freq_done && !s.rigctld_setup_running {
+                s.rigctld_setup_running = true;
+                true
+            } else {
+                false
+            }
         }
     };
 
-    if start_setup {
+    if let Some(rx_is_left) = sat_log {
+        log::info!("[SatSession] F/set_freq → RX {} pending={}（5s 节流采样）", side_name(rx_is_left), target);
+    } else if start_setup {
         log::info!("[Rigctld] 首个 set_freq={}，交由 freq_stepper 执行初始频率+STEP 设置", target);
-    } else {
-        log::info!("[Rigctld] set_freq target={}（等待限速追踪）", target);
+    } else if throttled_log {
+        log::info!("[Rigctld] set_freq target={}（5s 节流采样）", target);
     }
 
     if ext { format!("set_freq: {}\nFreq: {}\nRPRT 0\n", hz_str, target) }
@@ -557,7 +1396,7 @@ fn set_freq(args: &str, ext: bool, state: &SharedState) -> String {
 }
 
 fn get_mode(ext: bool, state: &SharedState) -> String {
-    let band = main_band(state);
+    let band = mode_band(state);
     let mode = match band.mode.as_str() {
         "AM" => "AM",
         _ => "FM",  // 默认 FM
@@ -573,10 +1412,33 @@ fn set_mode(_args: &str, ext: bool) -> String {
 }
 
 fn get_ptt(ext: bool, state: &SharedState) -> String {
-    let band = main_band(state);
+    let band = tx_band(state);
     let ptt = if band.is_tx { 1 } else { 0 };
     if ext { format!("get_ptt:\nPTT: {}\nRPRT 0\n", ptt) }
     else   { format!("{}\n", ptt) }
+}
+
+fn sat_ptt_ready(s: &RadioState) -> bool {
+    if !s.rigctld_sat_active || !s.rigctld_sat_split_enabled {
+        return true;
+    }
+    if s.macro_running || s.rigctld_setup_running {
+        return false;
+    }
+    let tx_band = if s.rigctld_sat_tx_is_left { &s.left } else { &s.right };
+    if !tx_band.is_main || tx_band.is_set {
+        return false;
+    }
+    let target = match s.rigctld_tx_target_hz {
+        Some(t) => t,
+        None => return false,
+    };
+    let current = match freq_str_to_hz(tx_band.freq.as_str()) {
+        Some(v) => v,
+        None => return false,
+    };
+    let diff = if current > target { current - target } else { target - current };
+    diff <= RIG_STEP_HZ
 }
 
 fn set_ptt(args: &str, ext: bool, state: &SharedState) -> String {
@@ -589,6 +1451,19 @@ fn set_ptt(args: &str, ext: bool, state: &SharedState) -> String {
     let now_us = unsafe { esp_timer_get_time() } as u64;
     {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if on && !sat_ptt_ready(&s) {
+            s.ptt_override = false;
+            log::warn!(
+                "[SatSession] 拒绝 PTT：MAIN={} TX={} target={:?} actual={} macro={} setup={}",
+                if s.right.is_main { "RIGHT" } else { "LEFT" },
+                side_name(s.rigctld_sat_tx_is_left),
+                s.rigctld_tx_target_hz,
+                if s.rigctld_sat_tx_is_left { s.left.freq.as_str() } else { s.right.freq.as_str() },
+                s.macro_running,
+                s.rigctld_setup_running,
+            );
+            return RPRT_EPROTO.to_string();
+        }
         s.ptt_override = on;
         if on { s.ptt_start_us = now_us; }
     }
@@ -597,15 +1472,19 @@ fn set_ptt(args: &str, ext: bool, state: &SharedState) -> String {
 }
 
 fn get_vfo(ext: bool, state: &SharedState) -> String {
-    // 把 MAIN 侧映射为 VFOA，另一侧为 VFOB
     let s = state.lock().unwrap_or_else(|e| e.into_inner());
-    let v = if s.left.is_main { "VFOA" } else { "VFOB" };
+    let v = if s.rigctld_sat_active {
+        "VFOA"
+    } else if s.left.is_main {
+        "VFOA"
+    } else {
+        "VFOB"
+    };
     if ext { format!("get_vfo:\nVFO: {}\nRPRT 0\n", v) }
     else   { format!("{}\n", v) }
 }
 
 fn set_vfo(args: &str, ext: bool, state: &SharedState) -> String {
-    // VFOA → 切到 LEFT MAIN；VFOB → RIGHT MAIN（注入 P1=0x10 切 MAIN）
     let target_left = match args.split_whitespace().next().unwrap_or("") {
         "VFOA" | "Main" | "main" => true,
         "VFOB" | "Sub" | "sub"   => false,
@@ -613,6 +1492,10 @@ fn set_vfo(args: &str, ext: bool, state: &SharedState) -> String {
     };
     {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.rigctld_sat_active {
+            log::info!("[SatSession #{}] set_vfo 在卫星会话内只 ACK，不物理切 MAIN", s.rigctld_session_id);
+            return if ext { "set_vfo:\nRPRT 0\n".to_string() } else { RPRT_OK.to_string() };
+        }
         let already = (target_left && s.left.is_main) || (!target_left && s.right.is_main);
         if already {
             return if ext { "set_vfo:\nRPRT 0\n".into() } else { RPRT_OK.to_string() };
@@ -624,15 +1507,91 @@ fn set_vfo(args: &str, ext: bool, state: &SharedState) -> String {
     if ext { "set_vfo:\nRPRT 0\n".to_string() } else { RPRT_OK.to_string() }
 }
 
-fn get_split_vfo(ext: bool) -> String {
-    // TH-9800 无 split：恒定 0 + VFOB
-    if ext { "get_split_vfo:\nSplit: 0\nTX VFO: VFOB\nRPRT 0\n".into() }
-    else   { "0\nVFOB\n".into() }
+fn get_split_vfo(ext: bool, state: &SharedState) -> String {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let split = if s.rigctld_sat_split_enabled { 1 } else { 0 };
+    let tx_vfo = if s.rigctld_sat_tx_is_left { "VFOA" } else { "VFOB" };
+    if ext { format!("get_split_vfo:\nSplit: {}\nTX VFO: {}\nRPRT 0\n", split, tx_vfo) }
+    else   { format!("{}\n{}\n", split, tx_vfo) }
 }
 
-fn set_split_vfo(_args: &str, ext: bool) -> String {
+fn set_split_vfo(args: &str, ext: bool, state: &SharedState) -> String {
+    let mut tokens = args.split_whitespace();
+    let split = match tokens.next().unwrap_or("") {
+        "0" => false,
+        "1" => true,
+        _ => return RPRT_EINVAL.to_string(),
+    };
+    let tx_vfo = tokens.next().unwrap_or("VFOB");
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.rigctld_sat_active {
+            log::warn!("[SatSession] set_split_vfo 时会话未绑定，等待下一次连接重新采样 MAIN");
+            return if ext { "set_split_vfo:\nRPRT 0\n".into() } else { RPRT_OK.to_string() };
+        }
+        s.rigctld_sat_split_enabled = split;
+    }
+    let (rx_is_left, tx_is_left) = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        (s.rigctld_sat_rx_is_left, s.rigctld_sat_tx_is_left)
+    };
+    log::info!("[SatSession] set_split_vfo split={} RX={} TX={} (DTrac TX VFO {}, 保留连接时物理映射)", split, side_name(rx_is_left), side_name(tx_is_left), tx_vfo);
     if ext { "set_split_vfo:\nRPRT 0\n".into() } else { RPRT_OK.to_string() }
 }
+
+fn get_split_freq(ext: bool, state: &SharedState) -> String {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let hz = match s.rigctld_tx_pending_hz.or(s.rigctld_tx_target_hz) {
+        Some(t) => t,
+        None => {
+            let band = if s.rigctld_sat_tx_is_left { &s.left } else { &s.right };
+            freq_str_to_hz(band.freq.as_str()).unwrap_or(0)
+        }
+    };
+    if ext { format!("get_split_freq:\nTx freq: {}\nRPRT 0\n", hz) }
+    else   { format!("{}\n", hz) }
+}
+
+fn set_split_freq(args: &str, ext: bool, state: &SharedState) -> String {
+    let (hz_str, hz) = match parse_freq_args(args) {
+        Some(v) => v,
+        None => {
+            log::warn!("[Rigctld] set_split_freq 参数无法解析: {:?}", args);
+            return RPRT_EINVAL.to_string();
+        }
+    };
+    let target = ((hz + RIG_STEP_HZ / 2) / RIG_STEP_HZ) * RIG_STEP_HZ;
+    if target < 26_000_000 || target > 1_300_000_000 {
+        log::warn!("[Rigctld] set_split_freq 频率越界: {}", target);
+        return RPRT_EINVAL.to_string();
+    }
+    let tx_is_left;
+    let changed;
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.rigctld_sat_active {
+            log::warn!("[SatSession] set_split_freq 时会话未绑定，等待下一次连接重新采样 MAIN");
+            return if ext { format!("set_split_freq: {}\nTx freq: {}\nRPRT 0\n", hz_str, target) } else { RPRT_OK.to_string() };
+        }
+        s.rigctld_sat_split_enabled = true;
+        changed = s.rigctld_tx_pending_hz != Some(target);
+        if changed {
+            s.rigctld_tx_pending_hz = Some(target);
+            s.rigctld_tx_pending_since_us = unsafe { esp_timer_get_time() } as u64;
+            if s.rigctld_setup_snapshot_ready {
+                s.rigctld_tx_target_hz = Some(target);
+            }
+        }
+        s.rigctld_target_hz = None;
+        tx_is_left = s.rigctld_sat_tx_is_left;
+    }
+    if changed {
+        log::info!("[SatSession] I/set_split_freq → TX {} pending={}（稳定 5s 后采纳）", side_name(tx_is_left), target);
+    }
+    if ext { format!("set_split_freq: {}\nTx freq: {}\nRPRT 0\n", hz_str, target) }
+    else   { RPRT_OK.to_string() }
+}
+
 
 fn get_rit(ext: bool) -> String {
     if ext { "get_rit:\nRIT: 0\nRPRT 0\n".into() } else { "0\n".into() }
@@ -662,10 +1621,10 @@ fn set_powerstat(_args: &str, ext: bool, _state: &SharedState) -> String {
 }
 
 fn get_vfo_info(ext: bool, state: &SharedState) -> String {
-    let band = main_band(state);
+    let band = mode_band(state);
     let hz = freq_str_to_hz(band.freq.as_str()).unwrap_or(0);
     let s = state.lock().unwrap_or_else(|e| e.into_inner());
-    let vfo = if s.left.is_main { "VFOA" } else { "VFOB" };
+    let vfo = if s.rigctld_sat_active || s.left.is_main { "VFOA" } else { "VFOB" };
     let mode = if band.mode.as_str() == "AM" { "AM" } else { "FM" };
     let bw = if mode == "AM" { 8000 } else { 12500 };
     if ext {
@@ -700,20 +1659,20 @@ fn set_ctcss_tone(args: &str, ext: bool, state: &SharedState) -> String {
         Some(v) => v,
         None => return RPRT_EINVAL.to_string(),
     };
-    state.lock().unwrap_or_else(|e| e.into_inner()).rigctld_ctcss_tone = tone;
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.rigctld_ctcss_tone = tone;
+        if s.rigctld_sat_active {
+            s.rigctld_tx_ctcss_tone = tone;
+        }
+    }
     let target_idx = CTCSS_TONES_TENTH_HZ.iter().position(|&t| t == tone);
-    log::info!("[Rigctld] set_ctcss_tone: {}（{} Hz），idx={:?}", tone, tone as f32 / 10.0, target_idx);
-    let st = state.clone();
-    std::thread::Builder::new()
-        .name("rigctld_ctcss".into())
-        .stack_size(8192)
-        .spawn(move || {
-            if let Some(idx) = target_idx {
-                inject_menu_set(&st, 30, CTCSS_TONE_STRS[idx], false);
-            }
-            inject_tone_mode(&st, if tone > 0 { ToneMode::Enc } else { ToneMode::Off });
-        })
-        .ok();
+    log::info!(
+        "[Rigctld] set_ctcss_tone: {}（{} Hz），idx={:?}，仅记录并 ACK，暂不执行菜单宏",
+        tone,
+        tone as f32 / 10.0,
+        target_idx
+    );
     if ext { "set_ctcss_tone:\nRPRT 0\n".to_string() } else { RPRT_OK.to_string() }
 }
 
@@ -729,19 +1688,20 @@ fn set_ctcss_sql(args: &str, ext: bool, state: &SharedState) -> String {
         Some(v) => v,
         None => return RPRT_EINVAL.to_string(),
     };
-    state.lock().unwrap_or_else(|e| e.into_inner()).rigctld_ctcss_tone = tone;
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.rigctld_ctcss_tone = tone;
+        if s.rigctld_sat_active {
+            s.rigctld_tx_ctcss_tone = tone;
+        }
+    }
     let target_idx = CTCSS_TONES_TENTH_HZ.iter().position(|&t| t == tone);
-    let st = state.clone();
-    std::thread::Builder::new()
-        .name("rigctld_ctcss_sql".into())
-        .stack_size(8192)
-        .spawn(move || {
-            if let Some(idx) = target_idx {
-                inject_menu_set(&st, 30, CTCSS_TONE_STRS[idx], false);
-            }
-            inject_tone_mode(&st, if tone > 0 { ToneMode::EncDec } else { ToneMode::Off });
-        })
-        .ok();
+    log::info!(
+        "[Rigctld] set_ctcss_sql: {}（{} Hz），idx={:?}，仅记录并 ACK，暂不执行菜单宏",
+        tone,
+        tone as f32 / 10.0,
+        target_idx
+    );
     if ext { "set_ctcss_sql:\nRPRT 0\n".to_string() } else { RPRT_OK.to_string() }
 }
 
@@ -775,13 +1735,32 @@ fn inject_menu_set(state: &SharedState, menu_num: u8, target_val: &str, keep_men
     if !acquired { return false; }
 
     // === Guard 2: 前提条件检查 ===
-    let ok = {
+    let (menu_side_is_left, ok) = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        let band = if s.right.is_main { &s.right } else { &s.left };
-        s.radio_alive && !band.is_tx && !band.is_busy
+        let menu_side_is_left = s.left.is_main;
+        let band = if menu_side_is_left { &s.left } else { &s.right };
+        let ok = s.radio_alive && !band.is_tx && !band.is_busy;
+        if !ok {
+            log::warn!(
+                "[MenuNav] Guard2 fail #{} target={} main={} alive={} tx={} busy={} s={} set={} menu=\"{}\" display=\"{}\" in_value={} macro={} ptt={}",
+                menu_num,
+                target_val,
+                side_name(menu_side_is_left),
+                s.radio_alive,
+                band.is_tx,
+                band.is_busy,
+                band.s_level,
+                band.is_set,
+                band.menu_text.as_str(),
+                band.display_text.as_str(),
+                band.menu_in_value,
+                s.macro_running,
+                s.ptt_override,
+            );
+        }
+        (menu_side_is_left, ok)
     };
     if !ok {
-        log::warn!("[MenuNav] 电台不满足条件（未在线/发射中/信道忙），取消");
         state.lock().unwrap_or_else(|e| e.into_inner()).macro_running = false;
         return false;
     }
@@ -797,16 +1776,17 @@ fn inject_menu_set(state: &SharedState, menu_num: u8, target_val: &str, keep_men
         }
     };
 
-    let (dial_click, dial_cw, dial_ccw) = {
-        let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        if s.left.is_main { (0x25u8, 0x02u8, 0x01u8) } else { (0xA5u8, 0x82u8, 0x81u8) }
+    let (dial_click, dial_cw, dial_ccw) = if menu_side_is_left {
+        (0x25u8, 0x02u8, 0x01u8)
+    } else {
+        (0xA5u8, 0x82u8, 0x81u8)
     };
 
     log::info!("[MenuNav] 开始：目标菜单 #{} = \"{}\"(idx={})", menu_num, target_val, tgt_idx);
 
     let already_in_set = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        let band = if s.right.is_main { &s.right } else { &s.left };
+        let band = if menu_side_is_left { &s.left } else { &s.right };
         band.is_set
     };
     if !already_in_set {
@@ -835,7 +1815,11 @@ fn inject_menu_set(state: &SharedState, menu_num: u8, target_val: &str, keep_men
     // wait_for_menu_value 等待 menu_in_value=true，保证读到的是当前值而非菜单名
     let mut verified = false;
     for attempt in 0u8..3 {
-        let cur_val = wait_for_menu_value(state);
+        let cur_val = if menu_num == 30 {
+            wait_for_menu_value_with_timeout(state, Duration::from_millis(1500))
+        } else {
+            wait_for_menu_value(state)
+        };
         if cur_val.is_empty() {
             log::warn!("[MenuNav] attempt={}: 菜单值未显示（超时），放弃验证", attempt);
             break;
@@ -859,11 +1843,12 @@ fn inject_menu_set(state: &SharedState, menu_num: u8, target_val: &str, keep_men
 
         let dv = tgt_idx as i32 - cur_idx as i32;
         let (vdir, vsteps) = if dv > 0 { (dial_cw, dv as u32) } else { (dial_ccw, (-dv) as u32) };
+        let knob_delay_ms = if menu_num == 30 { 250 } else { 120 };
         for _ in 0..vsteps {
             inject_knob_wait(state, vdir);
-            std::thread::sleep(Duration::from_millis(120));
+            std::thread::sleep(Duration::from_millis(knob_delay_ms));
         }
-        std::thread::sleep(Duration::from_millis(200)); // 等待电台 Len=09 响应更新 menu_text
+        std::thread::sleep(Duration::from_millis(if menu_num == 30 { 800 } else { 200 }));
     }
 
     // === Step 5: 保存值；不保留菜单时再按一次 SET 回到频率显示 ===
@@ -873,13 +1858,7 @@ fn inject_menu_set(state: &SharedState, menu_num: u8, target_val: &str, keep_men
         inject_key_wait(state, 0x20);
         std::thread::sleep(Duration::from_millis(500));
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-        let band = if s.right.is_main { &mut s.right } else { &mut s.left };
-        band.is_set = false;
-        band.menu_text.clear();
-        band.menu_in_value = false;
-        band.menu_exit_count = 0;
-        band.display_text.clear();
-        s.head_count = s.head_count.wrapping_add(1);
+        clear_side_menu_display(&mut s, menu_side_is_left);
     }
 
     state.lock().unwrap_or_else(|e| e.into_inner()).macro_running = false;
@@ -945,7 +1924,21 @@ fn parse_tenth_hz_menu_value(s: &str) -> Option<u32> {
 }
 
 /// 用手咪 P3(TONE) 键循环，将 MAIN 侧亚音模式切换到目标状态
-fn inject_tone_mode(state: &SharedState, target: ToneMode) {
+fn current_tone_mode(state: &SharedState) -> ToneMode {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let band = if s.right.is_main { &s.right } else { &s.left };
+    if band.tone_dcs {
+        ToneMode::Dcs
+    } else if band.tone_enc && band.tone_dec {
+        ToneMode::EncDec
+    } else if band.tone_enc {
+        ToneMode::Enc
+    } else {
+        ToneMode::Off
+    }
+}
+
+fn inject_tone_mode(state: &SharedState, target: ToneMode) -> bool {
     let acquired = {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -963,27 +1956,36 @@ fn inject_tone_mode(state: &SharedState, target: ToneMode) {
             std::thread::sleep(Duration::from_millis(200));
         }
     };
-    if !acquired { return; }
+    if !acquired { return false; }
 
-    let presses = {
-        let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        let band = if s.right.is_main { &s.right } else { &s.left };
-        let current = if band.tone_dcs {
-            ToneMode::Dcs
-        } else if band.tone_enc && band.tone_dec {
-            ToneMode::EncDec
-        } else if band.tone_enc {
-            ToneMode::Enc
-        } else {
-            ToneMode::Off
-        };
-        tone_mode_presses(current, target)
-    };
-    log::info!("[MenuNav] inject_tone_mode target={} presses={}", tone_mode_name(target), presses);
-    for _ in 0..presses {
-        inject_key_wait(state, 0x12);  // P3 = TONE 键循环模式
+    for attempt in 0..4 {
+        let current = current_tone_mode(state);
+        if current == target {
+            log::info!("[MenuNav] inject_tone_mode 已是 {}", tone_mode_name(target));
+            state.lock().unwrap_or_else(|e| e.into_inner()).macro_running = false;
+            return true;
+        }
+        let presses = tone_mode_presses(current, target);
+        if presses == 0 {
+            break;
+        }
+        log::info!(
+            "[MenuNav] inject_tone_mode attempt={} current={} target={} press P3",
+            attempt,
+            tone_mode_name(current),
+            tone_mode_name(target)
+        );
+        inject_key_wait(state, 0x12);
+        std::thread::sleep(Duration::from_millis(800));
+    }
+
+    let final_mode = current_tone_mode(state);
+    let ok = final_mode == target;
+    if !ok {
+        log::warn!("[MenuNav] inject_tone_mode 未确认到 {}，当前 {}", tone_mode_name(target), tone_mode_name(final_mode));
     }
     state.lock().unwrap_or_else(|e| e.into_inner()).macro_running = false;
+    ok
 }
 
 fn tone_mode_presses(current: ToneMode, target: ToneMode) -> u8 {
@@ -1044,10 +2046,8 @@ fn read_menu_text(state: &SharedState) -> heapless::String<12> {
     band.menu_text.clone()
 }
 
-/// 等待电台确认进入值编辑模式并返回当前值（最多 600ms）
-/// 只有 menu_in_value=true 时才返回，保证读到的是"值"而非"菜单名"
-fn wait_for_menu_value(state: &SharedState) -> heapless::String<12> {
-    let deadline = std::time::Instant::now() + Duration::from_millis(600);
+fn wait_for_menu_value_with_timeout(state: &SharedState, timeout: Duration) -> heapless::String<12> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         {
             let s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1059,7 +2059,11 @@ fn wait_for_menu_value(state: &SharedState) -> heapless::String<12> {
         if std::time::Instant::now() >= deadline { break; }
         std::thread::sleep(Duration::from_millis(20));
     }
-    heapless::String::new()  // 超时返回空串
+    heapless::String::new()
+}
+
+fn wait_for_menu_value(state: &SharedState) -> heapless::String<12> {
+    wait_for_menu_value_with_timeout(state, Duration::from_millis(600))
 }
 
 // ===== \dump_state 模板 =====

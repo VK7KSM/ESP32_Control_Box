@@ -90,7 +90,11 @@ fn recalc_uplink_xor(frame: &mut [u8; 16]) {
 /// 对完整上行帧应用 override（仅 PTT），然后重算校验
 /// Key/Knob 注入已移至 timeout 分支（面板空闲时发送独立帧），不篡改面板真实帧
 fn apply_overrides(frame: &mut [u8; 16], state: &SharedState) {
-    let s = state.lock().unwrap();
+    let mut s = state.lock().unwrap();
+    if s.ptt_override && !s.pc_alive && s.rigctld_clients == 0 {
+        log::warn!("[PTT保险] 无 PC/rigctld 客户端，清除 PTT override");
+        s.ptt_override = false;
+    }
     if s.ptt_override {
         frame[4] = 0x00;  // P[1] = PTT 按下
         drop(s);
@@ -140,6 +144,8 @@ pub fn relay_down_thread(
     let mut buf = [0u8; 1];
     let mut count: u32 = 0;
 
+    let mut last_wait_log: u32 = 0;
+
     log::info!("[下行] 中继线程启动");
 
     loop {
@@ -163,7 +169,10 @@ pub fn relay_down_thread(
             }
             _ => {
                 // Ok(0) 或 Err(ESP_ERR_TIMEOUT)：均为超时，1 秒无数据
-                log::warn!("[下行] 等待数据... 共收到 {} 帧", count);
+                if count.wrapping_sub(last_wait_log) >= 200 {
+                    last_wait_log = count;
+                    log::warn!("[下行] 等待数据... 共收到 {} 帧", count);
+                }
             }
         }
     }
@@ -212,7 +221,7 @@ pub fn relay_up_thread(
                     pending_len = 0;
 
                     // 诊断日志 + 状态更新
-                    parser.log_diag(count);
+                    // parser.log_diag(count);
                     let mut s = state.lock().unwrap();
                     parser.apply_to_state(&mut s);
                 } else if parser.state > 0 {
@@ -257,6 +266,10 @@ pub fn relay_up_thread(
                     heartbeat_ticks = 0;
                 } else if s.ptt_override || (last_ptt && !s.ptt_override) {
                     // PTT 持续注入：每 ~100ms 发一帧保持 PTT；PTT 松开瞬间发释放帧
+                    if s.ptt_override && !s.pc_alive && s.rigctld_clients == 0 {
+                        log::warn!("[PTT保险] timeout 分支检测到无控制端 PTT，强制释放");
+                        s.ptt_override = false;
+                    }
                     let ptt_on = s.ptt_override;
                     drop(s);
                     let mut frame = build_knob_frame(0xFF);
@@ -284,7 +297,11 @@ pub fn relay_up_thread(
                     heartbeat_ticks = 0;
                 } else if s.sql_changed {
                     let sql = s.sql_override;
-                    let is_right = s.right.is_main;
+                    let side_is_left = s.sql_override_side_is_left.take();
+                    let is_right = match side_is_left {
+                        Some(is_left) => !is_left,
+                        None => s.right.is_main,
+                    };
                     s.sql_changed = false;
                     drop(s);
                     if let Some(s_val) = sql {
@@ -372,10 +389,9 @@ pub fn relay_up_thread(
                         let _ = uart_panel.write(sm_off);
                         let _ = uart_host.write(&idle_frame);
 
-                        log::info!("[上行] → 心跳 side={} sum={:02X}",
-                            if use_right {"右"} else {"左"}, cw_frame[15]);
+                        // 心跳是周期性热路径，禁止在这里打日志，避免阻塞 UART 中继
                     } else {
-                        log::info!("[上行] → 心跳跳过 (不安全)");
+                        // 心跳跳过同样不打日志
                     }
                 }
                 } // else（正常心跳）

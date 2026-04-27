@@ -318,8 +318,16 @@ pub fn dispatch_command(
         }
         PcCommand::SetSql(pct) => {
             let mut s = state.lock().unwrap();
-            if pct == 0xFF { s.sql_override = None; }
-            else { s.sql_override = Some((20 + (pct as u32) * 980 / 100) as u16); s.sql_changed = true; }
+            if pct == 0xFF {
+                s.sql_override = None;
+                s.sql_override_side_is_left = None;
+            }
+            else {
+                let side_is_left = !s.right.is_main;
+                s.sql_override = Some((20 + (pct as u32) * 980 / 100) as u16);
+                s.sql_override_side_is_left = Some(side_is_left);
+                s.sql_changed = true;
+            }
         }
         PcCommand::SetPtt(on) => {
             let mut s = state.lock().unwrap();
