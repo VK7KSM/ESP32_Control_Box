@@ -368,7 +368,7 @@ pub fn relay_up_thread(
                             false  // MAIN 未知 → 默认步进 LEFT
                         };
                         let side = if use_right { &s.right } else { &s.left };
-                        let safe = side.s_level == 0 && !side.is_tx && !side.is_busy;
+                        let safe = s.rigctld_clients == 0 && side.s_level == 0 && !side.is_tx && !side.is_busy;
                         (safe, use_right)
                     };
 
