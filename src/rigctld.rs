@@ -56,16 +56,16 @@ struct StepCandidate {
 }
 
 fn log_sat_gate(s: &mut RadioState, now_us: u64, reason: &str) {
+    if !s.rigctld_sat_active || !s.rigctld_sat_split_enabled {
+        return;
+    }
     if now_us.saturating_sub(s.rigctld_setup_retry_after_us) >= SAT_GATE_LOG_INTERVAL_US {
         s.rigctld_setup_retry_after_us = now_us;
         let retry_left_ms = s.rigctld_sat_retry_after_us.saturating_sub(now_us) / 1000;
         log::info!(
-            "[SatGate #{}] {} clients={} active={} split={} snapshot={} setup={} macro={} attempts={}/{} retry_left={}ms rx_pending={:?} tx_pending={:?} rx_done={} rx_step={} tx_done={} tx_step={}",
+            "[SatGate #{}] {} snapshot={} setup={} macro={} attempts={}/{} retry_left={}ms rx_pending={:?} tx_pending={:?} rx_done={} rx_step={} tx_done={} tx_step={}",
             s.rigctld_session_id,
             reason,
-            s.rigctld_clients,
-            s.rigctld_sat_active,
-            s.rigctld_sat_split_enabled,
             s.rigctld_setup_snapshot_ready,
             s.rigctld_setup_running,
             s.macro_running,
@@ -171,64 +171,68 @@ fn freq_stepper_main(state: SharedState) {
             s.rigctld_clients == 0
         };
         if no_clients {
+            if run_tone_off_maintenance(&state) {
+                continue;
+            }
             std::thread::sleep(std::time::Duration::from_millis(800));
             continue;
         }
 
         let sat_setup = {
             let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-            prepare_sat_setup_snapshot(&mut s, now_us);
-            adopt_stable_sat_targets(&mut s, now_us);
-            let setup_incomplete = !s.rigctld_rx_initial_done
-                || !s.rigctld_tx_initial_done
-                || !s.rigctld_rx_step_ready
-                || !s.rigctld_tx_step_ready;
-            if s.rigctld_clients > 0
-                && s.rigctld_sat_active
-                && s.rigctld_sat_split_enabled
-                && s.rigctld_setup_snapshot_ready
-                && !s.rigctld_setup_running
-                && !s.macro_running
-                && s.rigctld_setup_attempts < SAT_SETUP_MAX_ATTEMPTS
-                && now_us >= s.rigctld_sat_retry_after_us
-                && setup_incomplete
-            {
-                match (s.rigctld_setup_rx_hz, s.rigctld_setup_tx_hz) {
-                    (Some(rx), Some(tx)) => {
-                        s.rigctld_setup_running = true;
-                        s.rigctld_setup_attempts = s.rigctld_setup_attempts.saturating_add(1);
-                        let session_id = s.rigctld_session_id;
-                        Some((rx, tx, s.rigctld_sat_rx_is_left, s.rigctld_sat_tx_is_left, session_id))
-                    }
-                    _ => {
-                        if setup_incomplete { log_sat_gate(&mut s, now_us, "snapshot=true but setup rx/tx missing"); }
-                        None
-                    }
-                }
-            } else {
-                if setup_incomplete {
-                    let reason = if s.rigctld_clients == 0 {
-                        "no clients"
-                    } else if !s.rigctld_sat_active {
-                        "sat inactive"
-                    } else if !s.rigctld_sat_split_enabled {
-                        "split not enabled"
-                    } else if !s.rigctld_setup_snapshot_ready {
-                        "snapshot not ready"
-                    } else if s.rigctld_setup_running {
-                        "setup running"
-                    } else if s.macro_running {
-                        "macro running"
-                    } else if s.rigctld_setup_attempts >= SAT_SETUP_MAX_ATTEMPTS {
-                        "setup attempts exhausted"
-                    } else if now_us < s.rigctld_sat_retry_after_us {
-                        "retry wait"
-                    } else {
-                        "setup condition not met"
-                    };
-                    log_sat_gate(&mut s, now_us, reason);
-                }
+            if !s.rigctld_sat_active || !s.rigctld_sat_split_enabled {
                 None
+            } else {
+                prepare_sat_setup_snapshot(&mut s, now_us);
+                adopt_stable_sat_targets(&mut s, now_us);
+                let setup_incomplete = !s.rigctld_rx_initial_done
+                    || !s.rigctld_tx_initial_done
+                    || !s.rigctld_rx_step_ready
+                    || !s.rigctld_tx_step_ready
+                    || !s.rigctld_rx_tone_clear_done
+                    || (s.rigctld_tx_ctcss_dirty && (!s.rigctld_tx_ctcss_done || !s.rigctld_tx_tone_mode_done))
+                    || !s.rigctld_rx_sql_open_done;
+                if s.rigctld_clients > 0
+                    && s.rigctld_setup_snapshot_ready
+                    && !s.rigctld_setup_running
+                    && !s.macro_running
+                    && s.rigctld_setup_attempts < SAT_SETUP_MAX_ATTEMPTS
+                    && now_us >= s.rigctld_sat_retry_after_us
+                    && setup_incomplete
+                {
+                    match (s.rigctld_setup_rx_hz, s.rigctld_setup_tx_hz) {
+                        (Some(rx), Some(tx)) => {
+                            s.rigctld_setup_running = true;
+                            s.rigctld_setup_attempts = s.rigctld_setup_attempts.saturating_add(1);
+                            let session_id = s.rigctld_session_id;
+                            Some((rx, tx, s.rigctld_sat_rx_is_left, s.rigctld_sat_tx_is_left, session_id))
+                        }
+                        _ => {
+                            if setup_incomplete { log_sat_gate(&mut s, now_us, "snapshot=true but setup rx/tx missing"); }
+                            None
+                        }
+                    }
+                } else {
+                    if setup_incomplete {
+                        let reason = if s.rigctld_clients == 0 {
+                            "no clients"
+                        } else if !s.rigctld_setup_snapshot_ready {
+                            "snapshot not ready"
+                        } else if s.rigctld_setup_running {
+                            "setup running"
+                        } else if s.macro_running {
+                            "macro running"
+                        } else if s.rigctld_setup_attempts >= SAT_SETUP_MAX_ATTEMPTS {
+                            "setup attempts exhausted"
+                        } else if now_us < s.rigctld_sat_retry_after_us {
+                            "retry wait"
+                        } else {
+                            "setup condition not met"
+                        };
+                        log_sat_gate(&mut s, now_us, reason);
+                    }
+                    None
+                }
             }
         };
 
@@ -264,6 +268,9 @@ fn freq_stepper_main(state: SharedState) {
                 && s.rigctld_tx_initial_done
                 && s.rigctld_rx_step_ready
                 && s.rigctld_tx_step_ready
+                && s.rigctld_rx_tone_clear_done
+                && (!s.rigctld_tx_ctcss_dirty || (s.rigctld_tx_ctcss_done && s.rigctld_tx_tone_mode_done))
+                && s.rigctld_rx_sql_open_done
                 && !s.rigctld_setup_running
                 && !s.macro_running
                 && s.key_override.is_none()
@@ -296,7 +303,7 @@ fn freq_stepper_main(state: SharedState) {
                 continue;
             }
             if s.rigctld_sat_active {
-                if !s.rigctld_rx_step_ready || !s.rigctld_tx_step_ready {
+                if !s.rigctld_rx_step_ready || !s.rigctld_tx_step_ready || !s.rigctld_rx_tone_clear_done || !s.rigctld_rx_sql_open_done || (s.rigctld_tx_ctcss_dirty && (!s.rigctld_tx_ctcss_done || !s.rigctld_tx_tone_mode_done)) {
                     continue;
                 }
                 let rx_candidate = make_sat_step_candidate(
@@ -802,22 +809,16 @@ fn queue_sql_inject(s: &mut RadioState, is_left: bool, adc: u16) {
     s.sql_changed = true;
 }
 
-fn restore_forced_rx_sql(state: &SharedState) {
-    let restore = {
-        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-        match (s.rigctld_rx_sql_forced_side.take(), s.rigctld_rx_sql_saved_adc.take()) {
-            (Some(side), Some(adc)) => {
-                clear_pending_injections(&mut s);
-                queue_sql_inject(&mut s, side, adc);
-                log::info!("[SatSession] 恢复上次 RX {} SQL ADC={}", side_name(side), adc);
-                true
-            }
-            _ => false,
-        }
-    };
-    if restore && !wait_pending_clear(state, Duration::from_secs(2)) {
-        log::warn!("[SatSession] 等待旧 SQL 恢复帧发送超时，继续新会话初始化");
+fn cancel_forced_rx_sql(state: &SharedState) {
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if s.rigctld_rx_sql_forced_side.is_some() || s.sql_changed || s.sql_override.is_some() {
+        log::info!("[SatSession] 取消卫星会话 SQL 固定注入，恢复由物理静噪旋钮接管");
     }
+    s.sql_override = None;
+    s.sql_changed = false;
+    s.sql_override_side_is_left = None;
+    s.rigctld_rx_sql_forced_side = None;
+    s.rigctld_rx_sql_saved_adc = None;
 }
 
 fn reset_sat_setup_state(s: &mut RadioState) {
@@ -845,6 +846,12 @@ fn reset_sat_setup_state(s: &mut RadioState) {
     s.rigctld_rx_last_step_us = 0;
     s.rigctld_tx_last_step_us = 0;
     s.rigctld_tx_ctcss_tone = 0;
+    s.rigctld_tx_ctcss_dirty = false;
+    s.rigctld_tx_ctcss_done = true;
+    s.rigctld_tx_tone_mode_requested = 0;
+    s.rigctld_tx_tone_mode_done = true;
+    s.rigctld_rx_tone_clear_done = false;
+    s.rigctld_rx_sql_open_done = false;
     s.rigctld_tx_placeholder_active = false;
     s.rigctld_tx_real_pending_after_placeholder = None;
     s.rigctld_ptt_blocked_until_tx_real = false;
@@ -869,11 +876,17 @@ fn begin_sat_session(state: &SharedState, rx_is_left_at_accept: bool) -> u32 {
         s.rigctld_session_id = s.rigctld_session_id.wrapping_add(1);
         s.rigctld_session_id
     };
-    restore_forced_rx_sql(state);
+    cancel_forced_rx_sql(state);
     if !wait_pending_clear(state, Duration::from_secs(1)) {
         log::warn!("[SatSession #{}] 新会话开始前仍有旧 pending 注入，清空后继续", session_id);
     }
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if s.rigctld_tone_off_pending {
+        log::warn!("[SatSession #{}] 新会话开始，取消上次断开后的亚音 OFF pending", session_id);
+        s.rigctld_tone_off_pending = false;
+        s.rigctld_tone_off_rx_done = false;
+        s.rigctld_tone_off_tx_done = false;
+    }
     clear_pending_injections(&mut s);
     bind_sat_session(&mut s, rx_is_left_at_accept);
     session_id
@@ -881,22 +894,47 @@ fn begin_sat_session(state: &SharedState, rx_is_left_at_accept: bool) -> u32 {
 
 fn bind_sat_session(s: &mut RadioState, rx_is_left: bool) {
     let tx_is_left = !rx_is_left;
+    let pending_tone = s.rigctld_ctcss_tone;
     s.rigctld_sat_active = true;
     s.rigctld_sat_split_enabled = false;
     s.rigctld_sat_rx_is_left = rx_is_left;
     s.rigctld_sat_tx_is_left = tx_is_left;
     reset_sat_setup_state(s);
+    if pending_tone != 0 {
+        s.rigctld_tx_ctcss_tone = pending_tone;
+        s.rigctld_tx_ctcss_dirty = true;
+        s.rigctld_tx_ctcss_done = false;
+        s.rigctld_tx_tone_mode_requested = tone_mode_code(ToneMode::Enc);
+        s.rigctld_tx_tone_mode_done = false;
+    }
     s.rigctld_setup_running = false;
     log::info!("[SatSession #{}] 绑定本次 DTrac 会话: RX={} TX={}（连接时 MAIN 作为 RX）", s.rigctld_session_id, side_name(rx_is_left), side_name(tx_is_left));
 }
 
 fn clear_sat_session(s: &mut RadioState) {
+    let session_id = s.rigctld_session_id;
+    let sql_restore = match (s.rigctld_rx_sql_forced_side.take(), s.rigctld_rx_sql_saved_adc.take()) {
+        (Some(side), Some(adc)) => Some((side, adc)),
+        _ => None,
+    };
     reset_sat_setup_state(s);
     s.rigctld_sat_active = false;
     s.rigctld_sat_split_enabled = false;
     s.rigctld_setup_running = false;
-    s.rigctld_rx_sql_forced_side = None;
-    s.rigctld_rx_sql_saved_adc = None;
+    s.rigctld_ctcss_tone = 0;
+    if let Some((side, adc)) = sql_restore {
+        queue_sql_inject(s, side, adc);
+        log::info!(
+            "[SatSession #{}] 会话结束，排队恢复 RX {} SQL ADC={}",
+            session_id,
+            side_name(side),
+            adc
+        );
+    }
+    s.rigctld_tone_off_pending = true;
+    s.rigctld_tone_off_rx_done = false;
+    s.rigctld_tone_off_tx_done = false;
+    log::info!("[SatSession #{}] 会话结束，无条件排队 RX/TX 亚音 OFF 检查", session_id);
 }
 
 fn clear_side_menu_display(s: &mut RadioState, is_left: bool) {
@@ -910,6 +948,9 @@ fn clear_side_menu_display(s: &mut RadioState, is_left: bool) {
 }
 
 fn prepare_sat_setup_snapshot(s: &mut RadioState, now_us: u64) {
+    if !s.rigctld_sat_active || !s.rigctld_sat_split_enabled {
+        return;
+    }
     if s.rigctld_setup_snapshot_ready {
         return;
     }
@@ -1066,6 +1107,12 @@ fn sat_actual_hz(s: &RadioState, is_left: bool) -> u64 {
     freq_str_to_hz(band.freq.as_str()).unwrap_or(0)
 }
 
+fn side_freq_matches_now(state: &SharedState, is_left: bool, target_hz: u64) -> bool {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let actual = sat_actual_hz(&s, is_left);
+    actual != 0 && actual.abs_diff(target_hz) <= SAT_KEYBOARD_ACCEPT_HZ
+}
+
 fn side_is_main(s: &RadioState, is_left: bool) -> bool {
     if is_left { s.left.is_main } else { s.right.is_main }
 }
@@ -1115,6 +1162,113 @@ fn side_tone_mode(s: &RadioState, is_left: bool) -> ToneMode {
     }
 }
 
+fn requested_tone_mode(s: &RadioState) -> ToneMode {
+    match s.rigctld_tx_tone_mode_requested {
+        1 => ToneMode::Enc,
+        2 => ToneMode::EncDec,
+        3 => ToneMode::Dcs,
+        _ => ToneMode::Off,
+    }
+}
+
+fn tone_mode_code(mode: ToneMode) -> u8 {
+    match mode {
+        ToneMode::Off => 0,
+        ToneMode::Enc => 1,
+        ToneMode::EncDec => 2,
+        ToneMode::Dcs => 3,
+    }
+}
+
+fn tone_target_satisfied(state: &SharedState, is_left: bool, target: ToneMode) -> bool {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    side_tone_mode(&s, is_left) == target
+}
+
+fn set_side_tone_mode(state: &SharedState, is_left: bool, target: ToneMode, label: &str) -> bool {
+    if tone_target_satisfied(state, is_left, target) {
+        log::info!("[SatSession] {} {} 亚音已是 {}", label, side_name(is_left), tone_mode_name(target));
+        return true;
+    }
+    if !ensure_main_side(state, is_left) {
+        log::warn!("[SatSession] {} {} 亚音设置失败：无法切 MAIN", label, side_name(is_left));
+        return false;
+    }
+    let ok = inject_tone_mode(state, target);
+    let final_ok = tone_target_satisfied(state, is_left, target);
+    if final_ok {
+        log::info!("[SatSession] {} {} 亚音已切到 {}", label, side_name(is_left), tone_mode_name(target));
+        true
+    } else {
+        log::warn!("[SatSession] {} {} 亚音未确认到 {}", label, side_name(is_left), tone_mode_name(target));
+        ok && final_ok
+    }
+}
+
+fn run_tone_off_maintenance(state: &SharedState) -> bool {
+    let target = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.rigctld_tone_off_pending || s.rigctld_clients > 0 || s.macro_running || s.rigctld_setup_running || s.ptt_override || s.left.is_tx || s.right.is_tx {
+            return false;
+        }
+        if !s.rigctld_tone_off_rx_done {
+            Some((s.rigctld_sat_rx_is_left, "断开清理 RX"))
+        } else if !s.rigctld_tone_off_tx_done {
+            Some((s.rigctld_sat_tx_is_left, "断开清理 TX"))
+        } else {
+            None
+        }
+    };
+    let Some((is_left, label)) = target else {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.rigctld_tone_off_pending = false;
+        return false;
+    };
+    let ok = set_side_tone_mode(state, is_left, ToneMode::Off, label);
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if ok {
+        if label.contains("RX") {
+            s.rigctld_tone_off_rx_done = true;
+        } else {
+            s.rigctld_tone_off_tx_done = true;
+        }
+        if s.rigctld_tone_off_rx_done && s.rigctld_tone_off_tx_done {
+            s.rigctld_tone_off_pending = false;
+            log::info!("[SatSession] 断开后 RX/TX 亚音清理完成");
+        }
+    }
+    true
+}
+
+fn sat_set_tx_ctcss_freq(state: &SharedState, tx_is_left: bool) -> bool {
+    let tone = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.rigctld_tx_ctcss_tone
+    };
+    if tone == 0 {
+        log::info!("[SatSession] TX {} CTCSS 频率请求为 0，跳过 #30", side_name(tx_is_left));
+        return true;
+    }
+    let Some(idx) = CTCSS_TONES_TENTH_HZ.iter().position(|&t| t == tone) else {
+        log::warn!("[SatSession] TX CTCSS {} 不在 TH-9800 标准表中", tone);
+        return false;
+    };
+    if !ensure_main_side(state, tx_is_left) {
+        log::warn!("[SatSession] TX {} CTCSS 频率设置失败：无法切 MAIN", side_name(tx_is_left));
+        return false;
+    }
+    log::info!("[SatSession] TX {} 设置 CTCSS {}Hz", side_name(tx_is_left), tone as f32 / 10.0);
+    inject_menu_set(state, 30, CTCSS_TONE_STRS[idx], false)
+}
+
+fn sat_set_tx_tone_mode(state: &SharedState, tx_is_left: bool) -> bool {
+    let target = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        requested_tone_mode(&s)
+    };
+    set_side_tone_mode(state, tx_is_left, target, "TX_TONE_MODE")
+}
+
 fn sat_clear_rx_tone_if_needed(state: &SharedState, rx_is_left: bool) -> bool {
     let mode = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1125,22 +1279,7 @@ fn sat_clear_rx_tone_if_needed(state: &SharedState, rx_is_left: bool) -> bool {
         return true;
     }
     log::info!("[SatSession] RX {} 检测到残留亚音 {}，切到 OFF", side_name(rx_is_left), tone_mode_name(mode));
-    if !ensure_main_side(state, rx_is_left) {
-        log::warn!("[SatSession] RX {} 残留亚音清理失败：无法切 MAIN", side_name(rx_is_left));
-        return false;
-    }
-    let ok = inject_tone_mode(state, ToneMode::Off);
-    let final_mode = {
-        let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        side_tone_mode(&s, rx_is_left)
-    };
-    if final_mode == ToneMode::Off {
-        log::info!("[SatSession] RX {} 残留亚音清理完成：{}", side_name(rx_is_left), tone_mode_name(final_mode));
-        true
-    } else {
-        log::warn!("[SatSession] RX {} 残留亚音清理未确认：{}", side_name(rx_is_left), tone_mode_name(final_mode));
-        ok && final_mode == ToneMode::Off
-    }
+    set_side_tone_mode(state, rx_is_left, ToneMode::Off, "RX_TONE_CLEAR")
 }
 
 fn sat_apply_tx_ctcss(state: &SharedState, mode: ToneMode) {
@@ -1245,10 +1384,18 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
             Some(("RX_FREQ", rx_is_left, s.rigctld_rx_pending_hz.or(s.rigctld_rx_target_hz).unwrap_or(rx_hz)))
         } else if !s.rigctld_rx_step_ready {
             Some(("RX_STEP", rx_is_left, rx_hz))
+        } else if !s.rigctld_rx_tone_clear_done {
+            Some(("RX_TONE_CLEAR", rx_is_left, rx_hz))
         } else if !s.rigctld_tx_initial_done {
             Some(("TX_FREQ", tx_is_left, s.rigctld_tx_pending_hz.or(s.rigctld_tx_target_hz).unwrap_or(tx_hz)))
         } else if !s.rigctld_tx_step_ready {
             Some(("TX_STEP", tx_is_left, tx_hz))
+        } else if s.rigctld_tx_ctcss_dirty && !s.rigctld_tx_ctcss_done {
+            Some(("TX_CTCSS_FREQ", tx_is_left, tx_hz))
+        } else if s.rigctld_tx_ctcss_dirty && !s.rigctld_tx_tone_mode_done {
+            Some(("TX_TONE_MODE", tx_is_left, tx_hz))
+        } else if !s.rigctld_rx_sql_open_done {
+            Some(("RX_SQL_OPEN", rx_is_left, rx_hz))
         } else {
             None
         }
@@ -1256,14 +1403,14 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
 
     let Some((stage, is_left, target_hz)) = stage else {
         let main_ok = ensure_main_side(state, tx_is_left);
-        if main_ok && session_alive(state, session_id) {
-            sat_open_rx_squelch(state, rx_is_left);
-            let _ = wait_pending_clear(state, Duration::from_secs(2));
-        }
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         if s.rigctld_session_id == session_id {
             s.rigctld_setup_running = false;
-            log::info!("[SatSession #{}] 初始设置完成，MAIN 已恢复 TX {}", session_id, side_name(tx_is_left));
+            if main_ok {
+                log::info!("[SatSession #{}] 初始设置完成，MAIN 已恢复 TX {}", session_id, side_name(tx_is_left));
+            } else {
+                log::warn!("[SatSession #{}] 初始设置完成但 MAIN 未能恢复 TX {}", session_id, side_name(tx_is_left));
+            }
         }
         return;
     };
@@ -1272,6 +1419,13 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
     let ok = match stage {
         "RX_FREQ" | "TX_FREQ" => sat_setup_frequency_only(state, is_left, target_hz, stage, session_id),
         "RX_STEP" | "TX_STEP" => sat_setup_step_only(state, is_left, stage, session_id),
+        "RX_TONE_CLEAR" => sat_clear_rx_tone_if_needed(state, is_left),
+        "TX_CTCSS_FREQ" => sat_set_tx_ctcss_freq(state, is_left),
+        "TX_TONE_MODE" => sat_set_tx_tone_mode(state, is_left),
+        "RX_SQL_OPEN" => {
+            sat_open_rx_squelch(state, is_left);
+            wait_pending_clear(state, Duration::from_secs(2))
+        }
         _ => false,
     };
 
@@ -1286,6 +1440,7 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
     match stage {
         "RX_FREQ" => s.rigctld_rx_initial_done = ok,
         "RX_STEP" => s.rigctld_rx_step_ready = ok,
+        "RX_TONE_CLEAR" => s.rigctld_rx_tone_clear_done = ok,
         "TX_FREQ" => {
             if ok && s.rigctld_tx_placeholder_active && target_hz == TX_PLACEHOLDER_HZ && s.rigctld_tx_real_pending_after_placeholder.is_some() {
                 s.rigctld_tx_initial_done = false;
@@ -1301,6 +1456,14 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
             }
         }
         "TX_STEP" => s.rigctld_tx_step_ready = ok,
+        "TX_CTCSS_FREQ" => s.rigctld_tx_ctcss_done = ok,
+        "TX_TONE_MODE" => {
+            s.rigctld_tx_tone_mode_done = ok;
+            if ok {
+                s.rigctld_tx_ctcss_dirty = false;
+            }
+        }
+        "RX_SQL_OPEN" => s.rigctld_rx_sql_open_done = ok,
         _ => {}
     }
     s.rigctld_setup_running = false;
@@ -1415,6 +1578,21 @@ fn sat_setup_frequency_only(state: &SharedState, is_left: bool, target_hz: u64, 
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         role == "TX_FREQ" && s.rigctld_tx_placeholder_active && target_hz == TX_PLACEHOLDER_HZ
     };
+
+    if !placeholder && side_freq_matches_now(state, is_left, target_hz) {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if role == "RX_FREQ" {
+            s.rigctld_rx_input_recovered = true;
+        }
+        log::info!(
+            "[SatSession #{}] {} {} 当前频率已匹配 {}，跳过键盘输入",
+            session_id,
+            role,
+            side_name(is_left),
+            target_hz
+        );
+        return true;
+    }
 
     if role == "RX_FREQ" && !reset_rx_freq_input_with_knob(state, is_left, session_id) {
         return false;
@@ -1742,6 +1920,9 @@ fn sat_ptt_ready(s: &RadioState) -> bool {
     if s.macro_running || s.rigctld_setup_running {
         return false;
     }
+    if s.rigctld_tx_ctcss_dirty || !s.rigctld_tx_ctcss_done || !s.rigctld_tx_tone_mode_done || !s.rigctld_rx_sql_open_done {
+        return false;
+    }
     let tx_band = if s.rigctld_sat_tx_is_left { &s.left } else { &s.right };
     if !tx_band.is_main || tx_band.is_set {
         return false;
@@ -2048,11 +2229,16 @@ fn set_ctcss_tone(args: &str, ext: bool, state: &SharedState) -> String {
         s.rigctld_ctcss_tone = tone;
         if s.rigctld_sat_active {
             s.rigctld_tx_ctcss_tone = tone;
+            s.rigctld_tx_ctcss_dirty = true;
+            s.rigctld_tx_ctcss_done = tone == 0;
+            s.rigctld_tx_tone_mode_requested = tone_mode_code(if tone == 0 { ToneMode::Off } else { ToneMode::Enc });
+            s.rigctld_tx_tone_mode_done = false;
+            s.rigctld_sat_retry_after_us = 0;
         }
     }
     let target_idx = CTCSS_TONES_TENTH_HZ.iter().position(|&t| t == tone);
     log::info!(
-        "[Rigctld] set_ctcss_tone: {}（{} Hz），idx={:?}，仅记录并 ACK，暂不执行菜单宏",
+        "[Rigctld] set_ctcss_tone: {}（{} Hz），idx={:?}，记录 dirty，由 freq_stepper 分阶段执行",
         tone,
         tone as f32 / 10.0,
         target_idx
@@ -2077,11 +2263,16 @@ fn set_ctcss_sql(args: &str, ext: bool, state: &SharedState) -> String {
         s.rigctld_ctcss_tone = tone;
         if s.rigctld_sat_active {
             s.rigctld_tx_ctcss_tone = tone;
+            s.rigctld_tx_ctcss_dirty = true;
+            s.rigctld_tx_ctcss_done = tone == 0;
+            s.rigctld_tx_tone_mode_requested = tone_mode_code(if tone == 0 { ToneMode::Off } else { ToneMode::Enc });
+            s.rigctld_tx_tone_mode_done = false;
+            s.rigctld_sat_retry_after_us = 0;
         }
     }
     let target_idx = CTCSS_TONES_TENTH_HZ.iter().position(|&t| t == tone);
     log::info!(
-        "[Rigctld] set_ctcss_sql: {}（{} Hz），idx={:?}，仅记录并 ACK，暂不执行菜单宏",
+        "[Rigctld] set_ctcss_sql: {}（{} Hz），idx={:?}，按 TX uplink CTCSS 记录 dirty",
         tone,
         tone as f32 / 10.0,
         target_idx
