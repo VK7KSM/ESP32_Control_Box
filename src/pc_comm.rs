@@ -331,8 +331,13 @@ pub fn dispatch_command(
         }
         PcCommand::SetPtt(on) => {
             let mut s = state.lock().unwrap();
-            s.ptt_override = on;
-            if on { s.ptt_start_us = now_us; }
+            if on && s.rigctld_ptt_blocked_until_tx_real {
+                s.ptt_override = false;
+                log::warn!("[PTT保护] TX placeholder active, block PC PTT until real TX I applied");
+            } else {
+                s.ptt_override = on;
+                if on { s.ptt_start_us = now_us; }
+            }
         }
         PcCommand::PowerToggle => {
             log::info!("[PC通信] 收到开关机指令，GPIO{} 脉冲 1.2s", power_pin_num);

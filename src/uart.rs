@@ -91,6 +91,16 @@ fn recalc_uplink_xor(frame: &mut [u8; 16]) {
 /// Key/Knob 注入已移至 timeout 分支（面板空闲时发送独立帧），不篡改面板真实帧
 fn apply_overrides(frame: &mut [u8; 16], state: &SharedState) {
     let mut s = state.lock().unwrap();
+    if s.rigctld_ptt_blocked_until_tx_real {
+        if s.ptt_override || frame[4] == 0x00 {
+            s.ptt_override = false;
+            log::warn!("[PTT保护] TX placeholder active, force uplink PTT release");
+        }
+        frame[4] = 0xFF;
+        drop(s);
+        recalc_uplink_xor(frame);
+        return;
+    }
     if s.ptt_override && !s.pc_alive && s.rigctld_clients == 0 {
         log::warn!("[PTT保险] 无 PC/rigctld 客户端，清除 PTT override");
         s.ptt_override = false;

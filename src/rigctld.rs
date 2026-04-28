@@ -9,9 +9,10 @@
 //   - 扩展模式（'+' 前缀或 backslash 命令）: "set_freq: 145000000\nFreq: 145000000\nRPRT 0\n"
 //
 // 当前实现 WSJT-X / fldigi / JTDX 必需的最小子集：
-//   f F m M t T v V s S j J _ \dump_state \chk_vfo \get_powerstat \set_powerstat q Q
+//   f F m M t T v V s S i I c C e E j J _ \dump_state \chk_vfo \get_powerstat \set_powerstat q Q
 //
-// F set_freq 在本版用 stub（回 RPRT 0 不实际改频率），完整实现见 Task #9。
+// F/set_freq 与 I/set_split_freq 在卫星会话中分别更新绑定 RX/TX 的最新目标；
+// 实际写入 TH-9800 仍由后台步进/宏流程按安全节奏执行。
 // ===================================================================
 
 use crate::state::{BandState, RadioState, SharedState, WifiState};
@@ -31,6 +32,9 @@ const SAT_RX_SQL_OPEN_ADC: u16 = 20;
 const SAT_SETUP_RETRY_US: u64 = 10_000_000;
 const SAT_SETUP_SNAPSHOT_US: u64 = 800_000;
 const SAT_SETUP_MAX_ATTEMPTS: u8 = 20;
+const SAT_GATE_LOG_INTERVAL_US: u64 = 5_000_000;
+const SAT_MISSING_TX_I_FALLBACK_US: u64 = 2_000_000;
+const TX_PLACEHOLDER_HZ: u64 = 0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ToneMode {
@@ -47,6 +51,33 @@ struct StepCandidate {
     delta_hz: i64,
     is_left: bool,
     is_sat_tx: bool,
+}
+
+fn log_sat_gate(s: &mut RadioState, now_us: u64, reason: &str) {
+    if now_us.saturating_sub(s.rigctld_setup_retry_after_us) >= SAT_GATE_LOG_INTERVAL_US {
+        s.rigctld_setup_retry_after_us = now_us;
+        let retry_left_ms = s.rigctld_sat_retry_after_us.saturating_sub(now_us) / 1000;
+        log::info!(
+            "[SatGate #{}] {} clients={} active={} split={} snapshot={} setup={} macro={} attempts={}/{} retry_left={}ms rx_pending={:?} tx_pending={:?} rx_done={} rx_step={} tx_done={} tx_step={}",
+            s.rigctld_session_id,
+            reason,
+            s.rigctld_clients,
+            s.rigctld_sat_active,
+            s.rigctld_sat_split_enabled,
+            s.rigctld_setup_snapshot_ready,
+            s.rigctld_setup_running,
+            s.macro_running,
+            s.rigctld_setup_attempts,
+            SAT_SETUP_MAX_ATTEMPTS,
+            retry_left_ms,
+            s.rigctld_rx_pending_hz,
+            s.rigctld_tx_pending_hz,
+            s.rigctld_rx_initial_done,
+            s.rigctld_rx_step_ready,
+            s.rigctld_tx_initial_done,
+            s.rigctld_tx_step_ready,
+        );
+    }
 }
 
 fn make_sat_step_candidate(
@@ -146,6 +177,10 @@ fn freq_stepper_main(state: SharedState) {
             let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
             prepare_sat_setup_snapshot(&mut s, now_us);
             adopt_stable_sat_targets(&mut s, now_us);
+            let setup_incomplete = !s.rigctld_rx_initial_done
+                || !s.rigctld_tx_initial_done
+                || !s.rigctld_rx_step_ready
+                || !s.rigctld_tx_step_ready;
             if s.rigctld_clients > 0
                 && s.rigctld_sat_active
                 && s.rigctld_sat_split_enabled
@@ -154,7 +189,7 @@ fn freq_stepper_main(state: SharedState) {
                 && !s.macro_running
                 && s.rigctld_setup_attempts < SAT_SETUP_MAX_ATTEMPTS
                 && now_us >= s.rigctld_sat_retry_after_us
-                && (!s.rigctld_rx_initial_done || !s.rigctld_tx_initial_done || !s.rigctld_rx_step_ready || !s.rigctld_tx_step_ready)
+                && setup_incomplete
             {
                 match (s.rigctld_setup_rx_hz, s.rigctld_setup_tx_hz) {
                     (Some(rx), Some(tx)) => {
@@ -163,9 +198,34 @@ fn freq_stepper_main(state: SharedState) {
                         let session_id = s.rigctld_session_id;
                         Some((rx, tx, s.rigctld_sat_rx_is_left, s.rigctld_sat_tx_is_left, session_id))
                     }
-                    _ => None,
+                    _ => {
+                        if setup_incomplete { log_sat_gate(&mut s, now_us, "snapshot=true but setup rx/tx missing"); }
+                        None
+                    }
                 }
             } else {
+                if setup_incomplete {
+                    let reason = if s.rigctld_clients == 0 {
+                        "no clients"
+                    } else if !s.rigctld_sat_active {
+                        "sat inactive"
+                    } else if !s.rigctld_sat_split_enabled {
+                        "split not enabled"
+                    } else if !s.rigctld_setup_snapshot_ready {
+                        "snapshot not ready"
+                    } else if s.rigctld_setup_running {
+                        "setup running"
+                    } else if s.macro_running {
+                        "macro running"
+                    } else if s.rigctld_setup_attempts >= SAT_SETUP_MAX_ATTEMPTS {
+                        "setup attempts exhausted"
+                    } else if now_us < s.rigctld_sat_retry_after_us {
+                        "retry wait"
+                    } else {
+                        "setup condition not met"
+                    };
+                    log_sat_gate(&mut s, now_us, reason);
+                }
                 None
             }
         };
@@ -211,15 +271,15 @@ fn freq_stepper_main(state: SharedState) {
                 && !s.right.is_tx
                 && !s.left.is_set
                 && !s.right.is_set
-                && !side_is_main(&s, s.rigctld_sat_rx_is_left)
+                && !side_is_main(&s, s.rigctld_sat_tx_is_left)
             {
-                Some(s.rigctld_sat_rx_is_left)
+                Some(s.rigctld_sat_tx_is_left)
             } else {
                 None
             }
         };
-        if let Some(rx_is_left) = correction_target {
-            log::warn!("[SatSession] MAIN 偏离 RX {}，自动切回", side_name(rx_is_left));
+        if let Some(tx_is_left) = correction_target {
+            log::warn!("[SatSession] MAIN 偏离 TX {}，自动切回", side_name(tx_is_left));
             inject_key_wait(&state, 0x10);
             continue;
         }
@@ -308,13 +368,7 @@ fn freq_stepper_main(state: SharedState) {
 }
 
 
-/// 键盘宏：MAIN 侧按 6 位数字键直接输入频率
-/// 频率格式：MHz×3 位 + kHz×3 位（如 145.500 MHz → "145500"）
-/// 假设当前在 VFO 模式（若在 MR 模式需先切 VFO，本版未实现）
-fn inject_freq_keyboard(state: &SharedState, target_hz: u64, session_id: Option<u32>) -> bool {
-    let mhz = target_hz / 1_000_000;
-    let khz = (target_hz % 1_000_000) / 1_000;
-    let digits = format!("{:03}{:03}", mhz, khz);
+fn inject_freq_digits(state: &SharedState, digits: &str, session_id: Option<u32>) -> bool {
     log::info!("[FreqStepper] 键盘输入: \"{}\"", digits);
 
     for ch in digits.chars() {
@@ -358,6 +412,16 @@ fn inject_freq_keyboard(state: &SharedState, target_hz: u64, session_id: Option<
     true
 }
 
+/// 键盘宏：MAIN 侧按 6 位数字键直接输入频率
+/// 频率格式：MHz×3 位 + kHz×3 位（如 145.500 MHz → "145500"）
+/// 假设当前在 VFO 模式（若在 MR 模式需先切 VFO，本版未实现）
+fn inject_freq_keyboard(state: &SharedState, target_hz: u64, session_id: Option<u32>) -> bool {
+    let mhz = target_hz / 1_000_000;
+    let khz = (target_hz % 1_000_000) / 1_000;
+    let digits = format!("{:03}{:03}", mhz, khz);
+    inject_freq_digits(state, digits.as_str(), session_id)
+}
+
 fn rigctld_main(state: SharedState) {
     let active = Arc::new(AtomicUsize::new(0));
     log::info!("[Rigctld] acceptor 启动");
@@ -392,47 +456,39 @@ fn rigctld_main(state: SharedState) {
                         continue;
                     }
                     active.fetch_add(1, Ordering::SeqCst);
-                    let first_client = {
+                    let (rx_is_left_at_accept, clients_before, session_before) = {
                         let s = state.lock().unwrap_or_else(|e| e.into_inner());
-                        s.rigctld_clients == 0
+                        (capture_rx_side(&s, s.rigctld_session_id), s.rigctld_clients, s.rigctld_session_id)
                     };
-                    if first_client {
-                        {
-                            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-                            s.rigctld_initial_freq_done = false;
-                            s.rigctld_step_ready = false;
-                            s.rigctld_setup_running = false;
-                            s.rigctld_target_hz = None;
-                            s.rigctld_last_step_us = 0;
-                            s.rigctld_sat_retry_after_us = 0;
-                            s.rigctld_setup_retry_after_us = 0;
-                            s.rigctld_setup_attempts = 0;
-                        }
-                        begin_sat_session(&state);
-                        log::info!("[Rigctld] 首次连接，等待 DTrac 频率/split 命令后执行初始设置");
-                    }
                     {
                         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                         s.rigctld_clients = s.rigctld_clients.saturating_add(1);
                     }
                     let st = state.clone();
                     let act = active.clone();
-                    log::info!("[Rigctld] 接受连接：{}", peer);
+                    log::info!("[Rigctld] 接受连接：{} clients_before={} session_before={} RX采样={}", peer, clients_before, session_before, side_name(rx_is_left_at_accept));
                     let spawn_result = std::thread::Builder::new()
                         .name(format!("rigctld_{}", peer.port()))
                         .stack_size(4096)
                         .spawn(move || {
-                            handle_client(stream, &st);
+                            let handler_session_id = handle_client(stream, &st, rx_is_left_at_accept);
                             act.fetch_sub(1, Ordering::SeqCst);
                             let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
                             s.rigctld_clients = s.rigctld_clients.saturating_sub(1);
-                            if s.rigctld_clients == 0 {
+                            if handler_session_id == Some(s.rigctld_session_id) {
                                 s.rigctld_target_hz = None;
                                 s.rigctld_setup_running = false;
                                 s.ptt_override = false;
                                 clear_sat_session(&mut s);
+                            } else if s.rigctld_clients == 0 {
+                                s.rigctld_target_hz = None;
+                                s.rigctld_setup_running = false;
+                                s.ptt_override = false;
+                                if handler_session_id.is_none() {
+                                    clear_sat_session(&mut s);
+                                }
                             }
-                            log::info!("[Rigctld] 连接 {} 已关闭，剩余 {} 客户端", peer, s.rigctld_clients);
+                            log::info!("[Rigctld] 连接 {} 已关闭，handler_session={:?} current_session={} 剩余 {} 客户端", peer, handler_session_id, s.rigctld_session_id, s.rigctld_clients);
                         });
                     if let Err(e) = spawn_result {
                         active.fetch_sub(1, Ordering::SeqCst);
@@ -461,7 +517,7 @@ fn rigctld_main(state: SharedState) {
     }
 }
 
-fn handle_client(stream: TcpStream, state: &SharedState) {
+fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: bool) -> Option<u32> {
     let _ = stream.set_nodelay(true);
     // 3s 无数据自动断开（DTrac 断开后尽快还原 IP 状态）
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
@@ -470,38 +526,81 @@ fn handle_client(stream: TcpStream, state: &SharedState) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let mut last_line_us = unsafe { esp_timer_get_time() } as u64;
+    let mut handler_session_id: Option<u32> = None;
 
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) => return,
+            Ok(0) => return handler_session_id,
             Ok(_) => {}
             Err(e) => match e.kind() {
                 ErrorKind::TimedOut | ErrorKind::WouldBlock => {
+                    if let Some(id) = handler_session_id {
+                        if !handler_session_is_current(state, id) {
+                            log::info!("[Rigctld] handler session #{} 已过期，关闭旧 client", id);
+                            return handler_session_id;
+                        }
+                    }
                     let now_us = unsafe { esp_timer_get_time() } as u64;
                     if now_us.saturating_sub(last_line_us) >= 10_000_000 {
                         log::info!("[Rigctld] 10s 无命令，关闭空闲 client");
-                        return;
+                        return handler_session_id;
                     }
                     continue;
                 }
-                _ => return,
+                _ => return handler_session_id,
             },
         }
         let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
         if trimmed.is_empty() { continue; }
         last_line_us = unsafe { esp_timer_get_time() } as u64;
 
+        let cmd_name = command_name(trimmed);
+        if let Some(id) = handler_session_id {
+            if !handler_session_is_current(state, id) {
+                log::info!("[RigctldGate] cmd={:?} handler_session #{} 已过期，关闭旧 client", trimmed, id);
+                return handler_session_id;
+            }
+        } else if is_stateful_dtrac_command(trimmed) {
+            let session_id = begin_sat_session(state, rx_is_left_at_accept);
+            handler_session_id = Some(session_id);
+            log::info!("[RigctldGate] cmd={:?} name={:?} 启动 SatSession #{}", trimmed, cmd_name, session_id);
+        } else {
+            log::info!("[RigctldGate] cmd={:?} name={:?} 非 stateful，handler_session=None", trimmed, cmd_name);
+        }
+
         let resp = match dispatch(trimmed, state) {
             DispatchOut::Reply(s) => s,
-            DispatchOut::Quit => return,
+            DispatchOut::Quit => return handler_session_id,
         };
         if !resp.is_empty() {
             let inner = reader.get_mut();
-            if inner.write_all(resp.as_bytes()).is_err() { return; }
+            if inner.write_all(resp.as_bytes()).is_err() { return handler_session_id; }
             let _ = inner.flush();
         }
     }
+}
+
+fn handler_session_is_current(state: &SharedState, session_id: u32) -> bool {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    s.rigctld_sat_active && s.rigctld_session_id == session_id
+}
+
+fn command_name(line: &str) -> &str {
+    let trimmed = line.trim();
+    let body = trimmed.strip_prefix('+').unwrap_or(trimmed).trim_start();
+    if let Some(rest) = body.strip_prefix("\\") {
+        rest.split_whitespace().next().unwrap_or("")
+    } else {
+        body.get(..body.chars().next().map(|c| c.len_utf8()).unwrap_or(0)).unwrap_or("")
+    }
+}
+
+fn is_stateful_dtrac_command(line: &str) -> bool {
+    matches!(command_name(line),
+        "F" | "I" | "S" | "V" | "C" | "E" | "T" |
+        "set_freq" | "set_split_freq" | "set_split_vfo" | "set_vfo" |
+        "set_ctcss_tone" | "set_ctcss_sql" | "set_tone" | "set_ptt")
 }
 
 enum DispatchOut {
@@ -515,7 +614,7 @@ fn log_dtrac_command(line: &str, state: &SharedState) {
         return;
     }
 
-    let body = trimmed.strip_prefix('+').unwrap_or(trimmed);
+    let body = trimmed.strip_prefix('+').unwrap_or(trimmed).trim_start();
     let (cmd, args) = if let Some(rest) = body.strip_prefix("\\") {
         let mut parts = rest.splitn(2, char::is_whitespace);
         (parts.next().unwrap_or(""), parts.next().unwrap_or("").trim())
@@ -711,6 +810,9 @@ fn reset_sat_setup_state(s: &mut RadioState) {
     s.rigctld_tx_pending_hz = None;
     s.rigctld_rx_pending_since_us = 0;
     s.rigctld_tx_pending_since_us = 0;
+    s.rigctld_setup_pair_since_us = 0;
+    s.rigctld_rx_log_us = 0;
+    s.rigctld_tx_log_us = 0;
     s.rigctld_setup_rx_hz = None;
     s.rigctld_setup_tx_hz = None;
     s.rigctld_setup_snapshot_ready = false;
@@ -728,28 +830,40 @@ fn reset_sat_setup_state(s: &mut RadioState) {
     s.rigctld_rx_last_step_us = 0;
     s.rigctld_tx_last_step_us = 0;
     s.rigctld_tx_ctcss_tone = 0;
+    s.rigctld_tx_placeholder_active = false;
+    s.rigctld_tx_real_pending_after_placeholder = None;
+    s.rigctld_ptt_blocked_until_tx_real = false;
+    s.rigctld_missing_tx_i_since_us = 0;
 }
 
-fn begin_sat_session(state: &SharedState) {
-    restore_forced_rx_sql(state);
-    if !wait_pending_clear(state, Duration::from_secs(1)) {
-        log::warn!("[SatSession] 新会话开始前仍有旧 pending 注入，清空后继续");
-    }
-    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-    clear_pending_injections(&mut s);
-    s.rigctld_session_id = s.rigctld_session_id.wrapping_add(1);
-    bind_sat_session(&mut s);
-}
-
-fn bind_sat_session(s: &mut RadioState) {
-    let rx_is_left = if s.left.is_main {
+fn capture_rx_side(s: &RadioState, session_id: u32) -> bool {
+    if s.left.is_main {
         true
     } else if s.right.is_main {
         false
     } else {
-        log::warn!("[SatSession #{}] MAIN 位置未知，暂按 LEFT 作为 RX；等待 MAIN 探测后下次连接会重新采样", s.rigctld_session_id);
+        log::warn!("[SatSession #{}] MAIN 位置未知，暂按 LEFT 作为 RX；等待 MAIN 探测后下次连接会重新采样", session_id);
         true
+    }
+}
+
+fn begin_sat_session(state: &SharedState, rx_is_left_at_accept: bool) -> u32 {
+    let session_id = {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.rigctld_session_id = s.rigctld_session_id.wrapping_add(1);
+        s.rigctld_session_id
     };
+    restore_forced_rx_sql(state);
+    if !wait_pending_clear(state, Duration::from_secs(1)) {
+        log::warn!("[SatSession #{}] 新会话开始前仍有旧 pending 注入，清空后继续", session_id);
+    }
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    clear_pending_injections(&mut s);
+    bind_sat_session(&mut s, rx_is_left_at_accept);
+    session_id
+}
+
+fn bind_sat_session(s: &mut RadioState, rx_is_left: bool) {
     let tx_is_left = !rx_is_left;
     s.rigctld_sat_active = true;
     s.rigctld_sat_split_enabled = false;
@@ -780,27 +894,67 @@ fn clear_side_menu_display(s: &mut RadioState, is_left: bool) {
 }
 
 fn prepare_sat_setup_snapshot(s: &mut RadioState, now_us: u64) {
-    if s.rigctld_setup_snapshot_ready || s.rigctld_setup_running {
+    if s.rigctld_setup_snapshot_ready {
         return;
     }
-    let (rx, tx, rx_since, tx_since) = match (
-        s.rigctld_rx_pending_hz,
-        s.rigctld_tx_pending_hz,
-        s.rigctld_rx_pending_since_us,
-        s.rigctld_tx_pending_since_us,
-    ) {
-        (Some(rx), Some(tx), rx_since, tx_since) if rx_since != 0 && tx_since != 0 => (rx, tx, rx_since, tx_since),
-        _ => return,
-    };
-    let newest = rx_since.max(tx_since);
-    if now_us.saturating_sub(newest) < SAT_SETUP_SNAPSHOT_US {
+    if s.rigctld_setup_running {
+        log_sat_gate(s, now_us, "snapshot blocked: setup running");
         return;
+    }
+    let (rx, tx, placeholder) = match (s.rigctld_rx_pending_hz, s.rigctld_tx_pending_hz) {
+        (Some(rx), Some(tx)) => (rx, tx, false),
+        (None, Some(_)) => {
+            log_sat_gate(s, now_us, "snapshot waiting RX F");
+            return;
+        }
+        (Some(rx), None) => {
+            if s.rigctld_sat_split_enabled && s.rigctld_session_id > 1 {
+                if s.rigctld_missing_tx_i_since_us == 0 {
+                    s.rigctld_missing_tx_i_since_us = now_us;
+                }
+                let missing_us = now_us.saturating_sub(s.rigctld_missing_tx_i_since_us);
+                if missing_us >= SAT_MISSING_TX_I_FALLBACK_US {
+                    s.rigctld_tx_placeholder_active = true;
+                    s.rigctld_ptt_blocked_until_tx_real = true;
+                    log::warn!(
+                        "[SatFallback #{}] missing TX I for {}ms, use 000000 placeholder and block PTT",
+                        s.rigctld_session_id,
+                        missing_us / 1000,
+                    );
+                    (rx, TX_PLACEHOLDER_HZ, true)
+                } else {
+                    log_sat_gate(s, now_us, "snapshot waiting TX I");
+                    return;
+                }
+            } else {
+                log_sat_gate(s, now_us, "snapshot waiting TX I");
+                return;
+            }
+        }
+        (None, None) => {
+            log_sat_gate(s, now_us, "snapshot waiting RX/TX");
+            return;
+        }
+    };
+    if !placeholder && s.rigctld_setup_pair_since_us == 0 {
+        s.rigctld_setup_pair_since_us = now_us;
+        log_sat_gate(s, now_us, "snapshot pair timer start");
+        return;
+    }
+    if !placeholder && now_us.saturating_sub(s.rigctld_setup_pair_since_us) < SAT_SETUP_SNAPSHOT_US {
+        log_sat_gate(s, now_us, "snapshot waiting pair settle");
+        return;
+    }
+    if placeholder {
+        s.rigctld_setup_pair_since_us = now_us;
     }
     s.rigctld_setup_rx_hz = Some(rx);
     s.rigctld_setup_tx_hz = Some(tx);
     s.rigctld_setup_snapshot_ready = true;
     s.rigctld_rx_target_hz = Some(rx);
-    s.rigctld_tx_target_hz = Some(tx);
+    if !placeholder {
+        s.rigctld_tx_target_hz = Some(tx);
+    }
     s.rigctld_rx_initial_attempted = false;
     s.rigctld_tx_initial_attempted = false;
     s.rigctld_rx_initial_done = false;
@@ -809,37 +963,19 @@ fn prepare_sat_setup_snapshot(s: &mut RadioState, now_us: u64) {
     s.rigctld_tx_step_ready = false;
     s.rigctld_sat_retry_after_us = 0;
     log::info!(
-        "[SatSession #{}] 生成初始化快照 RX {}={} TX {}={}，后续 Doppler 不改写快照",
+        "[SatSession #{}] 生成初始化快照 RX {}={} TX {}={}{}，pair 到齐 {}ms 后冻结最新 pending",
         s.rigctld_session_id,
         side_name(s.rigctld_sat_rx_is_left), rx,
         side_name(s.rigctld_sat_tx_is_left), tx,
+        if placeholder { " (000000 placeholder)" } else { "" },
+        SAT_SETUP_SNAPSHOT_US / 1000,
     );
 }
 
 
-fn adopt_stable_sat_targets(s: &mut RadioState, now_us: u64) {
-    if let Some(rx) = s.rigctld_rx_pending_hz {
-        if s.rigctld_rx_target_hz != Some(rx)
-            && s.rigctld_rx_pending_since_us != 0
-            && now_us.saturating_sub(s.rigctld_rx_pending_since_us) >= RIG_TRACK_INTERVAL_US
-        {
-            s.rigctld_rx_target_hz = Some(rx);
-            log::info!("[SatSession] RX {} target 稳定 5s，采纳 {}{}",
-                side_name(s.rigctld_sat_rx_is_left), rx,
-                if s.rigctld_setup_snapshot_ready { "（后续 Doppler 更新）" } else { "（等待初始化快照）" });
-        }
-    }
-    if let Some(tx) = s.rigctld_tx_pending_hz {
-        if s.rigctld_tx_target_hz != Some(tx)
-            && s.rigctld_tx_pending_since_us != 0
-            && now_us.saturating_sub(s.rigctld_tx_pending_since_us) >= RIG_TRACK_INTERVAL_US
-        {
-            s.rigctld_tx_target_hz = Some(tx);
-            log::info!("[SatSession] TX {} target 稳定 5s，采纳 {}{}",
-                side_name(s.rigctld_sat_tx_is_left), tx,
-                if s.rigctld_setup_snapshot_ready { "（后续 Doppler 更新）" } else { "（等待初始化快照）" });
-        }
-    }
+fn adopt_stable_sat_targets(_s: &mut RadioState, _now_us: u64) {
+    // DTrac 高频命令的最新 target 在 set_freq/set_split_freq 中立即采纳；
+    // 5 秒限制只保留在 make_sat_step_candidate() 的实际电台步进路径。
 }
 
 
@@ -882,16 +1018,20 @@ fn freq_str_to_hz(s: &str) -> Option<u64> {
     Some(hz)
 }
 
-/// 解析 Hamlib/DTrac 频率参数：支持 Hz 整数、Hz 浮点、MHz 浮点；最终只保留 kHz 精度。
+fn round_to_rig_step_hz(hz: u64) -> u64 {
+    ((hz + RIG_STEP_HZ / 2) / RIG_STEP_HZ) * RIG_STEP_HZ
+}
+
+/// 解析 Hamlib/DTrac 频率参数：支持 Hz 整数、Hz 浮点、MHz 浮点，保留 Hz 精度。
 fn parse_freq_arg(s: &str) -> Option<u64> {
     if s.is_empty() { return None; }
     if let Ok(v) = s.parse::<u64>() {
-        return Some((v / 1_000) * 1_000);
+        return Some(v);
     }
     let f = s.parse::<f64>().ok()?;
     if !f.is_finite() || f <= 0.0 { return None; }
     let hz = if f < 2_000.0 { f * 1_000_000.0 } else { f };
-    Some(((hz as u64) / 1_000) * 1_000)
+    Some(hz.round() as u64)
 }
 
 /// 从 Hamlib set_freq 参数中找出频率 token，兼容可选 VFO 前缀。
@@ -903,6 +1043,11 @@ fn parse_freq_args(args: &str) -> Option<(&str, u64)> {
         }
     }
     parsed
+}
+
+fn sat_actual_hz(s: &RadioState, is_left: bool) -> u64 {
+    let band = if is_left { &s.left } else { &s.right };
+    freq_str_to_hz(band.freq.as_str()).unwrap_or(0)
 }
 
 fn side_is_main(s: &RadioState, is_left: bool) -> bool {
@@ -1081,11 +1226,11 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
     let stage = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         if !s.rigctld_rx_initial_done {
-            Some(("RX_FREQ", rx_is_left, rx_hz))
+            Some(("RX_FREQ", rx_is_left, s.rigctld_rx_pending_hz.or(s.rigctld_rx_target_hz).unwrap_or(rx_hz)))
         } else if !s.rigctld_rx_step_ready {
             Some(("RX_STEP", rx_is_left, rx_hz))
         } else if !s.rigctld_tx_initial_done {
-            Some(("TX_FREQ", tx_is_left, tx_hz))
+            Some(("TX_FREQ", tx_is_left, s.rigctld_tx_pending_hz.or(s.rigctld_tx_target_hz).unwrap_or(tx_hz)))
         } else if !s.rigctld_tx_step_ready {
             Some(("TX_STEP", tx_is_left, tx_hz))
         } else {
@@ -1094,7 +1239,7 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
     };
 
     let Some((stage, is_left, target_hz)) = stage else {
-        let main_ok = ensure_main_side(state, rx_is_left);
+        let main_ok = ensure_main_side(state, tx_is_left);
         if main_ok && session_alive(state, session_id) {
             sat_open_rx_squelch(state, rx_is_left);
             let _ = wait_pending_clear(state, Duration::from_secs(2));
@@ -1102,7 +1247,7 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         if s.rigctld_session_id == session_id {
             s.rigctld_setup_running = false;
-            log::info!("[SatSession #{}] 初始设置完成，MAIN 已恢复 RX {}", session_id, side_name(rx_is_left));
+            log::info!("[SatSession #{}] 初始设置完成，MAIN 已恢复 TX {}", session_id, side_name(tx_is_left));
         }
         return;
     };
@@ -1125,7 +1270,20 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
     match stage {
         "RX_FREQ" => s.rigctld_rx_initial_done = ok,
         "RX_STEP" => s.rigctld_rx_step_ready = ok,
-        "TX_FREQ" => s.rigctld_tx_initial_done = ok,
+        "TX_FREQ" => {
+            if ok && s.rigctld_tx_placeholder_active && target_hz == TX_PLACEHOLDER_HZ && s.rigctld_tx_real_pending_after_placeholder.is_some() {
+                s.rigctld_tx_initial_done = false;
+                log::info!("[SatFallback #{}] 000000 占位输入完成，真实 TX 已到达，等待重写 TX_FREQ", session_id);
+            } else {
+                s.rigctld_tx_initial_done = ok;
+            }
+            if ok && s.rigctld_tx_placeholder_active && target_hz != TX_PLACEHOLDER_HZ {
+                s.rigctld_tx_placeholder_active = false;
+                s.rigctld_tx_real_pending_after_placeholder = None;
+                s.rigctld_ptt_blocked_until_tx_real = false;
+                log::info!("[SatFallback #{}] 真实 TX 频率已应用，解除 PTT 禁止", session_id);
+            }
+        }
         "TX_STEP" => s.rigctld_tx_step_ready = ok,
         _ => {}
     }
@@ -1152,14 +1310,24 @@ fn sat_setup_frequency_only(state: &SharedState, is_left: bool, target_hz: u64, 
         s.key_release = false;
         s.knob_inject = None;
     }
-    log::info!("[SatSession] {} {} 键盘输入频率 {}", role, side_name(is_left), target_hz);
-    let ok = inject_freq_keyboard(state, target_hz, Some(session_id));
+    let placeholder = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        role == "TX_FREQ" && s.rigctld_tx_placeholder_active && target_hz == TX_PLACEHOLDER_HZ
+    };
+    let ok = if placeholder {
+        log::warn!("[SatFallback #{}] TX_FREQ {} 输入 000000 占位，保持 PTT 禁止", session_id, side_name(is_left));
+        inject_freq_digits(state, "000000", Some(session_id))
+    } else {
+        log::info!("[SatSession] {} {} 键盘输入频率 {}", role, side_name(is_left), target_hz);
+        inject_freq_keyboard(state, target_hz, Some(session_id))
+    };
     std::thread::sleep(Duration::from_millis(800));
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     clear_side_menu_display(&mut s, is_left);
     s.macro_running = false;
     ok
 }
+
 
 fn sat_setup_step_only(state: &SharedState, is_left: bool, role: &str, _session_id: u32) -> bool {
     if !ensure_main_side(state, is_left) {
@@ -1340,7 +1508,7 @@ fn set_freq(args: &str, ext: bool, state: &SharedState) -> String {
             return RPRT_EINVAL.to_string();
         }
     };
-    let target = ((hz + RIG_STEP_HZ / 2) / RIG_STEP_HZ) * RIG_STEP_HZ;
+    let target = round_to_rig_step_hz(hz);
 
     if target < 26_000_000 || target > 1_300_000_000 {
         log::warn!("[Rigctld] set_freq 频率越界: {}", target);
@@ -1348,21 +1516,27 @@ fn set_freq(args: &str, ext: bool, state: &SharedState) -> String {
     }
 
     let now_us = unsafe { esp_timer_get_time() } as u64;
-    let mut sat_log: Option<bool> = None;
+    let mut sat_log: Option<(bool, u64, i64)> = None;
     let mut throttled_log = false;
     let start_setup = {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         if s.rigctld_sat_active {
             let changed = s.rigctld_rx_pending_hz != Some(target);
-            let due = s.rigctld_rx_pending_since_us == 0
-                || now_us.saturating_sub(s.rigctld_rx_pending_since_us) >= RIG_TRACK_INTERVAL_US;
-            if changed || due {
-                s.rigctld_rx_pending_hz = Some(target);
-                s.rigctld_rx_pending_since_us = now_us;
-                sat_log = Some(s.rigctld_sat_rx_is_left);
+            let log_due = s.rigctld_rx_log_us == 0
+                || now_us.saturating_sub(s.rigctld_rx_log_us) >= RIG_TRACK_INTERVAL_US;
+            let actual = sat_actual_hz(&s, s.rigctld_sat_rx_is_left);
+            let delta = target as i64 - actual as i64;
+            s.rigctld_rx_pending_hz = Some(target);
+            s.rigctld_rx_pending_since_us = now_us;
+            if s.rigctld_tx_pending_hz.is_some() && s.rigctld_setup_pair_since_us == 0 {
+                s.rigctld_setup_pair_since_us = now_us;
             }
             if s.rigctld_setup_snapshot_ready {
                 s.rigctld_rx_target_hz = Some(target);
+            }
+            if changed || log_due {
+                s.rigctld_rx_log_us = now_us;
+                sat_log = Some((s.rigctld_sat_rx_is_left, actual, delta));
             }
             s.rigctld_target_hz = None;
             false
@@ -1383,9 +1557,33 @@ fn set_freq(args: &str, ext: bool, state: &SharedState) -> String {
         }
     };
 
-    if let Some(rx_is_left) = sat_log {
-        log::info!("[SatSession] F/set_freq → RX {} pending={}（5s 节流采样）", side_name(rx_is_left), target);
-    } else if start_setup {
+    let had_sat_log = sat_log.is_some();
+    if let Some((rx_is_left, actual, delta)) = sat_log {
+        log::info!("[FreqDiag] RX {} raw={} parsed={} rounded={} actual={} delta={} half_step={} step_due={}ms", side_name(rx_is_left), hz_str, hz, target, actual, delta, RIG_STEP_HZ / 2, RIG_TRACK_INTERVAL_US / 1000);
+    }
+    if had_sat_log {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.rigctld_sat_active {
+            let retry_left_ms = s.rigctld_sat_retry_after_us.saturating_sub(now_us) / 1000;
+            log::info!(
+                "[SatCmd #{}] F raw={} parsed={} rounded={} split={} rx_pending={:?} tx_pending={:?} pair_since={} snapshot={} setup={} macro={} retry_left={}ms",
+                s.rigctld_session_id,
+                hz_str,
+                hz,
+                target,
+                s.rigctld_sat_split_enabled,
+                s.rigctld_rx_pending_hz,
+                s.rigctld_tx_pending_hz,
+                s.rigctld_setup_pair_since_us,
+                s.rigctld_setup_snapshot_ready,
+                s.rigctld_setup_running,
+                s.macro_running,
+                retry_left_ms,
+            );
+        }
+    }
+
+    if start_setup {
         log::info!("[Rigctld] 首个 set_freq={}，交由 freq_stepper 执行初始频率+STEP 设置", target);
     } else if throttled_log {
         log::info!("[Rigctld] set_freq target={}（5s 节流采样）", target);
@@ -1422,6 +1620,9 @@ fn sat_ptt_ready(s: &RadioState) -> bool {
     if !s.rigctld_sat_active || !s.rigctld_sat_split_enabled {
         return true;
     }
+    if s.rigctld_ptt_blocked_until_tx_real {
+        return false;
+    }
     if s.macro_running || s.rigctld_setup_running {
         return false;
     }
@@ -1453,6 +1654,10 @@ fn set_ptt(args: &str, ext: bool, state: &SharedState) -> String {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         if on && !sat_ptt_ready(&s) {
             s.ptt_override = false;
+            if s.rigctld_ptt_blocked_until_tx_real {
+                log::warn!("[PTT保护] TX placeholder active, block PTT until real TX I applied");
+                return if ext { format!("set_ptt: {}\nRPRT 0\n", v) } else { RPRT_OK.to_string() };
+            }
             log::warn!(
                 "[SatSession] 拒绝 PTT：MAIN={} TX={} target={:?} actual={} macro={} setup={}",
                 if s.right.is_main { "RIGHT" } else { "LEFT" },
@@ -1530,6 +1735,18 @@ fn set_split_vfo(args: &str, ext: bool, state: &SharedState) -> String {
             return if ext { "set_split_vfo:\nRPRT 0\n".into() } else { RPRT_OK.to_string() };
         }
         s.rigctld_sat_split_enabled = split;
+        log::info!(
+            "[SatCmd #{}] S split={} tx_vfo={} rx_pending={:?} tx_pending={:?} pair_since={} snapshot={} setup={} macro={}",
+            s.rigctld_session_id,
+            split,
+            tx_vfo,
+            s.rigctld_rx_pending_hz,
+            s.rigctld_tx_pending_hz,
+            s.rigctld_setup_pair_since_us,
+            s.rigctld_setup_snapshot_ready,
+            s.rigctld_setup_running,
+            s.macro_running,
+        );
     }
     let (rx_is_left, tx_is_left) = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1541,11 +1758,21 @@ fn set_split_vfo(args: &str, ext: bool, state: &SharedState) -> String {
 
 fn get_split_freq(ext: bool, state: &SharedState) -> String {
     let s = state.lock().unwrap_or_else(|e| e.into_inner());
-    let hz = match s.rigctld_tx_pending_hz.or(s.rigctld_tx_target_hz) {
-        Some(t) => t,
-        None => {
-            let band = if s.rigctld_sat_tx_is_left { &s.left } else { &s.right };
-            freq_str_to_hz(band.freq.as_str()).unwrap_or(0)
+    let hz = if s.rigctld_tx_placeholder_active {
+        s.rigctld_tx_pending_hz
+            .or(s.rigctld_tx_target_hz)
+            .filter(|&v| v != TX_PLACEHOLDER_HZ)
+            .unwrap_or_else(|| {
+                let band = if s.rigctld_sat_tx_is_left { &s.left } else { &s.right };
+                freq_str_to_hz(band.freq.as_str()).unwrap_or(0)
+            })
+    } else {
+        match s.rigctld_tx_pending_hz.or(s.rigctld_tx_target_hz) {
+            Some(t) => t,
+            None => {
+                let band = if s.rigctld_sat_tx_is_left { &s.left } else { &s.right };
+                freq_str_to_hz(band.freq.as_str()).unwrap_or(0)
+            }
         }
     };
     if ext { format!("get_split_freq:\nTx freq: {}\nRPRT 0\n", hz) }
@@ -1560,13 +1787,16 @@ fn set_split_freq(args: &str, ext: bool, state: &SharedState) -> String {
             return RPRT_EINVAL.to_string();
         }
     };
-    let target = ((hz + RIG_STEP_HZ / 2) / RIG_STEP_HZ) * RIG_STEP_HZ;
+    let target = round_to_rig_step_hz(hz);
     if target < 26_000_000 || target > 1_300_000_000 {
         log::warn!("[Rigctld] set_split_freq 频率越界: {}", target);
         return RPRT_EINVAL.to_string();
     }
+    let now_us = unsafe { esp_timer_get_time() } as u64;
     let tx_is_left;
-    let changed;
+    let actual;
+    let delta;
+    let should_log;
     {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         if !s.rigctld_sat_active {
@@ -1574,23 +1804,61 @@ fn set_split_freq(args: &str, ext: bool, state: &SharedState) -> String {
             return if ext { format!("set_split_freq: {}\nTx freq: {}\nRPRT 0\n", hz_str, target) } else { RPRT_OK.to_string() };
         }
         s.rigctld_sat_split_enabled = true;
-        changed = s.rigctld_tx_pending_hz != Some(target);
-        if changed {
-            s.rigctld_tx_pending_hz = Some(target);
-            s.rigctld_tx_pending_since_us = unsafe { esp_timer_get_time() } as u64;
-            if s.rigctld_setup_snapshot_ready {
-                s.rigctld_tx_target_hz = Some(target);
-            }
+        let changed = s.rigctld_tx_pending_hz != Some(target);
+        let log_due = s.rigctld_tx_log_us == 0
+            || now_us.saturating_sub(s.rigctld_tx_log_us) >= RIG_TRACK_INTERVAL_US;
+        tx_is_left = s.rigctld_sat_tx_is_left;
+        actual = sat_actual_hz(&s, tx_is_left);
+        delta = target as i64 - actual as i64;
+        s.rigctld_tx_pending_hz = Some(target);
+        s.rigctld_tx_pending_since_us = now_us;
+        if s.rigctld_tx_placeholder_active {
+            s.rigctld_tx_real_pending_after_placeholder = Some(target);
+            s.rigctld_tx_initial_done = false;
+            s.rigctld_tx_target_hz = Some(target);
+            s.rigctld_setup_snapshot_ready = true;
+            log::warn!("[SatFallback #{}] 收到真实 TX I={}，安排只重写 TX_FREQ，PTT 继续禁止", s.rigctld_session_id, target);
+        }
+        if s.rigctld_rx_pending_hz.is_some() && s.rigctld_setup_pair_since_us == 0 {
+            s.rigctld_setup_pair_since_us = now_us;
+        }
+        if s.rigctld_setup_snapshot_ready {
+            s.rigctld_tx_target_hz = Some(target);
+        }
+        should_log = changed || log_due;
+        if should_log {
+            s.rigctld_tx_log_us = now_us;
         }
         s.rigctld_target_hz = None;
-        tx_is_left = s.rigctld_sat_tx_is_left;
     }
-    if changed {
-        log::info!("[SatSession] I/set_split_freq → TX {} pending={}（稳定 5s 后采纳）", side_name(tx_is_left), target);
+    if should_log {
+        log::info!("[FreqDiag] TX {} raw={} parsed={} rounded={} actual={} delta={} half_step={} step_due={}ms", side_name(tx_is_left), hz_str, hz, target, actual, delta, RIG_STEP_HZ / 2, RIG_TRACK_INTERVAL_US / 1000);
+    }
+    {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.rigctld_sat_active {
+            let retry_left_ms = s.rigctld_sat_retry_after_us.saturating_sub(now_us) / 1000;
+            log::info!(
+                "[SatCmd #{}] I raw={} parsed={} rounded={} split={} rx_pending={:?} tx_pending={:?} pair_since={} snapshot={} setup={} macro={} retry_left={}ms",
+                s.rigctld_session_id,
+                hz_str,
+                hz,
+                target,
+                s.rigctld_sat_split_enabled,
+                s.rigctld_rx_pending_hz,
+                s.rigctld_tx_pending_hz,
+                s.rigctld_setup_pair_since_us,
+                s.rigctld_setup_snapshot_ready,
+                s.rigctld_setup_running,
+                s.macro_running,
+                retry_left_ms,
+            );
+        }
     }
     if ext { format!("set_split_freq: {}\nTx freq: {}\nRPRT 0\n", hz_str, target) }
     else   { RPRT_OK.to_string() }
 }
+
 
 
 fn get_rit(ext: bool) -> String {
