@@ -1628,11 +1628,10 @@ fn sat_setup_frequency_only(state: &SharedState, is_left: bool, target_hz: u64, 
 }
 
 
-fn sat_setup_step_only(state: &SharedState, is_left: bool, role: &str, _session_id: u32) -> bool {
+fn sat_setup_step_only(state: &SharedState, is_left: bool, _role: &str, _session_id: u32) -> bool {
     if !ensure_main_side(state, is_left) {
         return false;
     }
-    log::info!("[SatSession] {} {} 设置 STEP=2.5kHz", role, side_name(is_left));
     inject_menu_set(state, 28, "2.5", false)
 }
 
@@ -2322,20 +2321,11 @@ fn inject_menu_set(state: &SharedState, menu_num: u8, target_val: &str, keep_men
         let ok = s.radio_alive && !band.is_tx && !band.is_busy;
         if !ok {
             log::warn!(
-                "[MenuNav] Guard2 fail #{} target={} main={} alive={} tx={} busy={} s={} set={} menu=\"{}\" display=\"{}\" in_value={} macro={} ptt={}",
+                "[MenuNav] Guard2 fail #{} alive={} tx={} busy={}",
                 menu_num,
-                target_val,
-                side_name(menu_side_is_left),
                 s.radio_alive,
                 band.is_tx,
                 band.is_busy,
-                band.s_level,
-                band.is_set,
-                band.menu_text.as_str(),
-                band.display_text.as_str(),
-                band.menu_in_value,
-                s.macro_running,
-                s.ptt_override,
             );
         }
         (menu_side_is_left, ok)
