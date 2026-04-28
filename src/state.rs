@@ -230,8 +230,8 @@ pub struct RadioState {
     pub rigctld_missing_tx_i_since_us: u64,
     pub rigctld_rx_input_recovered: bool,
     pub rigctld_session_id: u32,
-    pub rigctld_rx_sql_forced_side: Option<bool>,
-    pub rigctld_rx_sql_saved_adc: Option<u16>,
+    pub rigctld_sql_close_left_pending: bool,
+    pub rigctld_sql_close_right_pending: bool,
     // ===== rigctld 连接状态 =====
     pub rigctld_clients: u32,       // 当前活跃 rigctld 客户端数（>0 → IP 显示橙色）
     pub rigctld_ctcss_tone: u32,    // 最后设置的 CTCSS 频率（0.1 Hz 单位，0=OFF）
@@ -314,8 +314,8 @@ impl RadioState {
             rigctld_missing_tx_i_since_us: 0,
             rigctld_rx_input_recovered: false,
             rigctld_session_id: 0,
-            rigctld_rx_sql_forced_side: None,
-            rigctld_rx_sql_saved_adc: None,
+            rigctld_sql_close_left_pending: false,
+            rigctld_sql_close_right_pending: false,
             rigctld_clients: 0,
             rigctld_ctcss_tone: 0,
             rigctld_initial_freq_done: false,

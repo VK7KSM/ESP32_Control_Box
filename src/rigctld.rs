@@ -29,6 +29,7 @@ const MAX_CLIENTS: usize = 4;
 const RIG_STEP_HZ: u64 = 2_500;
 const RIG_TRACK_INTERVAL_US: u64 = 5_000_000;
 const SAT_RX_SQL_OPEN_ADC: u16 = 20;
+const SAT_RX_SQL_CLOSE_ADC: u16 = 564;  // 60% 安全关闭，断开后注入两侧
 const SAT_SETUP_RETRY_US: u64 = 10_000_000;
 const SAT_SETUP_SNAPSHOT_US: u64 = 800_000;
 const SAT_SETUP_MAX_ATTEMPTS: u8 = 20;
@@ -61,24 +62,7 @@ fn log_sat_gate(s: &mut RadioState, now_us: u64, reason: &str) {
     }
     if now_us.saturating_sub(s.rigctld_setup_retry_after_us) >= SAT_GATE_LOG_INTERVAL_US {
         s.rigctld_setup_retry_after_us = now_us;
-        let retry_left_ms = s.rigctld_sat_retry_after_us.saturating_sub(now_us) / 1000;
-        log::info!(
-            "[SatGate #{}] {} snapshot={} setup={} macro={} attempts={}/{} retry_left={}ms rx_pending={:?} tx_pending={:?} rx_done={} rx_step={} tx_done={} tx_step={}",
-            s.rigctld_session_id,
-            reason,
-            s.rigctld_setup_snapshot_ready,
-            s.rigctld_setup_running,
-            s.macro_running,
-            s.rigctld_setup_attempts,
-            SAT_SETUP_MAX_ATTEMPTS,
-            retry_left_ms,
-            s.rigctld_rx_pending_hz,
-            s.rigctld_tx_pending_hz,
-            s.rigctld_rx_initial_done,
-            s.rigctld_rx_step_ready,
-            s.rigctld_tx_initial_done,
-            s.rigctld_tx_step_ready,
-        );
+        log::info!("[SatGate #{}] {}", s.rigctld_session_id, reason);
     }
 }
 
@@ -154,7 +138,7 @@ pub fn start_rigctld_thread(state: SharedState) {
 pub fn start_freq_stepper_thread(state: SharedState) {
     std::thread::Builder::new()
         .name("freq_stepper".into())
-        .stack_size(3072)
+        .stack_size(4096)
         .spawn(move || freq_stepper_main(state))
         .expect("freq_stepper 线程启动失败");
 }
@@ -172,6 +156,9 @@ fn freq_stepper_main(state: SharedState) {
         };
         if no_clients {
             if run_tone_off_maintenance(&state) {
+                continue;
+            }
+            if run_sql_close_maintenance(&state) {
                 continue;
             }
             std::thread::sleep(std::time::Duration::from_millis(800));
@@ -289,7 +276,9 @@ fn freq_stepper_main(state: SharedState) {
         };
         if let Some(tx_is_left) = correction_target {
             log::warn!("[SatSession] MAIN 偏离 TX {}，自动切回", side_name(tx_is_left));
-            inject_key_wait(&state, 0x10);
+            if !ensure_main_side(&state, tx_is_left) {
+                log::warn!("[SatSession] MAIN 自动切回 TX {} 超时", side_name(tx_is_left));
+            }
             continue;
         }
 
@@ -809,18 +798,6 @@ fn queue_sql_inject(s: &mut RadioState, is_left: bool, adc: u16) {
     s.sql_changed = true;
 }
 
-fn cancel_forced_rx_sql(state: &SharedState) {
-    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-    if s.rigctld_rx_sql_forced_side.is_some() || s.sql_changed || s.sql_override.is_some() {
-        log::info!("[SatSession] 取消卫星会话 SQL 固定注入，恢复由物理静噪旋钮接管");
-    }
-    s.sql_override = None;
-    s.sql_changed = false;
-    s.sql_override_side_is_left = None;
-    s.rigctld_rx_sql_forced_side = None;
-    s.rigctld_rx_sql_saved_adc = None;
-}
-
 fn reset_sat_setup_state(s: &mut RadioState) {
     s.rigctld_rx_pending_hz = None;
     s.rigctld_tx_pending_hz = None;
@@ -876,7 +853,6 @@ fn begin_sat_session(state: &SharedState, rx_is_left_at_accept: bool) -> u32 {
         s.rigctld_session_id = s.rigctld_session_id.wrapping_add(1);
         s.rigctld_session_id
     };
-    cancel_forced_rx_sql(state);
     if !wait_pending_clear(state, Duration::from_secs(1)) {
         log::warn!("[SatSession #{}] 新会话开始前仍有旧 pending 注入，清空后继续", session_id);
     }
@@ -913,24 +889,14 @@ fn bind_sat_session(s: &mut RadioState, rx_is_left: bool) {
 
 fn clear_sat_session(s: &mut RadioState) {
     let session_id = s.rigctld_session_id;
-    let sql_restore = match (s.rigctld_rx_sql_forced_side.take(), s.rigctld_rx_sql_saved_adc.take()) {
-        (Some(side), Some(adc)) => Some((side, adc)),
-        _ => None,
-    };
     reset_sat_setup_state(s);
     s.rigctld_sat_active = false;
     s.rigctld_sat_split_enabled = false;
     s.rigctld_setup_running = false;
     s.rigctld_ctcss_tone = 0;
-    if let Some((side, adc)) = sql_restore {
-        queue_sql_inject(s, side, adc);
-        log::info!(
-            "[SatSession #{}] 会话结束，排队恢复 RX {} SQL ADC={}",
-            session_id,
-            side_name(side),
-            adc
-        );
-    }
+    s.rigctld_sql_close_left_pending = true;
+    s.rigctld_sql_close_right_pending = true;
+    log::info!("[SatSession #{}] 会话结束，排队注入 RX/TX SQL=60% 安全关闭", session_id);
     s.rigctld_tone_off_pending = true;
     s.rigctld_tone_off_rx_done = false;
     s.rigctld_tone_off_tx_done = false;
@@ -989,7 +955,6 @@ fn prepare_sat_setup_snapshot(s: &mut RadioState, now_us: u64) {
             }
         }
         (None, None) => {
-            log_sat_gate(s, now_us, "snapshot waiting RX/TX");
             return;
         }
     };
@@ -1240,6 +1205,48 @@ fn run_tone_off_maintenance(state: &SharedState) -> bool {
     true
 }
 
+fn run_sql_close_maintenance(state: &SharedState) -> bool {
+    let target = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.rigctld_clients > 0
+            || s.macro_running
+            || s.rigctld_setup_running
+            || s.ptt_override
+            || s.left.is_tx
+            || s.right.is_tx
+        {
+            return false;
+        }
+        if !s.rigctld_sql_close_left_pending && !s.rigctld_sql_close_right_pending {
+            return false;
+        }
+        if s.sql_changed {
+            return true;
+        }
+        if s.rigctld_sql_close_left_pending {
+            Some(true)
+        } else {
+            Some(false)
+        }
+    };
+    let Some(is_left) = target else { return false; };
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    queue_sql_inject(&mut s, is_left, SAT_RX_SQL_CLOSE_ADC);
+    if is_left {
+        s.left.sql = SAT_RX_SQL_CLOSE_ADC;
+        s.rigctld_sql_close_left_pending = false;
+    } else {
+        s.right.sql = SAT_RX_SQL_CLOSE_ADC;
+        s.rigctld_sql_close_right_pending = false;
+    }
+    s.head_count = s.head_count.wrapping_add(1);
+    log::info!("[SatSession] 断开后注入 {} SQL=60% (ADC={})", side_name(is_left), SAT_RX_SQL_CLOSE_ADC);
+    if !s.rigctld_sql_close_left_pending && !s.rigctld_sql_close_right_pending {
+        log::info!("[SatSession] 断开后 RX/TX SQL 关闭注入完成");
+    }
+    true
+}
+
 fn sat_set_tx_ctcss_freq(state: &SharedState, tx_is_left: bool) -> bool {
     let tone = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1324,13 +1331,11 @@ fn sat_tx_ready_for_ctcss(s: &RadioState) -> bool {
 
 fn sat_open_rx_squelch(state: &SharedState, rx_is_left: bool) {
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-    if s.rigctld_rx_sql_forced_side == Some(rx_is_left) {
-        log::info!("[SatSession #{}] RX {} SQL=0 已在本会话打开，跳过重复注入", s.rigctld_session_id, side_name(rx_is_left));
+    let current = if rx_is_left { s.left.sql } else { s.right.sql };
+    if current == SAT_RX_SQL_OPEN_ADC {
+        log::info!("[SatSession #{}] RX {} SQL 已是 OPEN，跳过重复注入", s.rigctld_session_id, side_name(rx_is_left));
         return;
     }
-    let saved = if rx_is_left { s.left.sql } else { s.right.sql };
-    s.rigctld_rx_sql_forced_side = Some(rx_is_left);
-    s.rigctld_rx_sql_saved_adc = Some(saved);
     queue_sql_inject(&mut s, rx_is_left, SAT_RX_SQL_OPEN_ADC);
     if rx_is_left {
         s.left.sql = SAT_RX_SQL_OPEN_ADC;
@@ -1338,7 +1343,7 @@ fn sat_open_rx_squelch(state: &SharedState, rx_is_left: bool) {
         s.right.sql = SAT_RX_SQL_OPEN_ADC;
     }
     s.head_count = s.head_count.wrapping_add(1);
-    log::info!("[SatSession #{}] RX {} 静噪设为 0%，保存原 ADC={}", s.rigctld_session_id, side_name(rx_is_left), saved);
+    log::info!("[SatSession #{}] RX {} 静噪强制设为 OPEN (ADC={})", s.rigctld_session_id, side_name(rx_is_left), SAT_RX_SQL_OPEN_ADC);
 }
 
 struct SatSideSetupResult {
