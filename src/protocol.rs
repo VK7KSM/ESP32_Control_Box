@@ -19,6 +19,7 @@
 // ===================================================================
 
 use crate::state::{PowerLevel, RadioState};
+use esp_idf_svc::sys::esp_timer_get_time;
 
 /// 根据 6 位频率（kHz 整数）推算末三位（100Hz/10Hz/1Hz），级联尝试所有标准步进网格
 /// TH-9800 协议只传 6 位 ASCII（精度 1kHz），面板 LCD 的末三位由本地计算
@@ -333,6 +334,7 @@ impl DownParser {
             let sub = compute_sub_khz(freq_khz);
             let _ = band.freq.push('.');
             let _ = band.freq.push_str(sub);
+            band.last_freq_frame_us = unsafe { esp_timer_get_time() } as u64;
 
             if !self.got_channel[side_idx] {
                 band.channel.clear();

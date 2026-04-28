@@ -35,6 +35,8 @@ const SAT_SETUP_MAX_ATTEMPTS: u8 = 20;
 const SAT_GATE_LOG_INTERVAL_US: u64 = 5_000_000;
 const SAT_MISSING_TX_I_FALLBACK_US: u64 = 2_000_000;
 const TX_PLACEHOLDER_HZ: u64 = 0;
+const SAT_KEYBOARD_ACCEPT_HZ: u64 = 6_000;
+const SAT_REWRITE_THRESHOLD_HZ: u64 = SAT_KEYBOARD_ACCEPT_HZ;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ToneMode {
@@ -286,7 +288,7 @@ fn freq_stepper_main(state: SharedState) {
 
         // 读快照：无 rigctld client、宏运行、STEP 未就绪时都不追频
         let step = {
-            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
             if s.rigctld_clients == 0 {
                 continue;
             }
@@ -314,6 +316,18 @@ fn freq_stepper_main(state: SharedState) {
                     now_us,
                 );
                 match (rx_candidate, tx_candidate) {
+                    (Some(rx), _) if rx.delta_hz.unsigned_abs() > SAT_REWRITE_THRESHOLD_HZ => {
+                        s.rigctld_rx_initial_done = false;
+                        s.rigctld_sat_retry_after_us = now_us;
+                        log::warn!("[SatSession] RX {} 偏差 {}Hz 超过 {}Hz，改用键盘重写", side_name(rx.is_left), rx.delta_hz, SAT_REWRITE_THRESHOLD_HZ);
+                        continue;
+                    }
+                    (_, Some(tx)) if tx.delta_hz.unsigned_abs() > SAT_REWRITE_THRESHOLD_HZ => {
+                        s.rigctld_tx_initial_done = false;
+                        s.rigctld_sat_retry_after_us = now_us;
+                        log::warn!("[SatSession] TX {} 偏差 {}Hz 超过 {}Hz，改用键盘重写", side_name(tx.is_left), tx.delta_hz, SAT_REWRITE_THRESHOLD_HZ);
+                        continue;
+                    }
                     (Some(rx), Some(tx)) => Some(if rx.delta_hz.unsigned_abs() >= tx.delta_hz.unsigned_abs() { rx } else { tx }),
                     (Some(rx), None) => Some(rx),
                     (None, Some(tx)) => Some(tx),
@@ -416,8 +430,9 @@ fn inject_freq_digits(state: &SharedState, digits: &str, session_id: Option<u32>
 /// 频率格式：MHz×3 位 + kHz×3 位（如 145.500 MHz → "145500"）
 /// 假设当前在 VFO 模式（若在 MR 模式需先切 VFO，本版未实现）
 fn inject_freq_keyboard(state: &SharedState, target_hz: u64, session_id: Option<u32>) -> bool {
-    let mhz = target_hz / 1_000_000;
-    let khz = (target_hz % 1_000_000) / 1_000;
+    let freq_khz = (target_hz + 500) / 1_000;
+    let mhz = freq_khz / 1_000;
+    let khz = freq_khz % 1_000;
     let digits = format!("{:03}{:03}", mhz, khz);
     inject_freq_digits(state, digits.as_str(), session_id)
 }
@@ -834,6 +849,7 @@ fn reset_sat_setup_state(s: &mut RadioState) {
     s.rigctld_tx_real_pending_after_placeholder = None;
     s.rigctld_ptt_blocked_until_tx_real = false;
     s.rigctld_missing_tx_i_since_us = 0;
+    s.rigctld_rx_input_recovered = false;
 }
 
 fn capture_rx_side(s: &RadioState, session_id: u32) -> bool {
@@ -1299,7 +1315,110 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
     }
 }
 
+fn side_freq_frame_us(s: &RadioState, is_left: bool) -> u64 {
+    if is_left { s.left.last_freq_frame_us } else { s.right.last_freq_frame_us }
+}
+
+fn wait_side_freq_frame_after(state: &SharedState, is_left: bool, start_us: u64, timeout: Duration, session_id: u32) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !session_alive(state, session_id) {
+            return false;
+        }
+        let seen = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            side_freq_frame_us(&s, is_left) >= start_us
+        };
+        if seen {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_side_freq_confirmed(state: &SharedState, is_left: bool, target_hz: u64, start_us: u64, timeout: Duration, session_id: u32) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !session_alive(state, session_id) {
+            return false;
+        }
+        let confirmed = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            let band = if is_left { &s.left } else { &s.right };
+            if band.last_freq_frame_us >= start_us {
+                freq_str_to_hz(band.freq.as_str())
+                    .map(|actual| actual.abs_diff(target_hz) <= SAT_KEYBOARD_ACCEPT_HZ)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        };
+        if confirmed {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            let band = if is_left { &s.left } else { &s.right };
+            log::warn!("[SatSession #{}] {} 频率确认超时：target={} actual={}", session_id, side_name(is_left), target_hz, band.freq.as_str());
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn reset_rx_freq_input_with_knob(state: &SharedState, rx_is_left: bool, session_id: u32) -> bool {
+    let already_recovered = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.rigctld_rx_input_recovered
+    };
+    if already_recovered {
+        return true;
+    }
+    if !ensure_main_side(state, rx_is_left) {
+        return false;
+    }
+    let start_us = unsafe { esp_timer_get_time() } as u64;
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.ptt_override || s.left.is_tx || s.right.is_tx {
+            log::warn!("[SatSession #{}] RX {} 频率输入恢复跳过：PTT/TX active", session_id, side_name(rx_is_left));
+            return false;
+        }
+        let rx = if rx_is_left { &s.left } else { &s.right };
+        if rx.is_busy {
+            log::warn!("[SatSession #{}] RX {} busy，延后频率输入恢复", session_id, side_name(rx_is_left));
+            return false;
+        }
+        s.key_override = None;
+        s.key_release = false;
+        s.knob_inject = None;
+    }
+    let step = if rx_is_left { 0x02u8 } else { 0x82u8 };
+    log::info!("[SatSession #{}] RX {} 旋钮 1 格复位残留频率输入", session_id, side_name(rx_is_left));
+    inject_knob_wait(state, step);
+    if !wait_pending_clear(state, Duration::from_secs(2)) {
+        log::warn!("[SatSession #{}] 等待 RX {} 旋钮恢复帧发送超时", session_id, side_name(rx_is_left));
+        return false;
+    }
+    let ok = wait_side_freq_frame_after(state, rx_is_left, start_us, Duration::from_secs(2), session_id);
+    if ok {
+        state.lock().unwrap_or_else(|e| e.into_inner()).rigctld_rx_input_recovered = true;
+    }
+    ok
+}
+
 fn sat_setup_frequency_only(state: &SharedState, is_left: bool, target_hz: u64, role: &str, session_id: u32) -> bool {
+    let placeholder = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        role == "TX_FREQ" && s.rigctld_tx_placeholder_active && target_hz == TX_PLACEHOLDER_HZ
+    };
+
+    if role == "RX_FREQ" && !reset_rx_freq_input_with_knob(state, is_left, session_id) {
+        return false;
+    }
     if !ensure_main_side(state, is_left) {
         return false;
     }
@@ -1310,18 +1429,15 @@ fn sat_setup_frequency_only(state: &SharedState, is_left: bool, target_hz: u64, 
         s.key_release = false;
         s.knob_inject = None;
     }
-    let placeholder = {
-        let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        role == "TX_FREQ" && s.rigctld_tx_placeholder_active && target_hz == TX_PLACEHOLDER_HZ
-    };
-    let ok = if placeholder {
+    let start_us = unsafe { esp_timer_get_time() } as u64;
+    let sent = if placeholder {
         log::warn!("[SatFallback #{}] TX_FREQ {} 输入 000000 占位，保持 PTT 禁止", session_id, side_name(is_left));
         inject_freq_digits(state, "000000", Some(session_id))
     } else {
         log::info!("[SatSession] {} {} 键盘输入频率 {}", role, side_name(is_left), target_hz);
         inject_freq_keyboard(state, target_hz, Some(session_id))
     };
-    std::thread::sleep(Duration::from_millis(800));
+    let ok = sent && (placeholder || wait_side_freq_confirmed(state, is_left, target_hz, start_us, Duration::from_secs(4), session_id));
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     clear_side_menu_display(&mut s, is_left);
     s.macro_running = false;

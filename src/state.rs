@@ -50,6 +50,7 @@ pub struct BandState {
     pub menu_exit_count: u8,
     // 机头频率区当前非数字文本（Len=09 原始文本）；为空时显示 freq
     pub display_text: String<12>,
+    pub last_freq_frame_us: u64,
 }
 
 impl BandState {
@@ -85,6 +86,7 @@ impl BandState {
             menu_in_value: false,
             menu_exit_count: 0,
             display_text: String::new(),
+            last_freq_frame_us: 0,
         };
         let _ = s.freq.push_str("---.---");
         let _ = s.mode.push_str("FM");
@@ -217,6 +219,7 @@ pub struct RadioState {
     pub rigctld_tx_real_pending_after_placeholder: Option<u64>,
     pub rigctld_ptt_blocked_until_tx_real: bool,
     pub rigctld_missing_tx_i_since_us: u64,
+    pub rigctld_rx_input_recovered: bool,
     pub rigctld_session_id: u32,
     pub rigctld_rx_sql_forced_side: Option<bool>,
     pub rigctld_rx_sql_saved_adc: Option<u16>,
@@ -291,6 +294,7 @@ impl RadioState {
             rigctld_tx_real_pending_after_placeholder: None,
             rigctld_ptt_blocked_until_tx_real: false,
             rigctld_missing_tx_i_since_us: 0,
+            rigctld_rx_input_recovered: false,
             rigctld_session_id: 0,
             rigctld_rx_sql_forced_side: None,
             rigctld_rx_sql_saved_adc: None,
