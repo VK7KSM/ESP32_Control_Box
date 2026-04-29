@@ -209,6 +209,8 @@ impl DownParser {
             // DEC: CTCSS 解码器
             0x18 => {
                 let old = band.tone_type.clone();
+                band.tone_seen_mask |= 0x01;
+                band.tone_last_frame_us = unsafe { esp_timer_get_time() } as u64;
                 band.tone_dec = is_on;
                 if is_on { band.tone_dcs = false; }
                 band.refresh_tone_type();
@@ -219,6 +221,8 @@ impl DownParser {
             // ENC: CTCSS 编码器
             0x19 => {
                 let old = band.tone_type.clone();
+                band.tone_seen_mask |= 0x02;
+                band.tone_last_frame_us = unsafe { esp_timer_get_time() } as u64;
                 band.tone_enc = is_on;
                 if is_on { band.tone_dcs = false; }
                 band.refresh_tone_type();
@@ -233,6 +237,8 @@ impl DownParser {
             // DCS
             0x20 => {
                 let old = band.tone_type.clone();
+                band.tone_seen_mask |= 0x04;
+                band.tone_last_frame_us = unsafe { esp_timer_get_time() } as u64;
                 band.tone_dcs = is_on;
                 if is_on {
                     band.tone_enc = false;

@@ -11,6 +11,7 @@
 
 # 运行时生成文件
 /examples/elfradio-box/recordings/
+/logs/dtrac-stability/
 
 # 本地工具 / IDE 数据
 /tmp/

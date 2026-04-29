@@ -31,6 +31,7 @@ const RIG_TRACK_INTERVAL_US: u64 = 5_000_000;
 const SAT_RX_SQL_OPEN_ADC: u16 = 20;
 const SAT_RX_SQL_CLOSE_ADC: u16 = 564;  // 60% 安全关闭，断开后注入两侧
 const SAT_SETUP_RETRY_US: u64 = 10_000_000;
+const SAT_REWRITE_RETRY_US: u64 = 1_000_000;
 const SAT_SETUP_SNAPSHOT_US: u64 = 800_000;
 const SAT_SETUP_MAX_ATTEMPTS: u8 = 20;
 const SAT_GATE_LOG_INTERVAL_US: u64 = 5_000_000;
@@ -172,7 +173,9 @@ fn freq_stepper_main(state: SharedState) {
             } else {
                 prepare_sat_setup_snapshot(&mut s, now_us);
                 adopt_stable_sat_targets(&mut s, now_us);
-                let setup_incomplete = !s.rigctld_rx_initial_done
+                let setup_incomplete = !s.rigctld_preflight_sql_left_done
+                    || !s.rigctld_preflight_sql_right_done
+                    || !s.rigctld_rx_initial_done
                     || !s.rigctld_tx_initial_done
                     || !s.rigctld_rx_step_ready
                     || !s.rigctld_tx_step_ready
@@ -190,7 +193,6 @@ fn freq_stepper_main(state: SharedState) {
                     match (s.rigctld_setup_rx_hz, s.rigctld_setup_tx_hz) {
                         (Some(rx), Some(tx)) => {
                             s.rigctld_setup_running = true;
-                            s.rigctld_setup_attempts = s.rigctld_setup_attempts.saturating_add(1);
                             let session_id = s.rigctld_session_id;
                             Some((rx, tx, s.rigctld_sat_rx_is_left, s.rigctld_sat_tx_is_left, session_id))
                         }
@@ -292,7 +294,7 @@ fn freq_stepper_main(state: SharedState) {
                 continue;
             }
             if s.rigctld_sat_active {
-                if !s.rigctld_rx_step_ready || !s.rigctld_tx_step_ready || !s.rigctld_rx_tone_clear_done || !s.rigctld_rx_sql_open_done || (s.rigctld_tx_ctcss_dirty && (!s.rigctld_tx_ctcss_done || !s.rigctld_tx_tone_mode_done)) {
+                if !s.rigctld_preflight_sql_left_done || !s.rigctld_preflight_sql_right_done || !s.rigctld_rx_initial_done || !s.rigctld_tx_initial_done || !s.rigctld_rx_step_ready || !s.rigctld_tx_step_ready || !s.rigctld_rx_tone_clear_done || !s.rigctld_rx_sql_open_done || (s.rigctld_tx_ctcss_dirty && (!s.rigctld_tx_ctcss_done || !s.rigctld_tx_tone_mode_done)) {
                     continue;
                 }
                 let rx_candidate = make_sat_step_candidate(
@@ -313,15 +315,28 @@ fn freq_stepper_main(state: SharedState) {
                 );
                 match (rx_candidate, tx_candidate) {
                     (Some(rx), _) if rx.delta_hz.unsigned_abs() > SAT_REWRITE_THRESHOLD_HZ => {
+                        if s.rigctld_rx_initial_done {
+                            s.rigctld_setup_attempts = 0;
+                            s.rigctld_preflight_sql_left_done = false;
+                            s.rigctld_preflight_sql_right_done = false;
+                            s.rigctld_rx_sql_open_done = false;
+                            s.rigctld_rx_input_recovered = false;
+                            s.rigctld_sat_retry_after_us = now_us + SAT_REWRITE_RETRY_US;
+                            log::warn!("[SatSession] RX {} 偏差 {}Hz 超过 {}Hz，新建 RX_FREQ 重写生命周期", side_name(rx.is_left), rx.delta_hz, SAT_REWRITE_THRESHOLD_HZ);
+                        }
                         s.rigctld_rx_initial_done = false;
-                        s.rigctld_sat_retry_after_us = now_us;
-                        log::warn!("[SatSession] RX {} 偏差 {}Hz 超过 {}Hz，改用键盘重写", side_name(rx.is_left), rx.delta_hz, SAT_REWRITE_THRESHOLD_HZ);
                         continue;
                     }
                     (_, Some(tx)) if tx.delta_hz.unsigned_abs() > SAT_REWRITE_THRESHOLD_HZ => {
+                        if s.rigctld_tx_initial_done {
+                            s.rigctld_setup_attempts = 0;
+                            s.rigctld_preflight_sql_left_done = false;
+                            s.rigctld_preflight_sql_right_done = false;
+                            s.rigctld_rx_sql_open_done = false;
+                            s.rigctld_sat_retry_after_us = now_us + SAT_REWRITE_RETRY_US;
+                            log::warn!("[SatSession] TX {} 偏差 {}Hz 超过 {}Hz，新建 TX_FREQ 重写生命周期", side_name(tx.is_left), tx.delta_hz, SAT_REWRITE_THRESHOLD_HZ);
+                        }
                         s.rigctld_tx_initial_done = false;
-                        s.rigctld_sat_retry_after_us = now_us;
-                        log::warn!("[SatSession] TX {} 偏差 {}Hz 超过 {}Hz，改用键盘重写", side_name(tx.is_left), tx.delta_hz, SAT_REWRITE_THRESHOLD_HZ);
                         continue;
                     }
                     (Some(rx), Some(tx)) => Some(if rx.delta_hz.unsigned_abs() >= tx.delta_hz.unsigned_abs() { rx } else { tx }),
@@ -810,6 +825,18 @@ fn queue_sql_inject(s: &mut RadioState, is_left: bool, adc: u16) {
 }
 
 fn reset_sat_setup_state(s: &mut RadioState) {
+    s.left.tone_enc = false;
+    s.left.tone_dec = false;
+    s.left.tone_dcs = false;
+    s.left.tone_seen_mask = 0;
+    s.left.tone_last_frame_us = 0;
+    s.left.refresh_tone_type();
+    s.right.tone_enc = false;
+    s.right.tone_dec = false;
+    s.right.tone_dcs = false;
+    s.right.tone_seen_mask = 0;
+    s.right.tone_last_frame_us = 0;
+    s.right.refresh_tone_type();
     s.rigctld_rx_pending_hz = None;
     s.rigctld_tx_pending_hz = None;
     s.rigctld_rx_pending_since_us = 0;
@@ -839,6 +866,8 @@ fn reset_sat_setup_state(s: &mut RadioState) {
     s.rigctld_tx_tone_mode_requested = 0;
     s.rigctld_tx_tone_mode_done = true;
     s.rigctld_rx_tone_clear_done = false;
+    s.rigctld_preflight_sql_left_done = false;
+    s.rigctld_preflight_sql_right_done = false;
     s.rigctld_rx_sql_open_done = false;
     s.rigctld_tx_placeholder_active = false;
     s.rigctld_tx_real_pending_after_placeholder = None;
@@ -1125,16 +1154,18 @@ fn ensure_main_side(state: &SharedState, target_left: bool) -> bool {
     ok
 }
 
-fn side_tone_mode(s: &RadioState, is_left: bool) -> ToneMode {
+fn side_tone_mode_known(s: &RadioState, is_left: bool) -> Option<ToneMode> {
     let band = if is_left { &s.left } else { &s.right };
     if band.tone_dcs {
-        ToneMode::Dcs
+        Some(ToneMode::Dcs)
     } else if band.tone_enc && band.tone_dec {
-        ToneMode::EncDec
+        Some(ToneMode::EncDec)
     } else if band.tone_enc {
-        ToneMode::Enc
+        Some(ToneMode::Enc)
+    } else if (band.tone_seen_mask & 0x07) == 0x07 {
+        Some(ToneMode::Off)
     } else {
-        ToneMode::Off
+        None
     }
 }
 
@@ -1158,13 +1189,20 @@ fn tone_mode_code(mode: ToneMode) -> u8 {
 
 fn tone_target_satisfied(state: &SharedState, is_left: bool, target: ToneMode) -> bool {
     let s = state.lock().unwrap_or_else(|e| e.into_inner());
-    side_tone_mode(&s, is_left) == target
+    side_tone_mode_known(&s, is_left) == Some(target)
 }
 
 fn set_side_tone_mode(state: &SharedState, is_left: bool, target: ToneMode, label: &str) -> bool {
-    if tone_target_satisfied(state, is_left, target) {
+    let initial = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        side_tone_mode_known(&s, is_left)
+    };
+    if initial == Some(target) {
         log::info!("[SatSession] {} {} 亚音已是 {}", label, side_name(is_left), tone_mode_name(target));
         return true;
+    }
+    if initial.is_none() {
+        log::warn!("[SatSession] {} {} 亚音状态未知，主动收敛到 {}", label, side_name(is_left), tone_mode_name(target));
     }
     if !ensure_main_side(state, is_left) {
         log::warn!("[SatSession] {} {} 亚音设置失败：无法切 MAIN", label, side_name(is_left));
@@ -1172,11 +1210,16 @@ fn set_side_tone_mode(state: &SharedState, is_left: bool, target: ToneMode, labe
     }
     let ok = inject_tone_mode(state, target);
     let final_ok = tone_target_satisfied(state, is_left, target);
-    if final_ok {
+    if ok || final_ok {
         log::info!("[SatSession] {} {} 亚音已切到 {}", label, side_name(is_left), tone_mode_name(target));
         true
     } else {
-        log::warn!("[SatSession] {} {} 亚音未确认到 {}", label, side_name(is_left), tone_mode_name(target));
+        let final_mode = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            side_tone_mode_known(&s, is_left)
+        };
+        let current = final_mode.map(tone_mode_name).unwrap_or("UNKNOWN");
+        log::warn!("[SatSession] {} {} 亚音未确认到 {}，当前 {}", label, side_name(is_left), tone_mode_name(target), current);
         ok && final_ok
     }
 }
@@ -1290,13 +1333,16 @@ fn sat_set_tx_tone_mode(state: &SharedState, tx_is_left: bool) -> bool {
 fn sat_clear_rx_tone_if_needed(state: &SharedState, rx_is_left: bool) -> bool {
     let mode = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        side_tone_mode(&s, rx_is_left)
+        side_tone_mode_known(&s, rx_is_left)
     };
-    if mode == ToneMode::Off {
-        log::info!("[SatSession] RX {} 亚音已是 OFF", side_name(rx_is_left));
+    if mode == Some(ToneMode::Off) {
+        log::info!("[SatSession] RX {} 亚音已确认 OFF", side_name(rx_is_left));
         return true;
     }
-    log::info!("[SatSession] RX {} 检测到残留亚音 {}，切到 OFF", side_name(rx_is_left), tone_mode_name(mode));
+    match mode {
+        Some(m) => log::info!("[SatSession] RX {} 检测到残留亚音 {}，切到 OFF", side_name(rx_is_left), tone_mode_name(m)),
+        None => log::warn!("[SatSession] RX {} 亚音状态未知，主动切到 OFF", side_name(rx_is_left)),
+    }
     set_side_tone_mode(state, rx_is_left, ToneMode::Off, "RX_TONE_CLEAR")
 }
 
@@ -1338,6 +1384,21 @@ fn sat_tx_ready_for_ctcss(s: &RadioState) -> bool {
         && s.rigctld_tx_step_ready
         && !s.rigctld_setup_running
         && !s.macro_running
+}
+
+fn sat_preflight_sql_close(state: &SharedState, is_left: bool) -> bool {
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        queue_sql_inject(&mut s, is_left, SAT_RX_SQL_CLOSE_ADC);
+        if is_left {
+            s.left.sql = SAT_RX_SQL_CLOSE_ADC;
+        } else {
+            s.right.sql = SAT_RX_SQL_CLOSE_ADC;
+        }
+        s.head_count = s.head_count.wrapping_add(1);
+        log::info!("[SatSession #{}] PREFLIGHT {} SQL=60% (ADC={})", s.rigctld_session_id, side_name(is_left), SAT_RX_SQL_CLOSE_ADC);
+    }
+    wait_pending_clear(state, Duration::from_secs(2))
 }
 
 fn sat_open_rx_squelch(state: &SharedState, rx_is_left: bool) {
@@ -1396,7 +1457,11 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
 
     let stage = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        if !s.rigctld_rx_initial_done {
+        if !s.rigctld_preflight_sql_left_done {
+            Some(("PREFLIGHT_SQL_CLOSE_LEFT", true, 0))
+        } else if !s.rigctld_preflight_sql_right_done {
+            Some(("PREFLIGHT_SQL_CLOSE_RIGHT", false, 0))
+        } else if !s.rigctld_rx_initial_done {
             Some(("RX_FREQ", rx_is_left, s.rigctld_rx_pending_hz.or(s.rigctld_rx_target_hz).unwrap_or(rx_hz)))
         } else if !s.rigctld_rx_step_ready {
             Some(("RX_STEP", rx_is_left, rx_hz))
@@ -1422,6 +1487,8 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         if s.rigctld_session_id == session_id {
             s.rigctld_setup_running = false;
+            s.rigctld_setup_attempts = 0;
+            s.rigctld_sat_retry_after_us = 0;
             if main_ok {
                 log::info!("[SatSession #{}] 初始设置完成，MAIN 已恢复 TX {}", session_id, side_name(tx_is_left));
             } else {
@@ -1433,6 +1500,7 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
 
     log::info!("[SatSession #{}] 单阶段初始化 {} {}", session_id, stage, side_name(is_left));
     let ok = match stage {
+        "PREFLIGHT_SQL_CLOSE_LEFT" | "PREFLIGHT_SQL_CLOSE_RIGHT" => sat_preflight_sql_close(state, is_left),
         "RX_FREQ" | "TX_FREQ" => sat_setup_frequency_only(state, is_left, target_hz, stage, session_id),
         "RX_STEP" | "TX_STEP" => sat_setup_step_only(state, is_left, stage, session_id),
         "RX_TONE_CLEAR" => sat_clear_rx_tone_if_needed(state, is_left),
@@ -1454,6 +1522,8 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
 
     let now = unsafe { esp_timer_get_time() } as u64;
     match stage {
+        "PREFLIGHT_SQL_CLOSE_LEFT" => s.rigctld_preflight_sql_left_done = ok,
+        "PREFLIGHT_SQL_CLOSE_RIGHT" => s.rigctld_preflight_sql_right_done = ok,
         "RX_FREQ" => s.rigctld_rx_initial_done = ok,
         "RX_STEP" => s.rigctld_rx_step_ready = ok,
         "RX_TONE_CLEAR" => s.rigctld_rx_tone_clear_done = ok,
@@ -1487,8 +1557,10 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
     s.rigctld_tx_last_step_us = now;
 
     if ok {
+        s.rigctld_setup_attempts = 0;
         log::info!("[SatSession #{}] {} 完成", session_id, stage);
     } else {
+        s.rigctld_setup_attempts = s.rigctld_setup_attempts.saturating_add(1);
         s.rigctld_sat_retry_after_us = now + SAT_SETUP_RETRY_US;
         log::warn!("[SatSession #{}] {} 失败，仅重试当前阶段，{}s 后允许重试", session_id, stage, SAT_SETUP_RETRY_US / 1_000_000);
     }
@@ -2248,6 +2320,7 @@ fn set_ctcss_tone(args: &str, ext: bool, state: &SharedState) -> String {
             s.rigctld_tx_ctcss_done = tone == 0;
             s.rigctld_tx_tone_mode_requested = tone_mode_code(if tone == 0 { ToneMode::Off } else { ToneMode::Enc });
             s.rigctld_tx_tone_mode_done = false;
+            s.rigctld_setup_attempts = 0;
             s.rigctld_sat_retry_after_us = 0;
         }
     }
@@ -2282,6 +2355,7 @@ fn set_ctcss_sql(args: &str, ext: bool, state: &SharedState) -> String {
             s.rigctld_tx_ctcss_done = tone == 0;
             s.rigctld_tx_tone_mode_requested = tone_mode_code(if tone == 0 { ToneMode::Off } else { ToneMode::Enc });
             s.rigctld_tx_tone_mode_done = false;
+            s.rigctld_setup_attempts = 0;
             s.rigctld_sat_retry_after_us = 0;
         }
     }
@@ -2505,18 +2579,28 @@ fn parse_tenth_hz_menu_value(s: &str) -> Option<u32> {
 }
 
 /// 用手咪 P3(TONE) 键循环，将 MAIN 侧亚音模式切换到目标状态
-fn current_tone_mode(state: &SharedState) -> ToneMode {
+fn current_tone_mode_known(state: &SharedState) -> Option<ToneMode> {
     let s = state.lock().unwrap_or_else(|e| e.into_inner());
-    let band = if s.right.is_main { &s.right } else { &s.left };
-    if band.tone_dcs {
-        ToneMode::Dcs
-    } else if band.tone_enc && band.tone_dec {
-        ToneMode::EncDec
-    } else if band.tone_enc {
-        ToneMode::Enc
-    } else {
-        ToneMode::Off
+    let is_left = !s.right.is_main;
+    side_tone_mode_known(&s, is_left)
+}
+
+fn current_tone_off_confirmed_after(state: &SharedState, start_us: u64) -> bool {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let is_left = !s.right.is_main;
+    let band = if is_left { &s.left } else { &s.right };
+    band.tone_last_frame_us >= start_us
+        && band.tone_seen_mask != 0
+        && !band.tone_enc
+        && !band.tone_dec
+        && !band.tone_dcs
+}
+
+fn current_tone_target_satisfied_after(state: &SharedState, target: ToneMode, start_us: u64) -> bool {
+    if current_tone_mode_known(state) == Some(target) {
+        return true;
     }
+    target == ToneMode::Off && current_tone_off_confirmed_after(state, start_us)
 }
 
 fn inject_tone_mode(state: &SharedState, target: ToneMode) -> bool {
@@ -2539,13 +2623,18 @@ fn inject_tone_mode(state: &SharedState, target: ToneMode) -> bool {
     };
     if !acquired { return false; }
 
-    for attempt in 0..4 {
-        let current = current_tone_mode(state);
-        if current == target {
+    let start_us = unsafe { esp_timer_get_time() } as u64;
+    for attempt in 0..5 {
+        let current_known = current_tone_mode_known(state);
+        if current_known == Some(target) || (target == ToneMode::Off && current_tone_off_confirmed_after(state, start_us)) {
             log::info!("[MenuNav] inject_tone_mode 已是 {}", tone_mode_name(target));
             state.lock().unwrap_or_else(|e| e.into_inner()).macro_running = false;
             return true;
         }
+        let current = current_known.unwrap_or(match target {
+            ToneMode::Off => ToneMode::Enc,
+            _ => ToneMode::Off,
+        });
         let presses = tone_mode_presses(current, target);
         if presses == 0 {
             break;
@@ -2560,10 +2649,11 @@ fn inject_tone_mode(state: &SharedState, target: ToneMode) -> bool {
         std::thread::sleep(Duration::from_millis(800));
     }
 
-    let final_mode = current_tone_mode(state);
-    let ok = final_mode == target;
+    let final_mode = current_tone_mode_known(state);
+    let ok = current_tone_target_satisfied_after(state, target, start_us);
     if !ok {
-        log::warn!("[MenuNav] inject_tone_mode 未确认到 {}，当前 {}", tone_mode_name(target), tone_mode_name(final_mode));
+        let current = final_mode.map(tone_mode_name).unwrap_or("UNKNOWN");
+        log::warn!("[MenuNav] inject_tone_mode 未确认到 {}，当前 {}", tone_mode_name(target), current);
     }
     state.lock().unwrap_or_else(|e| e.into_inner()).macro_running = false;
     ok

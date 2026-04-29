@@ -30,6 +30,8 @@ pub struct BandState {
     pub tone_enc: bool,          // CmdID=0x19: CTCSS 编码器
     pub tone_dec: bool,          // CmdID=0x18: CTCSS 解码器
     pub tone_dcs: bool,          // CmdID=0x20: DCS
+    pub tone_seen_mask: u8,      // bit0=DEC seen, bit1=ENC seen, bit2=DCS seen
+    pub tone_last_frame_us: u64, // 最近一次收到亚音图标帧的时间
     pub tone_type: String<4>,    // "ENC"/"T/R"/"DCS"/"" (由上面三个推导)
     pub tone_freq: String<8>,    // "88.5"/"023"/"" (暂不解析，留空)
     // 中继偏移（来自 CmdID=16/17）
@@ -70,6 +72,8 @@ impl BandState {
             tone_enc: false,
             tone_dec: false,
             tone_dcs: false,
+            tone_seen_mask: 0,
+            tone_last_frame_us: 0,
             tone_type: String::new(),
             tone_freq: String::new(),
             shift_plus: false,
@@ -220,6 +224,8 @@ pub struct RadioState {
     pub rigctld_tx_tone_mode_requested: u8, // 0=OFF, 1=ENC, 2=T/R, 3=DCS
     pub rigctld_tx_tone_mode_done: bool,
     pub rigctld_rx_tone_clear_done: bool,
+    pub rigctld_preflight_sql_left_done: bool,
+    pub rigctld_preflight_sql_right_done: bool,
     pub rigctld_rx_sql_open_done: bool,
     pub rigctld_tone_off_pending: bool,
     pub rigctld_tone_off_rx_done: bool,
@@ -304,6 +310,8 @@ impl RadioState {
             rigctld_tx_tone_mode_requested: 0,
             rigctld_tx_tone_mode_done: true,
             rigctld_rx_tone_clear_done: false,
+            rigctld_preflight_sql_left_done: false,
+            rigctld_preflight_sql_right_done: false,
             rigctld_rx_sql_open_done: false,
             rigctld_tone_off_pending: false,
             rigctld_tone_off_rx_done: false,
