@@ -284,6 +284,11 @@ fn freq_stepper_main(state: SharedState) {
             continue;
         }
 
+        // DTrac 会话存续期守护：检测用户手动偏离卫星参数
+        if sat_check_session_invariants(&state) {
+            continue;
+        }
+
         // 读快照：无 rigctld client、宏运行、STEP 未就绪时都不追频
         let step = {
             let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -861,10 +866,13 @@ fn reset_sat_setup_state(s: &mut RadioState) {
     s.rigctld_rx_last_step_us = 0;
     s.rigctld_tx_last_step_us = 0;
     s.rigctld_tx_ctcss_tone = 0;
-    s.rigctld_tx_ctcss_dirty = false;
+    // 强制初始化时执行 TX_TONE_MODE 一次：清理 TX 侧之前残留的亚音（若有）。
+    // 用 dirty=true 触发 stage 选择；ctcss_done=true 跳过 TX_CTCSS_FREQ（无频率值要写）；
+    // tone_mode_done=false + requested=0(OFF) → TX_TONE_MODE 执行 set_side_tone_mode 切到 OFF。
+    s.rigctld_tx_ctcss_dirty = true;
     s.rigctld_tx_ctcss_done = true;
     s.rigctld_tx_tone_mode_requested = 0;
-    s.rigctld_tx_tone_mode_done = true;
+    s.rigctld_tx_tone_mode_done = false;
     s.rigctld_rx_tone_clear_done = false;
     s.rigctld_preflight_sql_left_done = false;
     s.rigctld_preflight_sql_right_done = false;
@@ -1301,6 +1309,95 @@ fn run_sql_close_maintenance(state: &SharedState) -> bool {
     true
 }
 
+fn sat_check_session_invariants(state: &SharedState) -> bool {
+    let (ok, rx_is_left, tx_is_left, session_id) = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let ok = s.rigctld_clients > 0
+            && s.rigctld_sat_active
+            && s.rigctld_sat_split_enabled
+            && s.rigctld_rx_sql_open_done
+            && !s.rigctld_setup_running
+            && !s.macro_running
+            && !s.ptt_override
+            && !s.left.is_tx && !s.right.is_tx;
+        (ok, s.rigctld_sat_rx_is_left, s.rigctld_sat_tx_is_left, s.rigctld_session_id)
+    };
+    if !ok { return false; }
+
+    // SET 菜单守护已删除：DTrac 连接期间不再强制驱赶用户出 SET 菜单（用户决策）。
+    // 用户按 SET 退出后，protocol.rs cmd=0x03 OFF 帧会即时清 is_set，Doppler 追踪自然恢复。
+
+    // 检查 2a：RX 侧 SQL 漂移 → 重置 RX_SQL_OPEN（RX 侧必须保持 OPEN=20，否则会遮蔽卫星信号）
+    // 检查 2b：TX 侧出现 BUSY → 注入 SQL=60% 防 busy（用户允许调 SQL，但不能 busy）
+    let (rx_sql, tx_busy, sql_already_pending) = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let rx = if rx_is_left { s.left.sql } else { s.right.sql };
+        let tx_busy = if tx_is_left { s.left.is_busy } else { s.right.is_busy };
+        // 注意：sql_override 在 apply_overrides 消费后不清（保留作"上次注入值"痕迹），
+        // 必须用 sql_changed 判断"注入还在排队等消费"。
+        (rx, tx_busy, s.sql_changed)
+    };
+    const RX_SQL_DRIFT: u16 = SAT_RX_SQL_OPEN_ADC * 5; // = 100 ADC
+    if rx_sql > RX_SQL_DRIFT {
+        log::warn!("[SatGuard #{}] RX {} SQL 漂移 ADC={}，重置 RX_SQL_OPEN",
+            session_id, side_name(rx_is_left), rx_sql);
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.rigctld_rx_sql_open_done = false;
+        s.rigctld_setup_attempts = 0;
+        return true;
+    }
+    if tx_busy && !sql_already_pending {
+        log::warn!("[SatGuard #{}] TX {} 出现 BUSY，注入 SQL=60% 防 busy",
+            session_id, side_name(tx_is_left));
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        queue_sql_inject(&mut s, tx_is_left, SAT_RX_SQL_CLOSE_ADC);
+        if tx_is_left { s.left.sql = SAT_RX_SQL_CLOSE_ADC; } else { s.right.sql = SAT_RX_SQL_CLOSE_ADC; }
+        s.head_count = s.head_count.wrapping_add(1);
+        return true;
+    }
+
+    // 检查 3：RX 亚音漂移
+    let (rx_tone_on, rx_tone_fresh) = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let b = if rx_is_left { &s.left } else { &s.right };
+        (b.tone_enc || b.tone_dec || b.tone_dcs, b.tone_seen_mask != 0)
+    };
+    if rx_tone_on && rx_tone_fresh {
+        log::warn!("[SatGuard #{}] RX {} 亚音被手动开启，重置 RX_TONE_CLEAR",
+            session_id, side_name(rx_is_left));
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.rigctld_rx_tone_clear_done = false;
+        s.rigctld_setup_attempts = 0;
+        return true;
+    }
+
+    // 检查 4：TX 亚音模式漂移
+    let (tx_mode_matches, tx_tone_fresh) = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let b = if tx_is_left { &s.left } else { &s.right };
+        let fresh = b.tone_seen_mask != 0;
+        let matches = match s.rigctld_tx_tone_mode_requested {
+            0 => !b.tone_enc && !b.tone_dec && !b.tone_dcs,
+            1 =>  b.tone_enc && !b.tone_dec && !b.tone_dcs,
+            2 =>  b.tone_enc &&  b.tone_dec && !b.tone_dcs,
+            3 => b.tone_dcs,
+            _ => true,
+        };
+        (matches, fresh)
+    };
+    if !tx_mode_matches && tx_tone_fresh {
+        log::warn!("[SatGuard #{}] TX {} 亚音模式被手动修改，重置 TX_TONE_MODE",
+            session_id, side_name(tx_is_left));
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.rigctld_tx_ctcss_dirty = true;
+        s.rigctld_tx_tone_mode_done = false;
+        s.rigctld_setup_attempts = 0;
+        return true;
+    }
+
+    false
+}
+
 fn sat_set_tx_ctcss_freq(state: &SharedState, tx_is_left: bool) -> bool {
     let tone = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1401,21 +1498,23 @@ fn sat_preflight_sql_close(state: &SharedState, is_left: bool) -> bool {
     wait_pending_clear(state, Duration::from_secs(2))
 }
 
-fn sat_open_rx_squelch(state: &SharedState, rx_is_left: bool) {
-    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-    let current = if rx_is_left { s.left.sql } else { s.right.sql };
-    if current == SAT_RX_SQL_OPEN_ADC {
-        log::info!("[SatSession #{}] RX {} SQL 已是 OPEN，跳过重复注入", s.rigctld_session_id, side_name(rx_is_left));
-        return;
+/// 只把 RX 侧 SQL 设为 OPEN（ADC=20）；TX 侧保留 PREFLIGHT 设的 60%（ADC=564）。
+/// 设计：RX 侧需要完整接收卫星信号（不能被静噪门限挡住），TX 侧静噪保持 60% 防 busy。
+/// 守护：SatGuard 检查 2 单独负责 RX 漂移监控 + TX busy 触发 60% 重注入。
+fn sat_open_rx_squelch(state: &SharedState, rx_is_left: bool) -> bool {
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let current = if rx_is_left { s.left.sql } else { s.right.sql };
+        if current != SAT_RX_SQL_OPEN_ADC {
+            queue_sql_inject(&mut s, rx_is_left, SAT_RX_SQL_OPEN_ADC);
+            if rx_is_left { s.left.sql = SAT_RX_SQL_OPEN_ADC; } else { s.right.sql = SAT_RX_SQL_OPEN_ADC; }
+            s.head_count = s.head_count.wrapping_add(1);
+            log::info!("[SatSession #{}] RX {} 静噪强制设为 OPEN (ADC={})", s.rigctld_session_id, side_name(rx_is_left), SAT_RX_SQL_OPEN_ADC);
+        } else {
+            log::info!("[SatSession #{}] RX {} SQL 已是 OPEN，跳过", s.rigctld_session_id, side_name(rx_is_left));
+        }
     }
-    queue_sql_inject(&mut s, rx_is_left, SAT_RX_SQL_OPEN_ADC);
-    if rx_is_left {
-        s.left.sql = SAT_RX_SQL_OPEN_ADC;
-    } else {
-        s.right.sql = SAT_RX_SQL_OPEN_ADC;
-    }
-    s.head_count = s.head_count.wrapping_add(1);
-    log::info!("[SatSession #{}] RX {} 静噪强制设为 OPEN (ADC={})", s.rigctld_session_id, side_name(rx_is_left), SAT_RX_SQL_OPEN_ADC);
+    wait_pending_clear(state, Duration::from_secs(2))
 }
 
 struct SatSideSetupResult {
@@ -1506,10 +1605,7 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
         "RX_TONE_CLEAR" => sat_clear_rx_tone_if_needed(state, is_left),
         "TX_CTCSS_FREQ" => sat_set_tx_ctcss_freq(state, is_left),
         "TX_TONE_MODE" => sat_set_tx_tone_mode(state, is_left),
-        "RX_SQL_OPEN" => {
-            sat_open_rx_squelch(state, is_left);
-            wait_pending_clear(state, Duration::from_secs(2))
-        }
+        "RX_SQL_OPEN" => sat_open_rx_squelch(state, is_left),
         _ => false,
     };
 
@@ -1786,10 +1882,8 @@ fn sat_initial_setup(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: bo
 
     let main_tx_ok = tx_ok && wait_main_side(state, tx_is_left, Duration::from_secs(1));
     if main_tx_ok && session_alive(state, session_id) {
-        sat_open_rx_squelch(state, rx_is_left);
-        let sql_flushed = wait_pending_clear(state, Duration::from_secs(2));
-        if !sql_flushed {
-            log::warn!("[SatSession #{}] RX {} SQL=0 注入等待超时", session_id, side_name(rx_is_left));
+        if !sat_open_rx_squelch(state, rx_is_left) {
+            log::warn!("[SatSession #{}] RX SQL=0 注入等待超时", session_id);
         }
     }
 
@@ -2622,6 +2716,20 @@ fn inject_tone_mode(state: &SharedState, target: ToneMode) -> bool {
         }
     };
     if !acquired { return false; }
+
+    // 入口守护：电台在 SET 菜单时按 P3 不会切亚音，先注入 SET 键退出。
+    // is_set 由 protocol.rs cmd=0x03 OFF 帧即时反映，800ms 等待充足。
+    // 3 次重试覆盖最深"值编辑层"（按 2 次 SET 退到频率页）。
+    for _ in 0u8..3 {
+        let in_set = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.left.is_set || s.right.is_set
+        };
+        if !in_set { break; }
+        log::info!("[MenuNav] inject_tone_mode 检测到 SET 菜单，注入 SET 键退出");
+        inject_key_wait(state, 0x20);
+        std::thread::sleep(Duration::from_millis(800));
+    }
 
     let start_us = unsafe { esp_timer_get_time() } as u64;
     for attempt in 0..5 {

@@ -168,9 +168,17 @@ impl DownParser {
         let band = if is_right { &mut rs.right } else { &mut rs.left };
 
         match cmd {
-            // SET 图标状态只作为显示来源，不用于判断手动菜单退出。
-            // 手动退出仍由 Len=09 频率帧的 menu_exit_count 判定；DTrac 自动宏在 rigctld.rs 内显式清理。
-            0x03 => {}
+            // SET 图标：电台进/退 SET 菜单时事件驱动发送，bit0=1=ON, bit0=0=OFF
+            // 退出时即时清菜单状态，不再依赖 frequency frame 累计（电台空闲不发频率帧时永远卡住）
+            0x03 => {
+                if !is_on {
+                    band.is_set = false;
+                    band.menu_text.clear();
+                    band.menu_in_value = false;
+                    band.menu_exit_count = 0;
+                    band.display_text.clear();
+                }
+            }
             // MAIN 标记（互斥：设置一侧为 MAIN 时清除另一侧）
             0x14 => {
                 band.is_main = is_on;
@@ -529,6 +537,17 @@ impl UpParser {
         if self.buf[6] == 0x00 {
             let key = self.buf[7];
             log::info!("[上行按键] key=0x{:02X}", key);
+            // 用户按 SET 键退菜单时即时清本地状态（双保险，配合 cmd=0x03 OFF 帧）
+            if key == 0x20 {
+                let band = if rs.right.is_main { &mut rs.right } else { &mut rs.left };
+                if band.is_set {
+                    band.is_set = false;
+                    band.menu_text.clear();
+                    band.menu_in_value = false;
+                    band.menu_exit_count = 0;
+                    band.display_text.clear();
+                }
+            }
         }
         // 注意：不在此处 log warn，SUM 信息已通过 log_diag 每 20 帧打印一次
         // 大量日志会阻塞 relay 线程导致 UART FIFO 溢出，电台卡死
