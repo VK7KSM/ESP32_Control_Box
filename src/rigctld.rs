@@ -535,14 +535,19 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
     // ESP-IDF lwip 不可靠支持 TcpStream::try_clone()。改用单一 stream + BufReader 包装，
     // 通过 BufReader::get_mut() 写回原 stream（buffered read + raw write 共用同一句柄）
     let mut reader = BufReader::new(stream);
+    let mut buf: Vec<u8> = Vec::new();
     let mut line = String::new();
     let mut last_line_us = unsafe { esp_timer_get_time() } as u64;
     let mut handler_session_id: Option<u32> = None;
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return handler_session_id,
+        buf.clear();
+        // 用 read_until 而非 read_line：避免单字节 TCP 噪音 (非 UTF-8) 杀掉整个连接
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => {
+                log::info!("[Rigctld] 对端 TCP 正常关闭 (Ok(0)/FIN)，handler_session={:?}", handler_session_id);
+                return handler_session_id;
+            }
             Ok(_) => {}
             Err(e) => match e.kind() {
                 ErrorKind::TimedOut | ErrorKind::WouldBlock => {
@@ -554,14 +559,20 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
                     }
                     let now_us = unsafe { esp_timer_get_time() } as u64;
                     if now_us.saturating_sub(last_line_us) >= 10_000_000 {
-                        log::info!("[Rigctld] 10s 无命令，关闭空闲 client");
+                        log::info!("[Rigctld] 10s 无命令，关闭空闲 client (read_timeout/无 DTrac F/I/S)，handler_session={:?}", handler_session_id);
                         return handler_session_id;
                     }
                     continue;
                 }
-                _ => return handler_session_id,
+                kind => {
+                    log::warn!("[Rigctld] 对端异常断开 kind={:?} err={} handler_session={:?}", kind, e, handler_session_id);
+                    return handler_session_id;
+                }
             },
         }
+        // 字节流容错解码：非法 UTF-8 字节替换为 U+FFFD，不再杀连接
+        line.clear();
+        line.push_str(&String::from_utf8_lossy(&buf));
         let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
         if trimmed.is_empty() { continue; }
         last_line_us = unsafe { esp_timer_get_time() } as u64;
