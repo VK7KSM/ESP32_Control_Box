@@ -1212,6 +1212,22 @@ fn set_side_tone_mode(state: &SharedState, is_left: bool, target: ToneMode, labe
     if initial.is_none() {
         log::warn!("[SatSession] {} {} 亚音状态未知，主动收敛到 {}", label, side_name(is_left), tone_mode_name(target));
     }
+
+    // 入口守护：电台在 SET 菜单时 MAIN DIAL 被菜单导航占用，ensure_main_side 必超时。
+    // 必须先注入 SET 键退出菜单，is_set 由 protocol.rs cmd=0x03 OFF 即时反映（800ms 内）。
+    // inject_key_wait 不持 macro_running 锁；maintenance 入口已确保 !macro_running，安全。
+    // 3 次重试覆盖最深"值编辑层"（按 2 次 SET 退到频率页）。
+    for retry in 0u8..3 {
+        let in_set = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.left.is_set || s.right.is_set
+        };
+        if !in_set { break; }
+        log::info!("[SatSession] {} {} 检测到 SET 菜单，注入 SET 键退出 (retry={})", label, side_name(is_left), retry);
+        inject_key_wait(state, 0x20);
+        std::thread::sleep(Duration::from_millis(800));
+    }
+
     if !ensure_main_side(state, is_left) {
         log::warn!("[SatSession] {} {} 亚音设置失败：无法切 MAIN", label, side_name(is_left));
         return false;
