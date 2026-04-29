@@ -1,0 +1,324 @@
+ELFRADIO Control Box Proprietary Commercial License (Source-Available)
+Version 1.0, effective 2026-04-30
+
+Copyright (c) 2026 VK7KSM. All Rights Reserved.
+
+================================================================================
+NOTICE: THIS IS NOT AN OPEN SOURCE LICENSE
+================================================================================
+
+The source code of this Software is publicly visible on GitHub for transparency
+and audit purposes only. Public visibility does NOT grant any right to use the
+Software. Any Use (as defined below) of this Software requires the prior
+purchase of a paid license under the terms set forth in this document.
+
+This License does not satisfy the Open Source Definition published by the Open
+Source Initiative. Do not redistribute this Software under any open source
+license.
+
+================================================================================
+1. Definitions
+================================================================================
+
+1.1 "Software" means all source code, compiled binaries, firmware images,
+    documentation, configuration files, schematics, design files, and any
+    accompanying materials in this repository (currently
+    https://github.com/VK7KSM/ESP32_Control_Box) and any subsequent updates,
+    patches, and successor versions made available by the Licensor.
+
+1.2 "Licensor" means VK7KSM, the copyright holder of the Software.
+
+1.3 "You" or "Your" means the natural person or legal entity reading or
+    interacting with the Software.
+
+1.4 "Licensee" means a You who has paid the applicable Fee in full and received
+    a written confirmation of license grant from the Licensor by email.
+
+1.5 "Use" means any of the following acts performed on the Software, in whole
+    or in part, in original or modified form: running, executing, deploying,
+    installing, flashing onto any device, compiling for production purposes,
+    integrating with other software or hardware in a non-evaluation context,
+    creating derivative works, distributing, sublicensing, sharing privately
+    with third parties, selling, leasing, lending, or providing the Software
+    as a service.
+
+1.6 "Personal Use" means Use by a single natural person, strictly for
+    non-commercial, non-profit, personal hobby purposes (e.g., private
+    amateur radio operation under that person's individual license), without
+    providing any service to third parties and without receiving any form of
+    consideration (money, goods, services, or barter) in connection with the
+    Use.
+
+1.7 "Commercial Use" means any Use that is not Personal Use, including but not
+    limited to: Use by any legal entity (corporation, partnership, LLC,
+    cooperative, government agency, military organization, foundation,
+    nonprofit, club, association); Use that generates revenue or commercial
+    advantage; Use to provide services to third parties; Use in research
+    funded by commercial contracts; Use in products offered for sale or
+    promotion; Use by a natural person while acting in the course of
+    employment or contracting work.
+
+1.8 "Fee" means the price specified in Section 3 corresponding to the
+    applicable license tier.
+
+================================================================================
+2. License Grant (Granted ONLY to a Licensee Who Has Paid the Fee)
+================================================================================
+
+2.1 Subject to full payment of the applicable Fee and subject to continuous
+    compliance with all terms of this License, the Licensor grants the
+    Licensee a non-exclusive, non-transferable, non-sublicensable, perpetual
+    (subject to Section 8 Termination), worldwide right to Use the Software
+    within the scope of the purchased license tier (Section 3).
+
+2.2 No license is granted by implication, estoppel, or otherwise. All rights
+    not expressly granted are reserved by the Licensor.
+
+2.3 No license is granted to any patent rights of the Licensor unless
+    expressly set forth in a separate written agreement.
+
+================================================================================
+3. License Tiers and Fees
+================================================================================
+
+3.1 Personal License - USD $5,000 (five thousand US dollars)
+    - One-time payment, lifetime grant
+    - Includes all future updates of the Software made available by the
+      Licensor on the master branch of the official repository
+    - Granted to one (1) named natural person; not transferable
+    - Limited strictly to Personal Use as defined in Section 1.6
+    - The Licensee may flash and operate the Software on any number of
+      personal devices owned by the Licensee, used solely for Personal Use
+
+3.2 Commercial License - USD $500,000 (five hundred thousand US dollars)
+    - One-time payment, lifetime grant
+    - Includes all future updates of the Software made available by the
+      Licensor on the master branch of the official repository
+    - Granted to one (1) named legal entity and its wholly-owned subsidiaries
+      (>= 50% ownership)
+    - Permits Commercial Use within the licensed entity, including internal
+      use, integration into commercial products, and provision of services
+      to third parties
+    - Does not include the right to sublicense, resell, or relicense the
+      Software as a standalone product
+
+3.3 All Fees are denominated in United States Dollars (USD), exclusive of any
+    applicable taxes, withholding, or transfer fees, which the Licensee
+    shall bear in addition to the Fee.
+
+3.4 Major version upgrades (e.g., from a 1.x release to a 2.0 release) may
+    be priced separately at the Licensor's sole discretion. Purchasing a
+    license under this Version 1.0 entitles the Licensee to all updates
+    within Version 1.x but does not automatically entitle the Licensee to
+    any future major version released under a new license version.
+
+================================================================================
+4. Restrictions (Applicable to Everyone, Including Non-Licensees)
+================================================================================
+
+4.1 Without a paid license, You shall NOT:
+
+    (a) Run, execute, deploy, flash, install, or otherwise put the Software
+        into operation on any device or environment;
+    (b) Modify, adapt, translate, port, or create derivative works based on
+        the Software;
+    (c) Distribute, redistribute, resell, lease, lend, sublicense, or
+        otherwise transfer the Software or any modified or derivative version
+        thereof to any third party;
+    (d) Use the Software for any Commercial Use, including private
+        Commercial Use that is not publicly disclosed;
+    (e) Remove, alter, or obscure any copyright notice, this LICENSE file,
+        or any other proprietary notice contained in the Software;
+    (f) File for or assert any patent claim that reads on the Software or
+        any feature, algorithm, or design implemented in the Software;
+    (g) Reverse engineer, decompile, or disassemble any compiled portion of
+        the Software for the purpose of circumventing any license enforcement
+        or copy protection mechanism (if any).
+
+4.2 The above restrictions apply regardless of whether the Use is private,
+    internal, or non-public.
+
+================================================================================
+5. Permitted Acts Without a Paid License
+================================================================================
+
+The following acts do NOT require a paid license and are expressly permitted:
+
+5.1 Viewing the source code on the GitHub web interface or via Git clone
+    operations, for the purposes of:
+    - Learning the algorithms, protocols, or design patterns
+    - Conducting independent security audits
+    - Verifying the absence of malicious code
+    - Academic study and citation in scholarly publications (with proper
+      attribution)
+
+5.2 Forking the repository on the GitHub platform, provided that:
+    - The fork is hosted on GitHub (or a comparable code hosting platform)
+    - The fork retains this LICENSE file unmodified
+    - No Use (as defined in Section 1.5) is performed based on the fork
+
+5.3 Submitting Issues, Pull Requests, or other contributions to the official
+    repository, subject to the contribution terms in Section 6.
+
+5.4 Citing or quoting brief excerpts of the source code in technical
+    publications, blog posts, conference presentations, or educational
+    materials, with proper attribution to the Licensor and a clear notice
+    that the Software is not free or open source.
+
+================================================================================
+6. Contributions
+================================================================================
+
+6.1 By submitting a Pull Request, patch, suggestion, or any other contribution
+    (collectively, "Contribution") to the official repository, You represent
+    and warrant that:
+
+    (a) You are the sole author of the Contribution, or You have the right to
+        license the Contribution under the terms of this Section;
+    (b) The Contribution does not infringe any third party's intellectual
+        property rights.
+
+6.2 You hereby grant to the Licensor a perpetual, worldwide, non-exclusive,
+    royalty-free, irrevocable, sublicensable, and transferable license to
+    reproduce, modify, prepare derivative works of, publicly display, publicly
+    perform, distribute, and otherwise exploit Your Contribution, in whole or
+    in part, under this License, any future version of this License, or any
+    other license terms the Licensor may adopt (including but not limited to
+    open source licenses or further commercial licenses).
+
+6.3 Submitting a Contribution does NOT grant the contributor any right to
+    Use the Software. Contributors who wish to Use the Software must purchase
+    a license under Section 3 like any other Licensee.
+
+================================================================================
+7. Updates and Maintenance
+================================================================================
+
+7.1 A Licensee is entitled to all updates of the Software made available by
+    the Licensor on the master branch of the official repository, from the
+    date of license purchase until the end of the Version 1.x lifecycle.
+
+7.2 The Licensor makes no commitment regarding the frequency, scope, content,
+    or timing of updates. The Licensor may discontinue updates at any time
+    without prior notice.
+
+7.3 The Licensor is under no obligation to provide technical support,
+    bug fixes, or compatibility maintenance unless a separate support
+    agreement is executed.
+
+================================================================================
+8. Termination
+================================================================================
+
+8.1 This License terminates immediately and automatically upon any breach of
+    Sections 4 (Restrictions) or 6 (Contributions Warranty) by You, without
+    further notice or action by the Licensor.
+
+8.2 Upon termination:
+    (a) The Licensee must immediately cease all Use of the Software;
+    (b) The Licensee must delete or destroy all copies of the Software in the
+        Licensee's possession or control within thirty (30) days;
+    (c) Any Fee paid is non-refundable.
+
+8.3 Sections 1 (Definitions), 4 (Restrictions), 6.2 (Contribution Grant),
+    9 (Warranty Disclaimer), 10 (Limitation of Liability), and 11 (Governing
+    Law) survive termination.
+
+================================================================================
+9. Warranty Disclaimer
+================================================================================
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, ACCURACY, RELIABILITY,
+OR FREEDOM FROM DEFECTS. THE ENTIRE RISK ARISING OUT OF THE USE OR
+PERFORMANCE OF THE SOFTWARE REMAINS WITH THE LICENSEE.
+
+THE LICENSOR MAKES NO WARRANTY THAT THE SOFTWARE WILL OPERATE WITHOUT
+INTERRUPTION OR BE FREE FROM ERRORS. THE LICENSOR DISCLAIMS ALL LIABILITY
+FOR ANY DAMAGE TO HARDWARE (INCLUDING ESP32 MODULES, AMATEUR RADIO
+TRANSCEIVERS, OR ANY CONNECTED EQUIPMENT) ARISING FROM USE OF THE SOFTWARE.
+
+================================================================================
+10. Limitation of Liability
+================================================================================
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL,
+EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR ANY LOSS OF PROFITS, REVENUE, DATA,
+GOODWILL, OR BUSINESS OPPORTUNITY, ARISING OUT OF OR IN CONNECTION WITH
+THIS LICENSE OR THE USE OF THE SOFTWARE, EVEN IF THE LICENSOR HAS BEEN
+ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+THE LICENSOR'S TOTAL CUMULATIVE LIABILITY UNDER THIS LICENSE SHALL NOT
+EXCEED THE FEE ACTUALLY PAID BY THE LICENSEE.
+
+================================================================================
+11. Governing Law and Dispute Resolution
+================================================================================
+
+11.1 This License is governed by and construed in accordance with the laws
+     of the State of Tasmania, Australia, without regard to conflict of law
+     principles.
+
+11.2 Any dispute arising out of or in connection with this License shall be
+     submitted to the exclusive jurisdiction of the courts located in
+     Hobart, Tasmania, Australia.
+
+11.3 For disputes involving an amount less than USD $10,000, the parties
+     agree to first attempt resolution through good-faith email negotiation
+     for at least thirty (30) days before initiating any court proceeding.
+
+11.4 The United Nations Convention on Contracts for the International Sale
+     of Goods does not apply to this License.
+
+================================================================================
+12. Contact and Purchase
+================================================================================
+
+To purchase a Personal or Commercial License, or to inquire about licensing
+terms, special arrangements, educational use, non-profit use, or any
+ambiguous use case (e.g., amateur radio clubs, research institutions,
+government agencies):
+
+    Email:   hello@elfradio.com
+    GitHub:  https://github.com/VK7KSM/ESP32_Control_Box
+
+When contacting the Licensor for a license purchase, please provide:
+
+    1. License tier (Personal or Commercial)
+    2. For Personal: full legal name and country of residence
+    3. For Commercial: legal entity name, country of incorporation, and
+       intended use description
+    4. Preferred payment method for negotiation
+    5. Any questions about the License terms
+
+The Licensor will respond with payment instructions, an invoice, and a
+written confirmation of license grant upon receipt of the Fee.
+
+The Licensor reserves the right to decline any license request at the
+Licensor's sole discretion, including but not limited to requests from
+sanctioned jurisdictions or entities, requests that conflict with the
+Licensor's amateur radio licensing obligations, or requests for use cases
+that the Licensor deems incompatible with the spirit of the project.
+
+================================================================================
+13. Entire Agreement; Severability; Amendments
+================================================================================
+
+13.1 This License constitutes the entire agreement between the parties
+     regarding the Software and supersedes all prior or contemporaneous
+     understandings, whether oral or written.
+
+13.2 If any provision of this License is held to be unenforceable, the
+     remaining provisions shall remain in full force and effect.
+
+13.3 The Licensor may publish revised versions of this License with a new
+     version number and effective date. Existing Licensees retain their
+     rights under the version of the License under which they purchased.
+     Future Use beyond the Version 1.x lifecycle may require acceptance of
+     a new License version.
+
+================================================================================
+END OF LICENSE
+================================================================================
