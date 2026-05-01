@@ -33,21 +33,99 @@ use esp_idf_svc::sys::*;
 // ===== ESP-IDF LCD DMA 面板句柄（全局，供 flush 使用）=====
 static mut LCD_PANEL: esp_lcd_panel_handle_t = std::ptr::null_mut();
 
-/// 将帧缓冲通过 DMA 异步刷到屏幕
-/// swap_bytes 修正 RGB565 字节序（小端→大端），然后提交 DMA
-/// queue_depth=2 + 双缓冲：draw_bitmap 立即返回，CPU 不阻塞
-/// 注意：提交后不恢复字节序——双缓冲下此 buffer 在 DMA 完成前不会被 CPU 写入
-fn flush_fb_dma(fb: &mut framebuf::FrameBuf) {
-    fb.swap_bytes();  // 小端序 → ST7789 大端序（0.3ms）
-    unsafe {
-        esp_lcd_panel_draw_bitmap(
-            LCD_PANEL,
-            0, 0, 240, 320,
-            fb.pixels().as_ptr() as *const std::ffi::c_void,
-        );
+// ===== LCD DMA 完成同步信号量 =====
+// 2-tile framebuf 共用同一个 75KB buffer，必须等上一帧 DMA 读完才能改写下一帧。
+// ISR 回调（on_color_trans_done）在 DMA 完成时 give，render_tiled 在 begin_tile
+// 之前 take（首次由 init 后的预 give 通过）。这样 CPU 画下一 tile 与 DMA 传上一 tile
+// 并行，但 buffer 不会被同时读写——避免之前"tile 0 中下部内容缺失"的 bug。
+// dirty=false 跳过 DMA 时由 render_tiled 手动 give 维持信号量平衡。
+static mut LCD_DONE_SEM: QueueHandle_t = std::ptr::null_mut();
+
+/// LCD DMA 完成 ISR 回调（运行在 ISR 上下文，禁止阻塞）
+unsafe extern "C" fn on_lcd_color_trans_done(
+    _panel_io: esp_lcd_panel_io_handle_t,
+    _edata: *mut esp_lcd_panel_io_event_data_t,
+    _user_ctx: *mut std::ffi::c_void,
+) -> bool {
+    let mut high_task_woken: BaseType_t = 0;
+    // queueQUEUE_TYPE_BINARY_SEMAPHORE 的 give = xQueueGiveFromISR
+    xQueueGiveFromISR(LCD_DONE_SEM, &mut high_task_woken);
+    // 返回 true → ESP-LCD 内部会调 portYIELD_FROM_ISR 让出 CPU 给被唤醒的高优先级任务
+    high_task_woken != 0
+}
+
+/// 双 tile 循环 + dirty 跟踪 + DMA 同步的 helper
+///
+/// 信号量语义 = "buffer 当前空闲（可修改）"：
+///   - init 后预 give 1 次 → 空闲
+///   - 循环顶部 take → 占用
+///   - 提交 DMA 后 → ISR 在 DMA 完成时 give → 空闲
+///   - dirty=false 跳过 DMA → 立即手动 give 维持平衡 → 空闲
+///
+/// 关键：xQueueSemaphoreTake 在 begin_tile 之前——保证 buffer 不再被 DMA 读取再 memset
+/// 这样 CPU 画下一 tile 与 DMA 传当前 tile 并行（max(5ms CPU, 15ms DMA) per tile）
+/// 但 buffer 不会被同时读写，避免之前 tile 0 内容缺失的 bug
+///
+/// tile=0：刷新 (0, 0) - (240, 160) 上半屏
+/// tile=1：刷新 (0, 160) - (240, 320) 下半屏
+fn render_tiled<F: FnMut(&mut framebuf::FrameBuf)>(fb: &mut framebuf::FrameBuf, mut draw: F) {
+    for tile in 0..framebuf::NUM_TILES {
+        unsafe {
+            // 等上一次 DMA 完成（首次由 init 后的预 give 立即通过）
+            // 此处 take 之后 buffer 必空闲（DMA 不再读取）
+            // portMAX_DELAY = TickType_t(u32) 的最大值 = 0xFFFFFFFF（无超时阻塞等待）
+            xQueueSemaphoreTake(LCD_DONE_SEM, u32::MAX);
+        }
+        fb.begin_tile(tile);
+        draw(fb);
+        if fb.is_dirty(tile) {
+            // 提交 DMA：swap + draw_bitmap 立即返回
+            // ISR 在 DMA 完成时自动 give，下次循环 take 阻塞等待
+            fb.swap_bytes();  // 小端序 → ST7789 大端序（~0.15ms / 75KB）
+            let y0 = (tile * framebuf::TILE_H) as i32;
+            let y1 = y0 + framebuf::TILE_H as i32;
+            unsafe {
+                esp_lcd_panel_draw_bitmap(
+                    LCD_PANEL,
+                    0, y0, 240, y1,
+                    fb.pixels().as_ptr() as *const std::ffi::c_void,
+                );
+            }
+        } else {
+            // dirty=false 跳过 DMA → 没有 ISR give → 必须手动 give 维护信号量平衡
+            // 否则下次循环 take 会永久阻塞（无人 give）
+            unsafe {
+                xQueueGenericSend(LCD_DONE_SEM, std::ptr::null::<std::ffi::c_void>(), 0, 0);
+            }
+        }
     }
-    // 不恢复字节序！此 buffer 交给 DMA，下次循环画到另一个 buffer
-    // 当此 buffer 再次轮到绘制时，draw_ui 会先 clear 再重绘，覆盖所有像素
+}
+
+/// 完整主 UI 渲染（双 tile 循环 + dirty 跟踪）
+/// 单字段变化（如 DTrac 频率追踪）通常只动一个 tile，撕裂感几乎不可见
+///
+/// 注意：`wifi_tcp_clients` 参数语义为"仅 WiFi/TCP rigctld 客户端数量"（不含 BLE）。
+/// 调用方必须传 `s.rigctld_clients.saturating_sub(s.ble_clients)`，否则 BLE 连接时
+/// IP 地址也会被 ui.rs 误染橙色。
+fn render_main_ui_tiled(
+    fb: &mut framebuf::FrameBuf,
+    left: &state::BandState,
+    right: &state::BandState,
+    radio_alive: bool,
+    pc_alive: bool,
+    wifi_state: &state::WifiState,
+    wifi_ip: &str,
+    wifi_tcp_clients: u32,
+) {
+    render_tiled(fb, |fb| {
+        ui::draw_main_ui(fb, left, right, radio_alive, pc_alive, wifi_state, wifi_ip, wifi_tcp_clients);
+    });
+}
+
+/// 开机画面（双 tile 循环，强制全部 dirty 确保完整刷新）
+fn render_splash_tiled(fb: &mut framebuf::FrameBuf) {
+    fb.invalidate_all();  // 开机首帧：所有 tile 都视为脏
+    render_tiled(fb, |fb| ui::draw_splash(fb));
 }
 
 fn main() {
@@ -127,6 +205,21 @@ fn main() {
         assert!(ret == ESP_OK, "LCD IO SPI 初始化失败: {}", ret);
         ::log::info!("LCD IO SPI 初始化完成 (40MHz, DMA queue=2)");
 
+        // ===== 创建 LCD DMA 完成信号量 + 注册 on_color_trans_done ISR 回调 =====
+        // 二值信号量：xQueueGenericCreate(length=1, item_size=0, type=3=BINARY_SEMAPHORE)
+        LCD_DONE_SEM = xQueueGenericCreate(1, 0, 3);
+        assert!(!LCD_DONE_SEM.is_null(), "LCD DMA 信号量创建失败");
+        // 预 give 一次：让首次 render_tiled 循环顶部的 take 立即通过（buffer 此时空闲）
+        // xQueueGenericSend(queue, item, ticks, pos): pos=0=queueSEND_TO_BACK
+        // 二值信号量 item_size=0，pvItemToQueue 可为 null（FreeRTOS 实现忽略）
+        xQueueGenericSend(LCD_DONE_SEM, std::ptr::null::<std::ffi::c_void>(), 0, 0);
+        let cbs = esp_lcd_panel_io_callbacks_t {
+            on_color_trans_done: Some(on_lcd_color_trans_done),
+        };
+        let ret = esp_lcd_panel_io_register_event_callbacks(io_handle, &cbs, std::ptr::null_mut());
+        assert!(ret == ESP_OK, "LCD on_color_trans_done 回调注册失败: {}", ret);
+        ::log::info!("LCD DMA 完成信号量 + ISR 回调已注册");
+
         // Step 3: ST7789 面板
         let mut panel_cfg: esp_lcd_panel_dev_config_t = std::mem::zeroed();
         panel_cfg.reset_gpio_num = 10;
@@ -157,11 +250,12 @@ fn main() {
     // ===== 单帧缓冲（内部 SRAM，DMA-capable）=====
     // PSRAM 与 WiFi 共享 GDMA 通道导致 LCD DMA 严重抖动；改用内部 SRAM
     let mut fb = framebuf::FrameBuf::new();
-    ::log::info!("单帧缓冲已分配 ({}KB 内部 SRAM)", 240 * 320 * 2 / 1024);
+    ::log::info!("帧缓冲已分配（2-tile 模式，{}KB × {} = {}KB 内部 SRAM）",
+        240 * framebuf::TILE_H * 2 / 1024, framebuf::NUM_TILES,
+        240 * framebuf::TILE_H * 2 * framebuf::NUM_TILES / 1024);
 
-    // ===== 开机画面 =====
-    ui::draw_splash(&mut fb);
-    flush_fb_dma(&mut fb);
+    // ===== 开机画面（2 tile 循环刷新）=====
+    render_splash_tiled(&mut fb);
     // 点亮背光（60% 亮度）
     let max_duty = backlight.get_max_duty();
     backlight.set_duty(max_duty * 60 / 100).unwrap();
@@ -266,13 +360,21 @@ fn main() {
     // ===== BLE 广播（手机 DTrac 直连用）— 阶段 2: GATT + rigctld 透传 =====
     ble::start_ble_thread(shared.clone());
 
-    // ===== 初始绘制 =====
+    // ===== 初始绘制（2 tile 循环刷新，强制全部 dirty 确保完整画面）=====
+    fb.invalidate_all();
     {
         let s = shared.lock().unwrap();
-        ui::draw_main_ui(&mut fb, &s.left, &s.right, s.radio_alive, s.pc_alive,
-            &s.wifi_state, s.wifi_ip.as_str(), s.rigctld_clients);
+        // tcp_only：仅 WiFi/TCP rigctld 客户端数（排除 BLE）。BLE 客户端虽计入
+        // rigctld_clients 用于触发 freq_stepper setup，但 IP 颜色应仅反映 LAN 活动
+        let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
+        let (left, right, alive, pc, ws, ip) = (
+            s.left.clone(), s.right.clone(),
+            s.radio_alive, s.pc_alive,
+            s.wifi_state.clone(), s.wifi_ip.clone(),
+        );
+        drop(s);
+        render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only);
     }
-    flush_fb_dma(&mut fb);
 
     // ===== 主循环: 双缓冲 + DMA 异步 =====
     // - sleep 20ms（100Hz tick 下 = 2 tick 真实让出，IDLE0 不饿 → 无 watchdog）
@@ -307,26 +409,34 @@ fn main() {
                 let _ = last_wifi_ip.push_str(s.wifi_ip.as_str());
                 last_rigctld_clients = s.rigctld_clients;
                 no_data_ticks = 0;
-                let (left, right, alive, pc, ws, ip, rc) = (
+                // tcp_only：仅 WiFi/TCP 客户端，排除 BLE（BLE 用 GATT 不用 IP）
+                let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
+                let (left, right, alive, pc, ws, ip) = (
                     s.left.clone(), s.right.clone(),
                     s.radio_alive, s.pc_alive,
-                    s.wifi_state.clone(), s.wifi_ip.clone(), s.rigctld_clients
+                    s.wifi_state.clone(), s.wifi_ip.clone(),
                 );
                 drop(s);
-                ui::draw_main_ui(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), rc);
-                flush_fb_dma(&mut fb);
+                render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only);
                 last_redraw_us = now_us;
             } else if !radio_changed && !pc_changed && !wifi_changed && !rc_changed {
                 no_data_ticks += 1;
-                if no_data_ticks == 300 {  // 300 × 50ms = 15s
+                // 仅在没有 rigctld 客户端时才超时置 alive=false
+                // rigctld 客户端（含 BLE）连接时认为电台一直 alive：
+                //   - DTrac 多阶段 setup 期间存在 10-30s 静默窗口（阶段间重试节流），
+                //     若此时 alive=false 会导致 inject_menu_set 的 Guard2 拒绝执行，
+                //     表现为"BLE 初始化卡死，需按机头键解除"
+                //   - 真正下行响应到达时 protocol::apply_to_state 会自动重置 alive=true
+                //   - 真正掉线场景：DTrac 自己会 timeout 报错，无需 ESP32 端探测
+                if no_data_ticks == 300 && s.rigctld_clients == 0 {  // 300 × 50ms = 15s
                     s.radio_alive = false;
-                    let (left, right, pc, ws, ip, rc) = (
+                    let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
+                    let (left, right, pc, ws, ip) = (
                         s.left.clone(), s.right.clone(), s.pc_alive,
-                        s.wifi_state.clone(), s.wifi_ip.clone(), s.rigctld_clients
+                        s.wifi_state.clone(), s.wifi_ip.clone(),
                     );
                     drop(s);
-                    ui::draw_main_ui(&mut fb, &left, &right, false, pc, &ws, ip.as_str(), rc);
-                    flush_fb_dma(&mut fb);
+                    render_main_ui_tiled(&mut fb, &left, &right, false, pc, &ws, ip.as_str(), tcp_only);
                 }
             }
         }
