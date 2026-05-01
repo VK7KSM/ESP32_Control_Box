@@ -18,6 +18,7 @@ mod discovery;
 mod pc_tcp;
 mod rigctld;
 mod ble;
+mod button;
 
 // 必须显式 extern：esp_idf_svc::sys 通过 wildcard 引入了一个叫 `log` 的 struct，
 // 与 `log` crate 冲突。extern crate log 把 log crate 强制放到 root namespace，
@@ -330,6 +331,10 @@ fn main() {
     }
     ::log::info!("GPIO 8 (开关机光耦) 初始化完成");
 
+    // ===== GPIO 2 物理按钮（长按 3 秒触发电台开关机）=====
+    button::start_button_thread(shared.clone());
+    ::log::info!("[Button] 按钮线程已启动 (CPU 0)");
+
     // ===== PC 通信线程（共口二进制协议，绑 CPU 0：UART 实时通信，与 main loop 同核）=====
     pc_comm::init_pc_comm();
     let state_c = shared.clone();
@@ -442,8 +447,22 @@ fn main() {
             let user_activity = head_changed || pc_changed || wifi_changed || rc_changed
                 || main_freq_changed || signal_arrived || busy_arrived;
 
+            // 电台开关机进行中标志（button.rs 长按触发后置 true，worker 完成后 release）
+            // 用作 wake 例外：长按时屏幕亮起反馈（即使电台还没启动）
+            let power_toggling = button::POWER_TOGGLE_IN_PROGRESS
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+            // 电台离线 → 强制关背光（覆盖 user_activity 唤醒）
+            // 例外：power_toggling=true 时允许唤醒（让用户长按时屏幕亮起反馈）
+            if !s.radio_alive && !backlight_dimmed && !power_toggling {
+                let _ = backlight.set_duty(bl_dim);
+                backlight_dimmed = true;
+                ::log::info!("[屏幕] 电台离线，关闭背光");
+            }
+
             // 用户活动 → 立即恢复背光（独立于 can_redraw 节流）
-            if user_activity && backlight_dimmed {
+            // 仅在电台 alive 或 power_toggling 时唤醒；否则即使有活动也保持关屏
+            if user_activity && backlight_dimmed && (s.radio_alive || power_toggling) {
                 let _ = backlight.set_duty(bl_normal);
                 backlight_dimmed = false;
                 ::log::info!("[屏幕] 检测到活动，背光恢复 60%");

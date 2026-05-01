@@ -31,6 +31,12 @@ use esp32_nimble::{
 /// 避免在 NimBLE host task callback 内 sleep+start 阻塞协议栈
 static SHOULD_RESTART_ADV: AtomicBool = AtomicBool::new(false);
 
+/// 外部模块（如 button.rs 短按）请求重启 BLE 广播
+/// 主循环每 500ms 检查 SHOULD_RESTART_ADV，等 100ms 后调 advertising.start()
+pub fn request_advertising_restart() {
+    SHOULD_RESTART_ADV.store(true, Ordering::Relaxed);
+}
+
 /// BLE 设备名（用户在 SoftAP 网页可改，当前固定为 elfRadio）
 const BLE_DEVICE_NAME: &str = "elfRadio";
 
