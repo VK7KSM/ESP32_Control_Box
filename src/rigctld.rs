@@ -127,6 +127,11 @@ const STEP_STRS: [&str; 12] = [
 ];
 
 pub fn start_rigctld_thread(state: SharedState) {
+    // 绑到 CPU 1，与其他网络线程同核；释放 CPU 0 给 UART/LCD/IDLE0
+    let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+        pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
+        ..Default::default()
+    }.set();
     std::thread::Builder::new()
         .name("rigctld".into())
         .stack_size(4096)
@@ -137,6 +142,11 @@ pub fn start_rigctld_thread(state: SharedState) {
 /// 后台频率步进线程：将 state.rigctld_target_hz 与 MAIN 侧实际频率逐步逼近
 /// 每次循环注入一帧旋钮 CW/CCW，每帧间隔 200ms（让 relay_up_thread 有时间消费 + 电台响应）
 pub fn start_freq_stepper_thread(state: SharedState) {
+    // 绑到 CPU 1，与其他控制状态机同核
+    let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+        pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
+        ..Default::default()
+    }.set();
     std::thread::Builder::new()
         .name("freq_stepper".into())
         .stack_size(4096)
@@ -498,6 +508,11 @@ fn rigctld_main(state: SharedState) {
                     let st = state.clone();
                     let act = active.clone();
                     log::info!("[Rigctld] 接受连接：{} clients_before={} session_before={} RX采样={}", peer, clients_before, session_before, side_name(rx_is_left_at_accept));
+                    // per-client handler 也绑 CPU 1（与 acceptor 同核）
+                    let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+                        pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
+                        ..Default::default()
+                    }.set();
                     let spawn_result = std::thread::Builder::new()
                         .name(format!("rigctld_{}", peer.port()))
                         .stack_size(4096)
@@ -623,12 +638,12 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
     }
 }
 
-fn handler_session_is_current(state: &SharedState, session_id: u32) -> bool {
+pub fn handler_session_is_current(state: &SharedState, session_id: u32) -> bool {
     let s = state.lock().unwrap_or_else(|e| e.into_inner());
     s.rigctld_sat_active && s.rigctld_session_id == session_id
 }
 
-fn command_name(line: &str) -> &str {
+pub fn command_name(line: &str) -> &str {
     let trimmed = line.trim();
     let body = trimmed.strip_prefix('+').unwrap_or(trimmed).trim_start();
     if let Some(rest) = body.strip_prefix("\\") {
@@ -638,14 +653,14 @@ fn command_name(line: &str) -> &str {
     }
 }
 
-fn is_stateful_dtrac_command(line: &str) -> bool {
+pub fn is_stateful_dtrac_command(line: &str) -> bool {
     matches!(command_name(line),
         "F" | "I" | "S" | "V" | "C" | "E" | "T" |
         "set_freq" | "set_split_freq" | "set_split_vfo" | "set_vfo" |
         "set_ctcss_tone" | "set_ctcss_sql" | "set_tone" | "set_ptt")
 }
 
-enum DispatchOut {
+pub enum DispatchOut {
     Reply(String),
     Quit,
 }
@@ -694,7 +709,7 @@ fn log_dtrac_command(line: &str, state: &SharedState) {
     }
 }
 
-fn dispatch(line: &str, state: &SharedState) -> DispatchOut {
+pub fn dispatch(line: &str, state: &SharedState) -> DispatchOut {
     log_dtrac_command(line, state);
 
     // 检测扩展响应前缀: '+' 或反斜杠长名
@@ -884,7 +899,7 @@ fn reset_sat_setup_state(s: &mut RadioState) {
     s.rigctld_rx_input_recovered = false;
 }
 
-fn capture_rx_side(s: &RadioState, session_id: u32) -> bool {
+pub fn capture_rx_side(s: &RadioState, session_id: u32) -> bool {
     if s.left.is_main {
         true
     } else if s.right.is_main {
@@ -895,7 +910,7 @@ fn capture_rx_side(s: &RadioState, session_id: u32) -> bool {
     }
 }
 
-fn begin_sat_session(state: &SharedState, rx_is_left_at_accept: bool) -> u32 {
+pub fn begin_sat_session(state: &SharedState, rx_is_left_at_accept: bool) -> u32 {
     let session_id = {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.rigctld_session_id = s.rigctld_session_id.wrapping_add(1);

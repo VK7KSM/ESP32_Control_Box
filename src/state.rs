@@ -238,6 +238,9 @@ pub struct RadioState {
     pub rigctld_session_id: u32,
     pub rigctld_sql_close_left_pending: bool,
     pub rigctld_sql_close_right_pending: bool,
+    // ===== BLE 连接状态（手机 DTrac 直连用）=====
+    pub ble_advertising: bool,      // 当前是否在 BLE 广播
+    pub ble_clients: u32,           // 当前 BLE 客户端连接数（GATT 已连接）
     // ===== rigctld 连接状态 =====
     pub rigctld_clients: u32,       // 当前活跃 rigctld 客户端数（>0 → IP 显示橙色）
     pub rigctld_ctcss_tone: u32,    // 最后设置的 CTCSS 频率（0.1 Hz 单位，0=OFF）
@@ -324,6 +327,8 @@ impl RadioState {
             rigctld_session_id: 0,
             rigctld_sql_close_left_pending: false,
             rigctld_sql_close_right_pending: false,
+            ble_advertising: false,
+            ble_clients: 0,
             rigctld_clients: 0,
             rigctld_ctcss_tone: 0,
             rigctld_initial_freq_done: false,

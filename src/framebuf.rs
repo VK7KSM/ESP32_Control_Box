@@ -3,10 +3,12 @@
 // 240×320×2 = 150KB
 //
 // 强制分配到内部 SRAM（MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA）：
-//   - PSRAM 与 WiFi DMA 争用会让 LCD DMA 耗时 300-600ms（理论 30ms），
-//     SPI queue 频繁饱和，屏幕大面积区域无法刷新。
+//   - PSRAM 与 WiFi DMA 争用会让 LCD DMA 严重失效——实测出现"只刷顶部 1/6 屏"
+//     的现象，比抖动更糟；CLAUDE.md 历史教训得到再次验证。
 //   - 内部 SRAM DMA 直通无争用，30ms 稳定完成。
 //   - 单帧缓冲即可（5fps 的状态显示无需双缓冲）。
+//   - WiFi 内存压力依靠 sdkconfig CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
+//     保留 DMA-only 池 + ESP_WIFI_IRAM_OPT=n 释放 IRAM 缓解，不再动 framebuf。
 // ===================================================================
 
 use embedded_graphics::pixelcolor::Rgb565;
@@ -38,7 +40,7 @@ impl FrameBuf {
                 *raw.add(i) = Rgb565::BLACK;
             }
         }
-        log::info!("[FrameBuf] 已在内部 SRAM 分配 {} 字节", BYTES);
+        ::log::info!("[FrameBuf] 已在内部 SRAM 分配 {} 字节", BYTES);
         Self { ptr: raw, len: PIXELS }
     }
 

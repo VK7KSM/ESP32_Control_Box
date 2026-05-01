@@ -21,7 +21,7 @@ fn read_creds(nvs_part: EspDefaultNvsPartition) -> Option<(heapless::String<32>,
     let nvs: EspNvs<NvsDefault> = match EspNvs::new(nvs_part, NVS_NS, true) {
         Ok(n) => n,
         Err(e) => {
-            log::warn!("[WiFi] 打开 NVS namespace 失败: {:?}", e);
+            ::log::warn!("[WiFi] 打开 NVS namespace 失败: {:?}", e);
             return None;
         }
     };
@@ -38,6 +38,11 @@ fn read_creds(nvs_part: EspDefaultNvsPartition) -> Option<(heapless::String<32>,
 }
 
 pub fn start_wifi_thread(modem: Modem, state: SharedState) {
+    // 绑到 CPU 1，与 ESP-IDF wifi task 同核；释放 CPU 0 给 UART/LCD/IDLE0
+    let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+        pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
+        ..Default::default()
+    }.set();
     std::thread::Builder::new()
         .name("wifi".into())
         .stack_size(8192)
@@ -60,7 +65,7 @@ fn auth_to_u8(am: AuthMethod) -> u8 {
 }
 
 fn do_scan(wifi: &mut BlockingWifi<EspWifi<'static>>, state: &SharedState) {
-    log::info!("[WiFi] 开始扫描...");
+    ::log::info!("[WiFi] 开始扫描...");
     { let mut s = state.lock().unwrap(); s.scanning = true; }
     match wifi.scan() {
         Ok(aps) => {
@@ -79,10 +84,10 @@ fn do_scan(wifi: &mut BlockingWifi<EspWifi<'static>>, state: &SharedState) {
             s.scan_seq = s.scan_seq.wrapping_add(1);
             s.scanning = false;
             s.scan_request = false;
-            log::info!("[WiFi] 扫描完成，找到 {} 个 AP", s.scan_results.len());
+            ::log::info!("[WiFi] 扫描完成，找到 {} 个 AP", s.scan_results.len());
         }
         Err(e) => {
-            log::warn!("[WiFi] 扫描失败: {:?}", e);
+            ::log::warn!("[WiFi] 扫描失败: {:?}", e);
             let mut s = state.lock().unwrap();
             s.scanning = false;
             s.scan_request = false;
@@ -99,32 +104,37 @@ fn mark(state: &SharedState, ws: WifiState, ip: &str) {
 }
 
 fn wifi_main(modem: Modem, state: SharedState) {
+    // 延迟 3 秒让 BLE controller 先 init 抢内部 SRAM（~30KB）。WiFi init 也吃约 16KB
+    // RESERVE_INTERNAL 内存，必须 BLE 在前 WiFi 在后；之前是反过来导致 BLE_INIT: Malloc failed
+    ::log::info!("[WiFi] 等待 3 秒让 BLE controller 先初始化完成...");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
     let sysloop = match EspSystemEventLoop::take() {
         Ok(s) => s,
-        Err(e) => { log::error!("[WiFi] sysloop 失败: {:?}", e); mark(&state, WifiState::Failed, ""); return; }
+        Err(e) => { ::log::error!("[WiFi] sysloop 失败: {:?}", e); mark(&state, WifiState::Failed, ""); return; }
     };
     let nvs_part = match EspDefaultNvsPartition::take() {
         Ok(n) => n,
-        Err(e) => { log::error!("[WiFi] NVS 失败: {:?}", e); mark(&state, WifiState::Failed, ""); return; }
+        Err(e) => { ::log::error!("[WiFi] NVS 失败: {:?}", e); mark(&state, WifiState::Failed, ""); return; }
     };
 
     let esp_wifi = match EspWifi::new(modem, sysloop.clone(), Some(nvs_part.clone())) {
         Ok(w) => w,
-        Err(e) => { log::error!("[WiFi] EspWifi::new 失败: {:?}", e); mark(&state, WifiState::Failed, ""); return; }
+        Err(e) => { ::log::error!("[WiFi] EspWifi::new 失败: {:?}", e); mark(&state, WifiState::Failed, ""); return; }
     };
     let mut wifi = match BlockingWifi::wrap(esp_wifi, sysloop) {
         Ok(w) => w,
-        Err(e) => { log::error!("[WiFi] BlockingWifi::wrap 失败: {:?}", e); mark(&state, WifiState::Failed, ""); return; }
+        Err(e) => { ::log::error!("[WiFi] BlockingWifi::wrap 失败: {:?}", e); mark(&state, WifiState::Failed, ""); return; }
     };
 
     // 必须先 set_configuration 一个空 STA 配置，否则 start() 后 scan 会失败
     if let Err(e) = wifi.set_configuration(&Configuration::Client(ClientConfiguration::default())) {
-        log::error!("[WiFi] 初始 set_configuration 失败: {:?}", e);
+        ::log::error!("[WiFi] 初始 set_configuration 失败: {:?}", e);
         mark(&state, WifiState::Failed, "");
         return;
     }
     if let Err(e) = wifi.start() {
-        log::error!("[WiFi] start 失败: {:?}", e);
+        ::log::error!("[WiFi] start 失败: {:?}", e);
         mark(&state, WifiState::Failed, "");
         return;
     }
@@ -133,13 +143,13 @@ fn wifi_main(modem: Modem, state: SharedState) {
     unsafe {
         let r = esp_wifi_set_ps(wifi_ps_type_t_WIFI_PS_NONE);
         if r == ESP_OK {
-            log::info!("[WiFi] 已关闭省电模式 (WIFI_PS_NONE)");
+            ::log::info!("[WiFi] 已关闭省电模式 (WIFI_PS_NONE)");
         } else {
-            log::warn!("[WiFi] esp_wifi_set_ps 返回 {}", r);
+            ::log::warn!("[WiFi] esp_wifi_set_ps 返回 {}", r);
         }
     }
 
-    log::info!("[WiFi] 已启动 STA 模式");
+    ::log::info!("[WiFi] 已启动 STA 模式");
 
     // 启动后不主动扫描，避免无上位机时 WiFi scan 抢占 UART 中继；等待 PC 显式请求
 
@@ -174,7 +184,7 @@ fn connect_loop(
         ..Default::default()
     });
     if let Err(e) = wifi.set_configuration(&cfg) {
-        log::error!("[WiFi] set_configuration 失败: {:?}", e);
+        ::log::error!("[WiFi] set_configuration 失败: {:?}", e);
         mark(state, WifiState::Failed, "");
         std::thread::sleep(std::time::Duration::from_secs(10));
         return;
@@ -190,19 +200,19 @@ fn connect_loop(
         }
 
         mark(state, WifiState::Connecting, "");
-        log::info!("[WiFi] 连接 SSID=\"{}\" auth={:?}", ssid, auth);
+        ::log::info!("[WiFi] 连接 SSID=\"{}\" auth={:?}", ssid, auth);
         match wifi.connect() {
             Ok(_) => {}
             Err(e) => {
                 fail_count += 1;
-                log::warn!("[WiFi] connect 失败({}): {:?}，10s 后重试", fail_count, e);
+                ::log::warn!("[WiFi] connect 失败({}): {:?}，10s 后重试", fail_count, e);
                 if fail_count >= 6 { mark(state, WifiState::Failed, ""); }
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 continue;
             }
         }
         if let Err(e) = wifi.wait_netif_up() {
-            log::warn!("[WiFi] wait_netif_up 失败: {:?}", e);
+            ::log::warn!("[WiFi] wait_netif_up 失败: {:?}", e);
             let _ = wifi.disconnect();
             std::thread::sleep(std::time::Duration::from_secs(10));
             continue;
@@ -210,7 +220,7 @@ fn connect_loop(
         let ip_info = match wifi.wifi().sta_netif().get_ip_info() {
             Ok(i) => i,
             Err(e) => {
-                log::warn!("[WiFi] get_ip_info 失败: {:?}", e);
+                ::log::warn!("[WiFi] get_ip_info 失败: {:?}", e);
                 let _ = wifi.disconnect();
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 continue;
@@ -218,7 +228,7 @@ fn connect_loop(
         };
         let mut ip_str: heapless::String<16> = heapless::String::new();
         let _ = write!(ip_str, "{}", ip_info.ip);
-        log::info!("[WiFi] ★ 已连接，IP = {}", ip_str.as_str());
+        ::log::info!("[WiFi] ★ 已连接，IP = {}", ip_str.as_str());
         fail_count = 0;
         mark(state, WifiState::Connected, ip_str.as_str());
 
@@ -229,7 +239,7 @@ fn connect_loop(
             std::thread::sleep(std::time::Duration::from_secs(5));
             let want_scan = { state.lock().map(|s| s.scan_request).unwrap_or(false) };
             if want_scan {
-                log::info!("[WiFi] PC 请求扫描，临时断开");
+                ::log::info!("[WiFi] PC 请求扫描，临时断开");
                 let _ = wifi.disconnect();
                 do_scan(wifi, state);
                 break;
@@ -238,9 +248,9 @@ fn connect_loop(
                 Ok(true) => { consecutive_disconnect = 0; }
                 _ => {
                     consecutive_disconnect = consecutive_disconnect.saturating_add(1);
-                    log::warn!("[WiFi] is_connected=false (连续 {} 次)", consecutive_disconnect);
+                    ::log::warn!("[WiFi] is_connected=false (连续 {} 次)", consecutive_disconnect);
                     if consecutive_disconnect >= 3 {
-                        log::warn!("[WiFi] 确认断开，重连");
+                        ::log::warn!("[WiFi] 确认断开，重连");
                         mark(state, WifiState::Connecting, "");
                         break;
                     }

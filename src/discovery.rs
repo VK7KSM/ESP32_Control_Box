@@ -22,6 +22,11 @@ const RIGTYPE: &str = "TH-9800";
 const MAGIC_REQ: &[u8] = b"ELFRADIO?";
 
 pub fn start_discovery_thread(state: SharedState) {
+    // 绑到 CPU 1，与其他网络线程同核；释放 CPU 0 给 UART/LCD/IDLE0
+    let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+        pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
+        ..Default::default()
+    }.set();
     std::thread::Builder::new()
         .name("discovery".into())
         .stack_size(4096)
@@ -40,7 +45,7 @@ fn read_serial() -> String {
 fn discovery_main(state: SharedState) {
     let serial = read_serial();
     let reply = format!("ELFRADIO! {} {} {}", serial, VERSION, RIGTYPE);
-    log::info!("[Discovery] 启动，serial={} version={} rigtype={}", serial, VERSION, RIGTYPE);
+    ::log::info!("[Discovery] 启动，serial={} version={} rigtype={}", serial, VERSION, RIGTYPE);
 
     loop {
         // 等到 WiFi 连上
@@ -57,7 +62,7 @@ fn discovery_main(state: SharedState) {
         let socket = match UdpSocket::bind(("0.0.0.0", PORT)) {
             Ok(s) => s,
             Err(e) => {
-                log::warn!("[Discovery] bind 0.0.0.0:{} 失败: {}，5s 后重试", PORT, e);
+                ::log::warn!("[Discovery] bind 0.0.0.0:{} 失败: {}，5s 后重试", PORT, e);
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 continue;
             }
@@ -66,16 +71,16 @@ fn discovery_main(state: SharedState) {
         let _ = socket.set_broadcast(true);
         // 设置 1s 读超时，便于检查 WiFi 状态
         let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-        log::info!("[Discovery] 监听 UDP 0.0.0.0:{}", PORT);
+        ::log::info!("[Discovery] 监听 UDP 0.0.0.0:{}", PORT);
 
         let mut buf = [0u8; 64];
         loop {
             match socket.recv_from(&mut buf) {
                 Ok((n, src)) => {
                     if &buf[..n.min(MAGIC_REQ.len())] == MAGIC_REQ {
-                        log::info!("[Discovery] 收到 ELFRADIO? 来自 {}", src);
+                        ::log::info!("[Discovery] 收到 ELFRADIO? 来自 {}", src);
                         if let Err(e) = socket.send_to(reply.as_bytes(), src) {
-                            log::warn!("[Discovery] 回复失败: {}", e);
+                            ::log::warn!("[Discovery] 回复失败: {}", e);
                         }
                     }
                 }
@@ -87,12 +92,12 @@ fn discovery_main(state: SharedState) {
                         s.wifi_state == WifiState::Connected
                     };
                     if !still {
-                        log::info!("[Discovery] WiFi 断开，关闭 socket");
+                        ::log::info!("[Discovery] WiFi 断开，关闭 socket");
                         break;
                     }
                 }
                 Err(e) => {
-                    log::warn!("[Discovery] recv 错误: {}，重新绑定", e);
+                    ::log::warn!("[Discovery] recv 错误: {}，重新绑定", e);
                     break;
                 }
             }

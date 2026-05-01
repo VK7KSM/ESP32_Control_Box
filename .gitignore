@@ -28,3 +28,12 @@ __pycache__/
 /ElfRadio_PC通信问题说明.md
 /TH-9800-协议未定项交接给Claude.md
 /TH-9800 面板通信协议逆向分析总结报告（整合修正版）v4.0.md
+
+# 调试 / 编译产物 / 临时文件
+/boot_log.txt
+/elfradio-hwnode.bin
+/elfradio-box-v0.1.0.zip
+/Hamlib_Rigctld/
+/.codegraphignore.disabled
+/dtrac_failed_duplex_backup_*.patch
+/capture_boot.py

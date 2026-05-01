@@ -19,4 +19,6 @@ ESP_IDF_VERSION = "v5.3.3"
 # 解决：-U 阻止 esp-idf-sys 静态 bindings.h 包含 TinyUSB 头文件
 # TinyUSB 组件仍由 CMake 正常编译链接，Rust 侧使用 pc_comm.rs 手动 FFI 声明
 BINDGEN_EXTRA_CLANG_ARGS = "-UESP_IDF_COMP_ESPRESSIF__ESP_TINYUSB_ENABLED"
+# 允许 stable rustc 使用 unstable feature（esp32-nimble 0.10.x 用了 inline_const_pat 但未声明 #![feature]）
+RUSTC_BOOTSTRAP = "1"
 

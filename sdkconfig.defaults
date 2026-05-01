@@ -27,3 +27,69 @@ CONFIG_LWIP_MAX_SOCKETS=10
 CONFIG_LWIP_TCP_MSS=1440
 CONFIG_LWIP_SO_RCVBUF=y
 CONFIG_LWIP_SO_REUSE=y
+
+# ===== 蓝牙 BLE (NimBLE) — 启用 + PSRAM 内存优化 =====
+# ESP32-S3 仅支持 BLE，不支持 BT Classic（无 SPP）
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_MODE_BLE_ONLY=y          # 仅 BLE，不开 BT Classic
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1            # 1 个并发 BLE 连接（DTrac 单连接够用，节内存）
+CONFIG_BT_NIMBLE_GAP_DEVICE_NAME_MAX_LEN=16   # 设备名最长 16 字符
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247        # MTU 247 = 244 字节 payload
+
+# ===== BLE NimBLE 缓冲挪到 PSRAM（避免 SRAM 枯竭）=====
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y    # NimBLE host 缓冲分配到 PSRAM
+CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY=y            # BLE 环境也用动态分配（可走 PSRAM）
+
+# ===== BLE Controller 缩小 buffer（释放内部 SRAM）=====
+CONFIG_BT_CTRL_BLE_MAX_ACT=2                  # 默认 4 → 2（最大同时活跃连接）
+
+# 注意：以下激进 BLE 配置已被撤销，原因是会导致 NimBLE 协议栈在断开/重连时不稳定：
+#   - CONFIG_BT_NIMBLE_NVS_PERSIST=y          → 走 SM 关闭路径，无 bonding 可存
+#   - CONFIG_BT_NIMBLE_ROLE_CENTRAL=n         → 恢复默认（vendor 已禁 client 模块，无影响）
+#   - CONFIG_BT_NIMBLE_ROLE_OBSERVER=n        → 恢复默认
+#   - CONFIG_BT_NIMBLE_TASK_STACK_SIZE=3072   → 恢复默认 4096
+#   - CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=16 → 恢复默认 30（防 HCI 事件丢失）
+
+# ===== WiFi 缓冲减小 + 优先 PSRAM =====
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# 关键：esp-idf-svc 默认 RX_BA_WIN=16，强制 STATIC/DYNAMIC RX BUFFER ≥ 16，
+# 导致 WiFi init 想要 16×1600=25.6KB 内部 DMA SRAM，分不齐就 ESP_ERR_NO_MEM。
+# 降到 6（ESP-IDF 原生默认）→ STATIC/DYNAMIC RX BUFFER NUM=10 真正生效，
+# WiFi init 只需 10×1600=16KB，与 SPIRAM_MALLOC_RESERVE_INTERNAL=49152 池配合稳定启动。
+# 代价：AMPDU 聚合窗口 16→6，吞吐 ~30Mbps→~15Mbps，rigctld TCP 用不上高速完全够用
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+# 注意：sdkconfig 不支持行内注释，# 必须在行首；之前 3 行带行内注释导致 value 解析失败被忽略
+# STATIC_RX_BUFFER_NUM 默认 10；启用 SPIRAM_TRY_ALLOCATE_WIFI_LWIP 时 ESP-IDF Kconfig 强行
+# 提到 16（"default 16 if SPIRAM_..."），但 STATIC_RX 必须 DMA-capable 内部 SRAM，PSRAM 无关
+# 显式设 10 覆盖 Kconfig default
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
+# ===== WiFi DMA buffer 内部 SRAM 保留池 =====
+# 显式保留 48KB 内部 SRAM 仅供 MALLOC_CAP_DMA / MALLOC_CAP_INTERNAL 使用
+# WiFi static RX 25.6KB + SPI/UART/协议栈 DMA 余量 + 安全裕度
+# 常规 malloc 不会侵占此池，保证 WiFi 启动时 DMA buffer 永远分配成功
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
+
+# ===== WiFi 代码不放 IRAM（释放 IRAM/SRAM 压力）=====
+# 牺牲少量 WiFi 性能（~5-10%），上位机/Hamlib TCP 数据量小完全够用
+# ESP-IDF 5.x 配置名（旧版 CONFIG_ESP32_WIFI_*_IRAM_OPT 已弃用）
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
+# ===== 允许 .bss + .noinit 段放 PSRAM（释放内部 SRAM）=====
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
+
+# ===== BLE+WiFi 共存（时分复用 2.4GHz RF）=====
+CONFIG_SW_COEXIST_ENABLE=y
+
+# ===== 双核负载平衡：ESP-IDF 子系统任务绑 CPU 1，释放 CPU 0 给 IDLE0 喂看门狗 =====
+# 默认全部任务在 CPU 0，与所有 Rust pthread 抢占 → IDLE0 (CPU 0) did not reset watchdog
+# 绑核后 CPU 0 = 实时硬件 I/O（UART relay、LCD），CPU 1 = 网络/BLE/控制
+# 注意：ESP-IDF 5.3 BLE-only 模式用 BT_CTRL_PINNED_TO_CORE_x（BTDM_ 是旧 dual-mode 名，已弃用）
+CONFIG_BT_CTRL_PINNED_TO_CORE_1=y
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_1=y
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y

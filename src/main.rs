@@ -17,6 +17,12 @@ mod wifi;
 mod discovery;
 mod pc_tcp;
 mod rigctld;
+mod ble;
+
+// 必须显式 extern：esp_idf_svc::sys 通过 wildcard 引入了一个叫 `log` 的 struct，
+// 与 `log` crate 冲突。extern crate log 把 log crate 强制放到 root namespace，
+// 让 `::log::info!` 等宏正确解析。
+extern crate log;
 
 use esp_idf_svc::hal::prelude::*;
 use esp_idf_svc::hal::rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse, TxRmtDriver};
@@ -47,7 +53,7 @@ fn flush_fb_dma(fb: &mut framebuf::FrameBuf) {
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
-    log::info!("ElfRadio HwNode 启动中...");
+    ::log::info!("ElfRadio HwNode 启动中...");
 
     let peripherals = Peripherals::take().unwrap();
 
@@ -77,7 +83,7 @@ fn main() {
     ).expect("LEDC 背光通道初始化失败");
     // 先关闭背光，等屏幕初始化完成后再点亮
     backlight.set_duty(0).unwrap();
-    log::info!("PWM 背光已初始化 (GPIO 13)");
+    ::log::info!("PWM 背光已初始化 (GPIO 13)");
 
     // ===== ESP-IDF esp_lcd SPI DMA 屏幕初始化 =====
     //
@@ -99,7 +105,7 @@ fn main() {
         bus_cfg.max_transfer_sz = 240 * 320 * 2;     // 全屏一次传输
         let ret = spi_bus_initialize(spi_host_device_t_SPI2_HOST, &bus_cfg, spi_common_dma_t_SPI_DMA_CH_AUTO);
         assert!(ret == ESP_OK, "SPI 总线初始化失败: {}", ret);
-        log::info!("SPI2 总线 + DMA 初始化完成");
+        ::log::info!("SPI2 总线 + DMA 初始化完成");
 
         // Step 2: SPI LCD IO（DMA 队列深度 2，配合双缓冲）
         let mut io_cfg: esp_lcd_panel_io_spi_config_t = std::mem::zeroed();
@@ -119,7 +125,7 @@ fn main() {
             &mut io_handle,
         );
         assert!(ret == ESP_OK, "LCD IO SPI 初始化失败: {}", ret);
-        log::info!("LCD IO SPI 初始化完成 (40MHz, DMA queue=2)");
+        ::log::info!("LCD IO SPI 初始化完成 (40MHz, DMA queue=2)");
 
         // Step 3: ST7789 面板
         let mut panel_cfg: esp_lcd_panel_dev_config_t = std::mem::zeroed();
@@ -145,13 +151,13 @@ fn main() {
 
         // 保存到全局句柄
         LCD_PANEL = panel;
-        log::info!("ST7789 DMA 面板初始化完成");
+        ::log::info!("ST7789 DMA 面板初始化完成");
     }
 
     // ===== 单帧缓冲（内部 SRAM，DMA-capable）=====
     // PSRAM 与 WiFi 共享 GDMA 通道导致 LCD DMA 严重抖动；改用内部 SRAM
     let mut fb = framebuf::FrameBuf::new();
-    log::info!("单帧缓冲已分配 ({}KB 内部 SRAM)", 240 * 320 * 2 / 1024);
+    ::log::info!("单帧缓冲已分配 ({}KB 内部 SRAM)", 240 * 320 * 2 / 1024);
 
     // ===== 开机画面 =====
     ui::draw_splash(&mut fb);
@@ -159,7 +165,7 @@ fn main() {
     // 点亮背光（60% 亮度）
     let max_duty = backlight.get_max_duty();
     backlight.set_duty(max_duty * 60 / 100).unwrap();
-    log::info!("开机画面已显示，背光 60%");
+    ::log::info!("开机画面已显示，背光 60%");
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
     // ===== 共享状态 =====
@@ -180,8 +186,15 @@ fn main() {
     let uart1_ref: &'static _ = &*uart1;
     let uart2_ref: &'static _ = &*uart2;
 
-    // ===== 启动 UART 中继线程 =====
+    // ===== 启动 UART 中继线程（绑 CPU 0：硬件中继实时性强，与 main loop / LCD 同核）=====
+    // ThreadSpawnConfiguration 是 sticky 全局状态，必须每次 spawn 前显式设；否则会
+    // 继承上一次 spawn 的 pin_to_core，例如 BLE 后续 spawn 设 Core1 后再不显式设
+    // Core0 就会跑到 CPU 1 上
     let state_a = shared.clone();
+    let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+        pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core0),
+        ..Default::default()
+    }.set();
     let _thread_a = std::thread::Builder::new()
         .name("relay_down".into())
         .stack_size(8192)
@@ -191,6 +204,10 @@ fn main() {
         .expect("下行中继线程启动失败");
 
     let state_b = shared.clone();
+    let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+        pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core0),
+        ..Default::default()
+    }.set();
     let _thread_b = std::thread::Builder::new()
         .name("relay_up".into())
         .stack_size(16384)  // 增大：PTT/VOL/SQL 注入 + Mutex + UART 写入需要足够栈
@@ -199,7 +216,7 @@ fn main() {
         })
         .expect("上行中继线程启动失败");
 
-    log::info!("UART 中继线程已启动");
+    ::log::info!("UART 中继线程已启动 (CPU 0)");
 
     // ===== GPIO 8: TH-9800 开关机光耦控制 =====
     // GPIO 8 → 330Ω → PC817C (Opto2) → RJ-12 Pin 5 (电源开关)
@@ -214,11 +231,15 @@ fn main() {
         esp_idf_svc::sys::gpio_config(&io_cfg);
         esp_idf_svc::sys::gpio_set_level(8, 0);  // 默认低电平（不触发）
     }
-    log::info!("GPIO 8 (开关机光耦) 初始化完成");
+    ::log::info!("GPIO 8 (开关机光耦) 初始化完成");
 
-    // ===== PC 通信线程（共口二进制协议）=====
+    // ===== PC 通信线程（共口二进制协议，绑 CPU 0：UART 实时通信，与 main loop 同核）=====
     pc_comm::init_pc_comm();
     let state_c = shared.clone();
+    let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+        pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core0),
+        ..Default::default()
+    }.set();
     let _thread_c = std::thread::Builder::new()
         .name("pc_comm".into())
         .stack_size(8192)
@@ -226,11 +247,11 @@ fn main() {
             pc_comm::pc_comm_thread(uart1_ref, state_c, 8);
         })
         .expect("PC 通信线程启动失败");
-    log::info!("PC 通信线程已启动");
+    ::log::info!("PC 通信线程已启动 (CPU 0)");
 
     // ===== WiFi STA 后台线程 =====
     wifi::start_wifi_thread(peripherals.modem, shared.clone());
-    log::info!("WiFi 线程已启动");
+    ::log::info!("WiFi 线程已启动");
 
     // ===== LAN 设备发现（UDP 4534）=====
     discovery::start_discovery_thread(shared.clone());
@@ -241,6 +262,9 @@ fn main() {
     // ===== Hamlib rigctld 文本协议服务器（TCP 4532）+ 频率步进线程 =====
     rigctld::start_rigctld_thread(shared.clone());
     rigctld::start_freq_stepper_thread(shared.clone());
+
+    // ===== BLE 广播（手机 DTrac 直连用）— 阶段 2: GATT + rigctld 透传 =====
+    ble::start_ble_thread(shared.clone());
 
     // ===== 初始绘制 =====
     {

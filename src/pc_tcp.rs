@@ -23,6 +23,11 @@ const PORT: u16 = 4533;
 const MAX_CLIENTS: usize = 4;
 
 pub fn start_pc_tcp_thread(state: SharedState, power_pin_num: i32) {
+    // 绑到 CPU 1，与其他网络线程同核；释放 CPU 0 给 UART/LCD/IDLE0
+    let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+        pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
+        ..Default::default()
+    }.set();
     std::thread::Builder::new()
         .name("pc_tcp_acceptor".into())
         .stack_size(4096)
@@ -68,6 +73,11 @@ fn acceptor_main(state: SharedState, power_pin_num: i32) {
                     let st = state.clone();
                     let act = active.clone();
                     log::info!("[PC-TCP] 接受连接：{}（活跃 {}）", peer, cur + 1);
+                    // per-client handler 也绑 CPU 1（与 acceptor 同核）
+                    let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+                        pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
+                        ..Default::default()
+                    }.set();
                     std::thread::Builder::new()
                         .name(format!("pc_tcp_{}", peer.port()))
                         .stack_size(8192)

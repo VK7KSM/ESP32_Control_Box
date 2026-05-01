@@ -29,6 +29,7 @@ esp-idf-hal = { version = "0.45", features = ["rmt-legacy"] }  # 启用旧版 RM
 embedded-graphics = "0.8"       # 绘图库：画文字、矩形、圆等
 profont = "0.7"                 # 高质量等宽字体 (7pt ~ 24pt)
 heapless = "0.8"               # 嵌入式定长容器（无堆分配）
+esp32-nimble = { path = "vendor/esp32-nimble" }  # BLE 协议栈（vendor 自 0.10.0，修了 ble_error.rs 的 inline_const_pat 不兼容问题）
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }

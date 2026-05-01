@@ -100,7 +100,7 @@ pub fn init_pc_comm() {
         };
         let ret = tinyusb_driver_install(&tusb_cfg);
         if ret != ESP_OK {
-            log::error!("[PC通信] tinyusb_driver_install 失败: {}", ret);
+            ::log::error!("[PC通信] tinyusb_driver_install 失败: {}", ret);
             return;
         }
 
@@ -115,11 +115,11 @@ pub fn init_pc_comm() {
         };
         let ret = tusb_cdc_acm_init(&acm_cfg);
         if ret != ESP_OK {
-            log::error!("[PC通信] tusb_cdc_acm_init 失败: {}", ret);
+            ::log::error!("[PC通信] tusb_cdc_acm_init 失败: {}", ret);
             return;
         }
     }
-    log::info!("[PC通信] TinyUSB CDC-ACM 通信口就绪（原生 USB OTG）");
+    ::log::info!("[PC通信] TinyUSB CDC-ACM 通信口就绪（原生 USB OTG）");
 }
 
 fn send_frame(typ: u8, payload: &[u8]) {
@@ -333,33 +333,33 @@ pub fn dispatch_command(
             let mut s = state.lock().unwrap();
             if on && s.rigctld_ptt_blocked_until_tx_real {
                 s.ptt_override = false;
-                log::warn!("[PTT保护] TX placeholder active, block PC PTT until real TX I applied");
+                ::log::warn!("[PTT保护] TX placeholder active, block PC PTT until real TX I applied");
             } else {
                 s.ptt_override = on;
                 if on { s.ptt_start_us = now_us; }
             }
         }
         PcCommand::PowerToggle => {
-            log::info!("[PC通信] 收到开关机指令，GPIO{} 脉冲 1.2s", power_pin_num);
+            ::log::info!("[PC通信] 收到开关机指令，GPIO{} 脉冲 1.2s", power_pin_num);
             unsafe { gpio_set_level(power_pin_num, 1); }
             std::thread::sleep(std::time::Duration::from_millis(1200));
             unsafe { gpio_set_level(power_pin_num, 0); }
-            log::info!("[PC通信] GPIO{} 脉冲结束", power_pin_num);
+            ::log::info!("[PC通信] GPIO{} 脉冲结束", power_pin_num);
         }
         PcCommand::WifiScan => {
             state.lock().unwrap().scan_request = true;
-            log::info!("[PC通信] 收到 WiFi 扫描请求");
+            ::log::info!("[PC通信] 收到 WiFi 扫描请求");
         }
         PcCommand::SetWifiCred { ssid, psk } => {
-            log::info!("[PC通信] 收到 WiFi 配网：SSID=\"{}\" PSK={}字节", ssid.as_str(), psk.len());
+            ::log::info!("[PC通信] 收到 WiFi 配网：SSID=\"{}\" PSK={}字节", ssid.as_str(), psk.len());
             match write_wifi_creds_raw(ssid.as_str(), psk.as_str()) {
                 Ok(()) => {
-                    log::info!("[PC通信] WiFi 凭据已写入 NVS，1 秒后重启");
+                    ::log::info!("[PC通信] WiFi 凭据已写入 NVS，1 秒后重启");
                     std::thread::sleep(std::time::Duration::from_millis(1000));
                     unsafe { esp_restart(); }
                 }
                 Err(e) => {
-                    log::error!("[PC通信] 写 NVS 失败: {}", e);
+                    ::log::error!("[PC通信] 写 NVS 失败: {}", e);
                     let msg = format!("WiFi NVS 写入失败: {}", e);
                     out.push((RPT_ERROR, msg.as_bytes().to_vec()));
                 }
@@ -479,7 +479,7 @@ pub fn pc_comm_thread(
     let mut last_report_us = init_us;
     let mut last_pushed_scan_seq: u32 = 0;
 
-    log::info!("[PC通信] TinyUSB CDC-ACM 线程启动");
+    ::log::info!("[PC通信] TinyUSB CDC-ACM 线程启动");
 
     loop {
         let now_us = unsafe { esp_timer_get_time() } as u64;
@@ -556,7 +556,7 @@ pub fn pc_comm_thread(
             }
         };
         if let Some(items) = scan_to_send {
-            log::info!("[PC通信] 推送 WiFi 扫描结果: {} 个 AP", items.len());
+            ::log::info!("[PC通信] 推送 WiFi 扫描结果: {} 个 AP", items.len());
             send_wifi_scan_frame(&items);
         }
 
