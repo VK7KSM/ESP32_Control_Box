@@ -258,7 +258,10 @@ fn main() {
     render_splash_tiled(&mut fb);
     // 点亮背光（60% 亮度）
     let max_duty = backlight.get_max_duty();
-    backlight.set_duty(max_duty * 60 / 100).unwrap();
+    // 防烧屏：normal 60%（正常）/ dim 0（PWM duty=0 完全断 LED，效果如断屏电源）
+    let bl_normal: u32 = max_duty * 60 / 100;
+    let bl_dim: u32 = 0;
+    backlight.set_duty(bl_normal).unwrap();
     ::log::info!("开机画面已显示，背光 60%");
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
@@ -389,18 +392,78 @@ fn main() {
     let mut last_redraw_us: u64 = 0;
     const MIN_REDRAW_INTERVAL_US: u64 = 200_000;  // 200ms = 5fps cap（PSRAM 帧缓冲 + WiFi 共享 DMA 时容易拥塞，状态显示 5fps 已足够）
 
+    // ===== 防烧屏（150s 无用户活动后背光从 60% 调暗到 8%）=====
+    // 心跳的 CW/CCW 注入会触发 body_count++ 和非 MAIN 侧 freq 变化，但**不**算用户活动。
+    // 真实用户活动定义：head_count 变化 OR pc/wifi/rc 变化 OR MAIN 侧频率变化 OR S 上升沿到 ≥3
+    //   - head_count: 上行帧（按键/旋钮）+ vol/sql 注入 + BLE/rigctld 状态事件
+    //   - MAIN freq 变化: 用户调台（DTrac/手动）影响主操作侧（心跳只动非 MAIN 侧不会触发）
+    //   - S 上升沿 ≥3: 强信号到达瞬间（≥3 是经验值，1-2 视为弱噪声不打扰）
+    // S 持续 ≥3 期间暂停 dim 计时（信号期间保持亮屏，避免边沿触发后又被调暗）
+    const DIM_AFTER_TICKS: u32 = 3000;       // 3000 × 50ms = 150s
+    const SIGNAL_WAKE_THRESHOLD: u32 = 3;    // S ≥ 3 视为真实信号
+    let mut no_user_activity_ticks: u32 = 0;
+    let mut backlight_dimmed: bool = false;
+    // 跟踪上次值用于检测 MAIN freq 变化、S 上升沿、BUSY 上升沿
+    let mut last_left_freq: heapless::String<12> = heapless::String::new();
+    let mut last_right_freq: heapless::String<12> = heapless::String::new();
+    let mut last_max_s_level: u32 = 0;
+    let mut last_left_busy: bool = false;
+    let mut last_right_busy: bool = false;
+
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let now_us = unsafe { esp_timer_get_time() } as u64;
         let can_redraw = now_us.saturating_sub(last_redraw_us) >= MIN_REDRAW_INTERVAL_US;
 
         if let Ok(mut s) = shared.try_lock() {
-            let radio_changed = s.body_count != last_body_count || s.head_count != last_head_count;
+            let body_changed = s.body_count != last_body_count;
+            let head_changed = s.head_count != last_head_count;
+            let radio_changed = body_changed || head_changed;
             let pc_changed = s.pc_alive != last_pc_alive;
             let wifi_changed = s.wifi_state != last_wifi_state || s.wifi_ip != last_wifi_ip;
             let rc_changed = s.rigctld_clients != last_rigctld_clients;
+            let any_change = radio_changed || pc_changed || wifi_changed || rc_changed;
 
-            if (radio_changed || pc_changed || wifi_changed || rc_changed) && can_redraw {
+            // ===== 防烧屏：识别真实用户活动（排除心跳响应）=====
+            // 心跳: body_count++ + 非 MAIN 侧 freq 变化（不算活动）
+            // 真活动: head_count 变化 / pc/wifi/rc 变化 / MAIN 侧 freq 变化 / S 上升沿到 ≥3 / BUSY 上升沿
+            let curr_max_s = s.left.s_level.max(s.right.s_level);
+            let signal_arrived = last_max_s_level < SIGNAL_WAKE_THRESHOLD
+                && curr_max_s >= SIGNAL_WAKE_THRESHOLD;
+            let signal_present = curr_max_s >= SIGNAL_WAKE_THRESHOLD;
+            // BUSY=ON 意味着 squelch open + 喇叭出音，用户大概率想看屏幕
+            // 上升沿（OFF→ON）唤醒；持续 ON 期间暂停 dim 计时
+            let busy_present = s.left.is_busy || s.right.is_busy;
+            let busy_arrived = (s.left.is_busy && !last_left_busy)
+                || (s.right.is_busy && !last_right_busy);
+            let main_freq_changed =
+                (s.left.is_main && s.left.freq != last_left_freq) ||
+                (s.right.is_main && s.right.freq != last_right_freq);
+            let user_activity = head_changed || pc_changed || wifi_changed || rc_changed
+                || main_freq_changed || signal_arrived || busy_arrived;
+
+            // 用户活动 → 立即恢复背光（独立于 can_redraw 节流）
+            if user_activity && backlight_dimmed {
+                let _ = backlight.set_duty(bl_normal);
+                backlight_dimmed = false;
+                ::log::info!("[屏幕] 检测到活动，背光恢复 60%");
+            }
+
+            // 更新跟踪：last_left_freq / last_right_freq / last_max_s_level / last_*_busy
+            // 必须每次主循环都更新（不依赖 redraw 路径），保证 main_freq_changed / signal_arrived / busy_arrived 准确
+            last_max_s_level = curr_max_s;
+            last_left_busy = s.left.is_busy;
+            last_right_busy = s.right.is_busy;
+            if s.left.freq != last_left_freq {
+                last_left_freq.clear();
+                let _ = last_left_freq.push_str(s.left.freq.as_str());
+            }
+            if s.right.freq != last_right_freq {
+                last_right_freq.clear();
+                let _ = last_right_freq.push_str(s.right.freq.as_str());
+            }
+
+            if any_change && can_redraw {
                 last_body_count = s.body_count;
                 last_head_count = s.head_count;
                 last_pc_alive = s.pc_alive;
@@ -419,7 +482,7 @@ fn main() {
                 drop(s);
                 render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only);
                 last_redraw_us = now_us;
-            } else if !radio_changed && !pc_changed && !wifi_changed && !rc_changed {
+            } else if !any_change {
                 no_data_ticks += 1;
                 // 仅在没有 rigctld 客户端时才超时置 alive=false
                 // rigctld 客户端（含 BLE）连接时认为电台一直 alive：
@@ -439,6 +502,23 @@ fn main() {
                     render_main_ui_tiled(&mut fb, &left, &right, false, pc, &ws, ip.as_str(), tcp_only);
                 }
             }
+
+            // ===== 防烧屏调暗判定（独立于 any_change 路径）=====
+            // dim_pause = 信号持续 ≥3 OR BUSY 持续 ON（喇叭出音用户想看屏）
+            // 用户活动 reset 计时；dim_pause 期间暂停计时（不调暗也不重置）；其它累加
+            let dim_pause = signal_present || busy_present;
+            if user_activity {
+                no_user_activity_ticks = 0;
+            } else if !dim_pause {
+                no_user_activity_ticks = no_user_activity_ticks.saturating_add(1);
+                // 用 == 触发：精确 150s 时关 LED 一次，之后 backlight_dimmed 防重入
+                if no_user_activity_ticks == DIM_AFTER_TICKS && !backlight_dimmed {
+                    let _ = backlight.set_duty(bl_dim);
+                    backlight_dimmed = true;
+                    ::log::info!("[屏幕] 150 秒无用户活动且无信号无 BUSY，关闭背光");
+                }
+            }
+            // dim_pause && !user_activity 时既不重置也不累加，等信号/BUSY 消失后从原值继续
         }
     }
 }
