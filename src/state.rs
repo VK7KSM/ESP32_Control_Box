@@ -241,6 +241,9 @@ pub struct RadioState {
     // ===== BLE 连接状态（手机 DTrac 直连用）=====
     pub ble_advertising: bool,      // 当前是否在 BLE 广播
     pub ble_clients: u32,           // 当前 BLE 客户端连接数（GATT 已连接）
+    // ===== SoftAP 状态（C 功能未来落地，本期 stub 永远 false/0）=====
+    pub softap_active: bool,        // SoftAP 模式启动中（影响 WiFi 图标橙/蓝 + 底栏 IP 显示）
+    pub softap_clients: u32,        // 连接到 SoftAP 的客户端数（影响底栏 IP 颜色橙/蓝）
     // ===== rigctld 连接状态 =====
     pub rigctld_clients: u32,       // 当前活跃 rigctld 客户端数（>0 → IP 显示橙色）
     pub rigctld_ctcss_tone: u32,    // 最后设置的 CTCSS 频率（0.1 Hz 单位，0=OFF）
@@ -248,6 +251,17 @@ pub struct RadioState {
     pub rigctld_step_ready: bool,        // TH-9800 STEP 已设为 2.5kHz
     pub rigctld_setup_running: bool,     // rigctld 初始设置线程正在运行
     pub rigctld_last_step_us: u64,       // 最近一次 DTrac 追踪旋钮注入时间
+    // ===== 顶栏状态消息（power toggle 等临时通知）=====
+    pub status_msg: heapless::String<32>,         // 空 = 不显示，恢复默认顶栏标题
+    pub status_msg_color: StatusMsgColor,         // 显示色（仅 status_msg 非空时生效）
+    pub status_msg_clear_at_us: u64,              // 0 = 持续显示直到手动 clear；>0 = 主循环到时自动清除
+}
+
+/// 顶栏状态消息颜色（仅 power toggle / 错误等临时通知用）
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum StatusMsgColor {
+    Amber,  // 进行中 / 警告（与 IP 橙色同色）
+    Red,    // 错误（与 BUSY 红色同色）
 }
 
 impl RadioState {
@@ -329,12 +343,17 @@ impl RadioState {
             rigctld_sql_close_right_pending: false,
             ble_advertising: false,
             ble_clients: 0,
+            softap_active: false,
+            softap_clients: 0,
             rigctld_clients: 0,
             rigctld_ctcss_tone: 0,
             rigctld_initial_freq_done: false,
             rigctld_step_ready: false,
             rigctld_setup_running: false,
             rigctld_last_step_us: 0,
+            status_msg: heapless::String::new(),
+            status_msg_color: StatusMsgColor::Amber,
+            status_msg_clear_at_us: 0,
         }
     }
 }

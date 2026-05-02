@@ -11,7 +11,7 @@ use embedded_graphics::primitives::{Line, PrimitiveStyleBuilder, Rectangle, Roun
 use embedded_graphics::text::{Alignment, Text};
 use profont::{PROFONT_24_POINT, PROFONT_14_POINT, PROFONT_12_POINT, PROFONT_9_POINT};
 
-use crate::state::{BandState, PowerLevel, WifiState};
+use crate::state::{BandState, PowerLevel, StatusMsgColor, WifiState};
 
 // ===== 配色 =====
 pub const BG:     Rgb565 = Rgb565::BLACK;
@@ -34,6 +34,13 @@ const VAL_X: i32 = 146;
 const LOGO_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo.raw"));
 const LOGO_W: u32 = 200;
 const LOGO_H: u32 = 166;
+
+// ===== 顶栏 WiFi / 蓝牙 状态图标（16×16 RGB565 LE）=====
+const WIFI_BLUE_DATA:    &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wifi_blue.raw"));
+const WIFI_ORANGE_DATA:  &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wifi_orange.raw"));
+const BT_BLUE_DATA:      &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bluetooth_blue.raw"));
+const BT_ORANGE_DATA:    &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bluetooth_orange.raw"));
+const ICON_W: u32 = 16;
 
 // ===== Unifont 16×16 CJK 字形 =====
 pub const GLYPH_GAO: [u16; 16] = [0x0200, 0x0100, 0xFFFE, 0x0000, 0x0FE0, 0x0820, 0x0820, 0x0FE0, 0x0000, 0x7FFC, 0x4004, 0x4FE4, 0x4824, 0x4824, 0x4FE4, 0x400C]; // 高
@@ -128,6 +135,12 @@ where D::Error: core::fmt::Debug,
 }
 
 // ===== 主界面绘制 =====
+//
+// `ble_advertising` 当前未参与图标渲染（保留参数避免再改签名）；
+// BT 图标颜色仅由 `ble_clients > 0` 决定。
+//
+// `softap_active` / `softap_clients` 本期由 state.rs 默认 false/0，C 功能落地后由
+// wifi.rs 切到 SoftAP 模式时设置；UI 自动切换 WiFi 图标颜色 + 底栏 IP 显示。
 pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
     display: &mut D,
     left: &BandState,
@@ -137,22 +150,52 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
     wifi_state: &WifiState,
     wifi_ip: &str,
     rigctld_clients: u32,
+    status_msg: &str,
+    status_msg_color: StatusMsgColor,
+    _ble_advertising: bool,
+    ble_clients: u32,
+    softap_active: bool,
+    softap_clients: u32,
 ) where D::Error: core::fmt::Debug,
 {
     display.clear(BG).unwrap();
 
-    // 顶栏
+    // 顶栏（22px 高）
     Rectangle::new(Point::new(0, 0), Size::new(240, 22))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(PANEL).build())
         .draw(display).unwrap();
     hline(display, 22, BORDER);
 
-    Text::new("TYT TH-9800", Point::new(6, 16),
-        MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(WHITE).build())
-        .draw(display).unwrap();
-    Text::with_alignment("V0.1.0", Point::new(234, 16),
-        MonoTextStyleBuilder::new().font(&PROFONT_9_POINT).text_color(CYAN).build(),
+    // 右侧时间占位（E2.A 阶段固定 GRAY "--:--:--"，E2.B 接入 NTP 后再上色）
+    // PROFONT_14 = 10×17 px，8 chars = 80px，右对齐 x=234 → 起 x=154
+    Text::with_alignment("--:--:--", Point::new(234, 16),
+        MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(GRAY).build(),
         Alignment::Right).draw(display).unwrap();
+
+    if !status_msg.is_empty() {
+        // status_msg 非空：左侧显示状态文字（按 status_msg_color 染色），中间图标隐藏
+        // 最长 "Radio Off FAIL" 14 chars × 10 = 140px → 结束 x=146，距时间区 x=154 → 8px ✓
+        let color = match status_msg_color {
+            StatusMsgColor::Red => RED,
+            StatusMsgColor::Amber => AMBER,
+        };
+        Text::new(status_msg, Point::new(6, 16),
+            MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(color).build())
+            .draw(display).unwrap();
+    } else {
+        // 默认状态：左 "elfRadio" 白色（8 chars × 10 = 80px → 结束 x=86）
+        Text::new("elfRadio", Point::new(6, 16),
+            MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(WHITE).build())
+            .draw(display).unwrap();
+        // 中间 WiFi + BT 双图标，居中并排（16+4+16 = 36px，居中起 x=102）
+        // 顶栏 22px 高，16×16 图标垂直居中 y=(22-16)/2 = 3
+        let wifi_data = if softap_active { WIFI_ORANGE_DATA } else { WIFI_BLUE_DATA };
+        let bt_data   = if ble_clients > 0 { BT_ORANGE_DATA } else { BT_BLUE_DATA };
+        let wifi_raw = ImageRawLE::<Rgb565>::new(wifi_data, ICON_W);
+        let bt_raw   = ImageRawLE::<Rgb565>::new(bt_data,   ICON_W);
+        Image::new(&wifi_raw, Point::new(102, 3)).draw(display).unwrap();
+        Image::new(&bt_raw,   Point::new(122, 3)).draw(display).unwrap();
+    }
 
     // 波段1
     draw_band(display, 23, left);
@@ -167,13 +210,18 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
         .into_styled(PrimitiveStyleBuilder::new().fill_color(PANEL).build())
         .draw(display).unwrap();
 
-    // 左下角：WiFi 状态 / IP（rigctld 客户端连接时 IP 显示橙色）
-    let (wifi_text, wifi_color): (&str, Rgb565) = match wifi_state {
-        WifiState::Connected    => (wifi_ip, if rigctld_clients > 0 { AMBER } else { CYAN }),
-        WifiState::Connecting   => ("WiFi:connect..", AMBER),
-        WifiState::NoCredentials => ("WiFi:no setup", GRAY),
-        WifiState::Failed       => ("WiFi:fail", GRAY),
-        WifiState::Disabled     => ("WiFi:OFF", GRAY),
+    // 左下角：WiFi 状态 / IP（SoftAP 模式优先；普通 STA 模式下 rigctld 客户端连接时 IP 显示橙色）
+    // 本期 softap_active 永远 false，SoftAP 分支永不触发，STA 行为完全保留 v4 一致
+    let (wifi_text, wifi_color): (&str, Rgb565) = if softap_active {
+        ("192.168.4.1", if softap_clients > 0 { AMBER } else { CYAN })
+    } else {
+        match wifi_state {
+            WifiState::Connected    => (wifi_ip, if rigctld_clients > 0 { AMBER } else { CYAN }),
+            WifiState::Connecting   => ("WiFi:connect..", AMBER),
+            WifiState::NoCredentials => ("WiFi:no setup", GRAY),
+            WifiState::Failed       => ("WiFi:fail", GRAY),
+            WifiState::Disabled     => ("WiFi:OFF", GRAY),
+        }
     };
     Text::new(wifi_text, Point::new(6, 314),
         MonoTextStyleBuilder::new().font(&PROFONT_12_POINT).text_color(wifi_color).build())

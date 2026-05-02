@@ -108,6 +108,13 @@ fn render_tiled<F: FnMut(&mut framebuf::FrameBuf)>(fb: &mut framebuf::FrameBuf, 
 /// 注意：`wifi_tcp_clients` 参数语义为"仅 WiFi/TCP rigctld 客户端数量"（不含 BLE）。
 /// 调用方必须传 `s.rigctld_clients.saturating_sub(s.ble_clients)`，否则 BLE 连接时
 /// IP 地址也会被 ui.rs 误染橙色。
+///
+/// `status_msg` 非空时顶栏左侧替换为临时状态消息（power toggle 等），空时显示默认 "elfRadio"
+/// 中间 WiFi/BT 双图标（仅 status_msg 为空时显示）：
+///   - WiFi 图标：`softap_active` → 橙色，否则蓝色
+///   - BT 图标：`ble_clients > 0` → 橙色，否则蓝色
+/// `ble_advertising` 当前未参与图标渲染（保留参数避免再改签名）
+/// 底栏 IP：`softap_active` → 显示 192.168.4.1（softap_clients>0 橙否则蓝），否则按 wifi_state 走 STA 路径
 fn render_main_ui_tiled(
     fb: &mut framebuf::FrameBuf,
     left: &state::BandState,
@@ -117,9 +124,17 @@ fn render_main_ui_tiled(
     wifi_state: &state::WifiState,
     wifi_ip: &str,
     wifi_tcp_clients: u32,
+    status_msg: &str,
+    status_msg_color: state::StatusMsgColor,
+    ble_advertising: bool,
+    ble_clients: u32,
+    softap_active: bool,
+    softap_clients: u32,
 ) {
     render_tiled(fb, |fb| {
-        ui::draw_main_ui(fb, left, right, radio_alive, pc_alive, wifi_state, wifi_ip, wifi_tcp_clients);
+        ui::draw_main_ui(fb, left, right, radio_alive, pc_alive, wifi_state, wifi_ip, wifi_tcp_clients,
+            status_msg, status_msg_color, ble_advertising, ble_clients,
+            softap_active, softap_clients);
     });
 }
 
@@ -375,13 +390,17 @@ fn main() {
         // tcp_only：仅 WiFi/TCP rigctld 客户端数（排除 BLE）。BLE 客户端虽计入
         // rigctld_clients 用于触发 freq_stepper setup，但 IP 颜色应仅反映 LAN 活动
         let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
-        let (left, right, alive, pc, ws, ip) = (
+        let (left, right, alive, pc, ws, ip, smsg, scolor, ble_adv, ble_n, sap_a, sap_n) = (
             s.left.clone(), s.right.clone(),
             s.radio_alive, s.pc_alive,
             s.wifi_state.clone(), s.wifi_ip.clone(),
+            s.status_msg.clone(), s.status_msg_color,
+            s.ble_advertising, s.ble_clients,
+            s.softap_active, s.softap_clients,
         );
         drop(s);
-        render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only);
+        render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only,
+            smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n);
     }
 
     // ===== 主循环: 双缓冲 + DMA 异步 =====
@@ -421,6 +440,18 @@ fn main() {
         let can_redraw = now_us.saturating_sub(last_redraw_us) >= MIN_REDRAW_INTERVAL_US;
 
         if let Ok(mut s) = shared.try_lock() {
+            // 顶栏 status_msg 自动过期清理（如 "Power Toggle FAILED" 5 秒后清空）
+            // 必须在 head_count 检测之前；清空时也 head_count++ 触发本轮重绘
+            if !s.status_msg.is_empty()
+                && s.status_msg_clear_at_us > 0
+                && now_us >= s.status_msg_clear_at_us
+            {
+                s.status_msg.clear();
+                s.status_msg_clear_at_us = 0;
+                s.head_count = s.head_count.wrapping_add(1);
+                ::log::info!("[屏幕] 状态消息到期自动清除");
+            }
+
             let body_changed = s.body_count != last_body_count;
             let head_changed = s.head_count != last_head_count;
             let radio_changed = body_changed || head_changed;
@@ -493,13 +524,17 @@ fn main() {
                 no_data_ticks = 0;
                 // tcp_only：仅 WiFi/TCP 客户端，排除 BLE（BLE 用 GATT 不用 IP）
                 let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
-                let (left, right, alive, pc, ws, ip) = (
+                let (left, right, alive, pc, ws, ip, smsg, scolor, ble_adv, ble_n, sap_a, sap_n) = (
                     s.left.clone(), s.right.clone(),
                     s.radio_alive, s.pc_alive,
                     s.wifi_state.clone(), s.wifi_ip.clone(),
+                    s.status_msg.clone(), s.status_msg_color,
+                    s.ble_advertising, s.ble_clients,
+                    s.softap_active, s.softap_clients,
                 );
                 drop(s);
-                render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only);
+                render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only,
+                    smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n);
                 last_redraw_us = now_us;
             } else if !any_change {
                 no_data_ticks += 1;
@@ -513,12 +548,16 @@ fn main() {
                 if no_data_ticks == 300 && s.rigctld_clients == 0 {  // 300 × 50ms = 15s
                     s.radio_alive = false;
                     let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
-                    let (left, right, pc, ws, ip) = (
+                    let (left, right, pc, ws, ip, smsg, scolor, ble_adv, ble_n, sap_a, sap_n) = (
                         s.left.clone(), s.right.clone(), s.pc_alive,
                         s.wifi_state.clone(), s.wifi_ip.clone(),
+                        s.status_msg.clone(), s.status_msg_color,
+                        s.ble_advertising, s.ble_clients,
+                        s.softap_active, s.softap_clients,
                     );
                     drop(s);
-                    render_main_ui_tiled(&mut fb, &left, &right, false, pc, &ws, ip.as_str(), tcp_only);
+                    render_main_ui_tiled(&mut fb, &left, &right, false, pc, &ws, ip.as_str(), tcp_only,
+                        smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n);
                 }
             }
 

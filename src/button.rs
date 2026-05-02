@@ -12,7 +12,7 @@
 // ===================================================================
 
 use crate::ble;
-use crate::state::SharedState;
+use crate::state::{SharedState, StatusMsgColor};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use esp_idf_svc::sys::*;
@@ -33,6 +33,30 @@ const MAX_ATTEMPTS: u8 = 3;  // 首次 + 2 次重试
 
 /// 全局电源切换互斥锁（物理按钮 + PC API PowerToggle 共用）
 pub static POWER_TOGGLE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// 设置顶栏状态消息（如 "Powering off..."），同时 head_count++ 触发主循环立即重绘
+/// clear_after_ms=0 表示持续显示直到下次 set 或 clear；>0 表示主循环到时自动清除
+fn set_status(state: &SharedState, text: &str, color: StatusMsgColor, clear_after_ms: u64) {
+    let mut s = state.lock().unwrap();
+    s.status_msg.clear();
+    let _ = s.status_msg.push_str(text);
+    s.status_msg_color = color;
+    s.status_msg_clear_at_us = if clear_after_ms == 0 {
+        0
+    } else {
+        let now_us = unsafe { esp_timer_get_time() } as u64;
+        now_us + clear_after_ms * 1000
+    };
+    s.head_count = s.head_count.wrapping_add(1);
+}
+
+/// 清除顶栏状态消息，恢复默认 "TYT TH-9800" 标题
+fn clear_status(state: &SharedState) {
+    let mut s = state.lock().unwrap();
+    s.status_msg.clear();
+    s.status_msg_clear_at_us = 0;
+    s.head_count = s.head_count.wrapping_add(1);
+}
 
 pub fn try_acquire_power_lock() -> bool {
     POWER_TOGGLE_IN_PROGRESS
@@ -73,6 +97,7 @@ fn button_main(state: SharedState) {
 
     let mut press_start: Option<Instant> = None;
     let mut already_triggered_long = false;  // 避免按住不放期间重复触发长按
+    let mut last_countdown_secs: u64 = 0;    // 长按倒计时已显示到第几秒（1/2/3，0=未显示）
 
     loop {
         let pressed = unsafe { gpio_get_level(BUTTON_GPIO) } == 0;
@@ -82,6 +107,7 @@ fn button_main(state: SharedState) {
             (true, None) => {
                 press_start = Some(now);
                 already_triggered_long = false;
+                last_countdown_secs = 0;
             }
             (true, Some(start)) if !already_triggered_long && now - start >= LONG_PRESS_DURATION => {
                 // 长按 3 秒触发（每次按下只触发一次）
@@ -104,6 +130,24 @@ fn button_main(state: SharedState) {
                     });
                 }
             }
+            (true, Some(start)) => {
+                // 仍按下但未达 3s：在 1s/2s/3s 整秒边界更新倒计时（每秒至多 1 次）
+                let elapsed_secs = (now - start).as_secs();
+                if !already_triggered_long
+                    && elapsed_secs > last_countdown_secs
+                    && elapsed_secs >= 1
+                    && elapsed_secs <= 3
+                {
+                    last_countdown_secs = elapsed_secs;
+                    let was_alive = state.lock().unwrap().radio_alive;
+                    let action = if was_alive { "Off" } else { "On" };
+                    let countdown = 4 - elapsed_secs; // 1s→显示3, 2s→2, 3s→1
+                    let mut text: heapless::String<32> = heapless::String::new();
+                    use core::fmt::Write;
+                    let _ = write!(text, "Radio {} {}..", action, countdown);
+                    set_status(&state, text.as_str(), StatusMsgColor::Amber, 0);
+                }
+            }
             (false, Some(start)) => {
                 // 释放：分类短按 vs 已触发的长按
                 let duration = now - start;
@@ -120,9 +164,15 @@ fn button_main(state: SharedState) {
                     }
                     ble::request_advertising_restart();
                 }
+                // 释放后清除可能残留的倒计时显示（< 1s 短按时 last_countdown_secs=0 跳过；
+                // 长按已触发时 worker 接管 status_msg，无需此处清除）
+                if last_countdown_secs > 0 && !already_triggered_long {
+                    clear_status(&state);
+                }
                 // 释放后无论何种类型都重置
                 press_start = None;
                 already_triggered_long = false;
+                last_countdown_secs = 0;
             }
             (false, None) => {}
             _ => {}
@@ -174,6 +224,11 @@ fn power_toggle_worker(state: SharedState) {
         if was_alive { "三次探针无响应 (关机)" } else { "body_count++ (开机)" });
 
     for attempt in 0..MAX_ATTEMPTS {
+        // 更新顶栏状态消息（v4 计划文字：Radio Off... / Radio On...）
+        // 重试期间不在 UI 显示次数（避免增加复杂度，重试详情在 log 里看）
+        let status_text: &str = if was_alive { "Radio Off..." } else { "Radio On..." };
+        set_status(&state, status_text, StatusMsgColor::Amber, 0);
+
         ::log::info!("[PowerToggle] 第 {} 次脉冲（GPIO {} → HIGH {}ms → LOW）",
             attempt + 1, POWER_GPIO, PULSE_DURATION.as_millis());
         unsafe {
@@ -231,6 +286,8 @@ fn power_toggle_worker(state: SharedState) {
                 ::log::info!("[PowerToggle] 第 {} 次成功（开机确认：body_count {} → {}）",
                     attempt + 1, body_before, body_now);
             }
+            // 成功 → 立即清除顶栏状态消息恢复默认标题
+            clear_status(&state);
             return;
         }
 
@@ -241,4 +298,7 @@ fn power_toggle_worker(state: SharedState) {
         }
     }
     ::log::error!("[PowerToggle] 共 {} 次尝试后仍无法确认状态变化（硬件故障？）", MAX_ATTEMPTS);
+    // 全部失败 → 按 v4 计划显示红字（关机/开机分别为 Radio Off FAIL / Radio On FAIL），5 秒后自动清除
+    let fail_text: &str = if was_alive { "Radio Off FAIL" } else { "Radio On FAIL" };
+    set_status(&state, fail_text, StatusMsgColor::Red, 5000);
 }
