@@ -28,6 +28,12 @@ CONFIG_LWIP_TCP_MSS=1440
 CONFIG_LWIP_SO_RCVBUF=y
 CONFIG_LWIP_SO_REUSE=y
 
+# ===== ESP-IDF httpd（SoftAP 配网用）— 增大 header/URI 缓冲 =====
+# Android Captive Portal 浏览器请求带很多 header（User-Agent/Cookie/X-Forwarded-* 等）
+# 默认 512 字节常超限，导致返回 431 Header Fields Too Large（页面空白）
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+CONFIG_HTTPD_MAX_URI_LEN=512
+
 # ===== 蓝牙 BLE (NimBLE) — 启用 + PSRAM 内存优化 =====
 # ESP32-S3 仅支持 BLE，不支持 BT Classic（无 SPP）
 CONFIG_BT_ENABLED=y

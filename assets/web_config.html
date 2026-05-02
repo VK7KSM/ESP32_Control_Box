@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<link rel="icon" type="image/png" href="/logo.png">
+<title>elfRadio Box 配置</title>
+<style>
+:root {
+  --bg: #000;
+  --panel: #0c0f0d;
+  --text: #fff;
+  --muted: #6e7d72;
+  --orange: #ff8000;
+  --blue: #00bfff;
+  --red: #ff4040;
+  --green: #4ade80;
+  --input-bg: #1a1a1a;
+  --input-border: #2a2a2a;
+  --btn-gray: #3a3a3a;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 15px; line-height: 1.5; }
+body { padding: 16px; max-width: 600px; margin: 0 auto; }
+h1 { color: var(--orange); font-size: 22px; font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 10px; }
+h1 .logo { height: 36px; width: auto; flex-shrink: 0; }
+.subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+.section { background: var(--panel); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+.section h2 { font-size: 16px; color: var(--text); margin-bottom: 12px; font-weight: 600; }
+.row { margin-bottom: 12px; }
+.row label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+input[type=text], input[type=password], input[type=datetime-local], select {
+  width: 100%; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 8px;
+  color: var(--text); padding: 10px 12px; font-size: 15px; font-family: inherit;
+}
+input:focus, select:focus { outline: none; border-color: var(--orange); }
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+button {
+  border: none; border-radius: 8px; padding: 10px 18px; font-size: 14px; font-weight: 600; cursor: pointer;
+  font-family: inherit; transition: opacity 0.2s;
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.primary { background: var(--orange); color: #000; }
+button.secondary { background: var(--btn-gray); color: var(--text); }
+button.danger { background: var(--red); color: #fff; }
+.btn-full { width: 100%; }
+.choice-group { display: flex; gap: 6px; flex-wrap: wrap; }
+.choice {
+  flex: 1; min-width: 60px; text-align: center; padding: 10px 4px; background: var(--input-bg);
+  border: 1px solid var(--input-border); border-radius: 8px; cursor: pointer; font-size: 14px; user-select: none;
+}
+.choice.active { background: var(--orange); color: #000; border-color: var(--orange); }
+.toggle-pwd { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; margin-top: 6px; cursor: pointer; }
+.scan-list { max-height: 200px; overflow-y: auto; background: var(--input-bg); border-radius: 8px; padding: 4px; margin-bottom: 8px; }
+.scan-item {
+  display: flex; justify-content: space-between; padding: 8px 10px; border-radius: 6px; cursor: pointer;
+  font-size: 14px;
+}
+.scan-item:hover, .scan-item.selected { background: var(--orange); color: #000; }
+.scan-item .ssid { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scan-item .rssi { color: var(--muted); margin-left: 8px; font-variant-numeric: tabular-nums; }
+.scan-item.selected .rssi { color: rgba(0,0,0,0.6); }
+.alert { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 14px; display: none; }
+.alert.success { background: rgba(74, 222, 128, 0.15); color: var(--green); display: block; }
+.alert.error { background: rgba(255, 64, 64, 0.15); color: var(--red); display: block; }
+.alert.info { background: rgba(0, 191, 255, 0.15); color: var(--blue); display: block; }
+.status-bar { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+.status-bar span { white-space: nowrap; }
+.status-bar .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--green); margin-right: 4px; }
+.muted { color: var(--muted); font-size: 12px; margin-top: 6px; }
+hr { border: none; border-top: 1px solid var(--input-border); margin: 16px 0; }
+</style>
+</head>
+<body>
+
+<h1><img src="/logo.png" class="logo" alt="">elfRadio Box 配置</h1>
+<div class="status-bar">
+  <span><span class="dot"></span>SoftAP 模式</span>
+  <span id="status-version">V--</span>
+  <span id="status-ssid">SSID: --</span>
+  <span id="status-clients">客户端: --</span>
+</div>
+
+<div id="alert" class="alert"></div>
+
+<!-- ============ WiFi 配置 ============ -->
+<div class="section">
+  <h2>📶 WiFi 配置</h2>
+  <div class="row">
+    <label>选择网络（点击扫描结果）</label>
+    <div id="scan-list" class="scan-list">
+      <div class="muted" style="text-align:center;padding:12px">点击「扫描」按钮发现周围 WiFi</div>
+    </div>
+    <button class="secondary btn-full" onclick="doScan()" id="scan-btn">扫描 WiFi</button>
+  </div>
+  <div class="row">
+    <label>WiFi SSID（或手动输入）</label>
+    <input type="text" id="wifi-ssid" placeholder="家里的 WiFi 名称" maxlength="32">
+  </div>
+  <div class="row">
+    <label>WiFi 密码</label>
+    <input type="password" id="wifi-psk" placeholder="WiFi 密码" maxlength="64">
+    <label class="toggle-pwd"><input type="checkbox" id="show-pwd" onchange="togglePwd()"> 显示密码</label>
+  </div>
+  <button class="primary btn-full" onclick="submitWifi()" id="wifi-btn">保存并连接（重启）</button>
+</div>
+
+<!-- ============ 控制盒设置 ============ -->
+<div class="section">
+  <h2>🛠 控制盒设置</h2>
+  <div class="row">
+    <label>屏幕亮度</label>
+    <div class="choice-group" data-name="brightness">
+      <div class="choice" data-value="30">30%</div>
+      <div class="choice" data-value="60">60%</div>
+      <div class="choice" data-value="100">100%</div>
+    </div>
+  </div>
+  <div class="row">
+    <label>屏幕熄屏超时</label>
+    <div class="choice-group" data-name="dim_timeout">
+      <div class="choice" data-value="60">60s</div>
+      <div class="choice" data-value="150">150s</div>
+      <div class="choice" data-value="300">300s</div>
+      <div class="choice" data-value="600">600s</div>
+      <div class="choice" data-value="0">禁用</div>
+    </div>
+  </div>
+  <div class="row">
+    <label>BLE 设备名称（最长 16 字符）</label>
+    <input type="text" id="ble-name" placeholder="elfRadio" maxlength="16">
+  </div>
+  <div class="row">
+    <label>时间同步</label>
+    <div class="choice-group" data-name="ntp_enabled">
+      <div class="choice" data-value="1">NTP 自动</div>
+      <div class="choice" data-value="0">手动设置</div>
+    </div>
+  </div>
+  <div class="row" id="manual-time-row" style="display:none">
+    <label>手动设置时间（保存后立即生效）</label>
+    <input type="datetime-local" id="manual-time">
+  </div>
+  <button class="primary btn-full" onclick="submitConfig()" id="config-btn">保存设置（重启）</button>
+</div>
+
+<!-- ============ 高级 ============ -->
+<div class="section">
+  <h2>⚙ 高级</h2>
+  <div class="btn-row">
+    <button class="secondary" style="flex:1" onclick="exitSoftap()">退出 SoftAP</button>
+    <button class="danger" style="flex:1" onclick="resetNvs()">重置全部 NVS</button>
+  </div>
+  <div class="muted" style="margin-top:8px">"重置"将清除所有 WiFi 凭据和配置项，恢复出厂状态。</div>
+</div>
+
+<script>
+// ===== 全局状态 =====
+let currentCfg = {};
+
+// ===== 工具函数 =====
+function showAlert(msg, type) {
+  const el = document.getElementById('alert');
+  el.className = 'alert ' + type;
+  el.textContent = msg;
+  if (type !== 'error') {
+    setTimeout(() => { el.className = 'alert'; }, 5000);
+  }
+}
+
+function togglePwd() {
+  const el = document.getElementById('wifi-psk');
+  el.type = document.getElementById('show-pwd').checked ? 'text' : 'password';
+}
+
+// ===== 单选组通用绑定 =====
+document.querySelectorAll('.choice-group').forEach(group => {
+  group.querySelectorAll('.choice').forEach(item => {
+    item.addEventListener('click', () => {
+      group.querySelectorAll('.choice').forEach(x => x.classList.remove('active'));
+      item.classList.add('active');
+      // 时间同步选 "手动" 时显示日期输入框
+      if (group.dataset.name === 'ntp_enabled') {
+        document.getElementById('manual-time-row').style.display =
+          item.dataset.value === '0' ? 'block' : 'none';
+      }
+    });
+  });
+});
+
+function getChoiceValue(name) {
+  const group = document.querySelector(`.choice-group[data-name="${name}"]`);
+  const active = group?.querySelector('.choice.active');
+  return active ? active.dataset.value : null;
+}
+
+function setChoiceValue(name, value) {
+  const group = document.querySelector(`.choice-group[data-name="${name}"]`);
+  if (!group) return;
+  group.querySelectorAll('.choice').forEach(item => {
+    item.classList.toggle('active', item.dataset.value === String(value));
+  });
+  if (name === 'ntp_enabled') {
+    document.getElementById('manual-time-row').style.display =
+      String(value) === '0' ? 'block' : 'none';
+  }
+}
+
+// ===== 加载状态（启动 + 心跳）=====
+async function loadStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const j = await r.json();
+    currentCfg = j.cfg;
+    document.getElementById('status-version').textContent = 'V' + j.version;
+    document.getElementById('status-clients').textContent = '客户端: ' + j.softap_clients;
+    document.getElementById('status-ssid').textContent =
+      j.wifi.ssid ? ('已存: ' + j.wifi.ssid) : 'SSID: 未配置';
+    // 应用当前配置到 UI
+    document.getElementById('ble-name').value = j.cfg.ble_name || '';
+    setChoiceValue('brightness', j.cfg.brightness);
+    setChoiceValue('dim_timeout', j.cfg.dim_timeout);
+    setChoiceValue('ntp_enabled', j.cfg.ntp_enabled ? 1 : 0);
+  } catch (e) {
+    console.warn('loadStatus failed:', e);
+  }
+}
+
+// ===== WiFi 扫描 =====
+async function doScan() {
+  const btn = document.getElementById('scan-btn');
+  const list = document.getElementById('scan-list');
+  btn.disabled = true;
+  btn.textContent = '扫描中...';
+  list.innerHTML = '<div class="muted" style="text-align:center;padding:12px">扫描中...</div>';
+  try {
+    const r = await fetch('/api/scan');
+    const j = await r.json();
+    if (j.error) {
+      list.innerHTML = '<div class="muted" style="text-align:center;padding:12px;color:var(--red)">扫描失败: ' + j.error + '</div>';
+    } else if (!j.aps || j.aps.length === 0) {
+      list.innerHTML = '<div class="muted" style="text-align:center;padding:12px">未发现 WiFi</div>';
+    } else {
+      list.innerHTML = '';
+      j.aps.sort((a, b) => b.rssi - a.rssi);
+      j.aps.forEach(ap => {
+        const item = document.createElement('div');
+        item.className = 'scan-item';
+        item.innerHTML = `<span class="ssid">${escapeHtml(ap.ssid || '<隐藏>')}</span><span class="rssi">${ap.rssi} dBm</span>`;
+        item.addEventListener('click', () => {
+          list.querySelectorAll('.scan-item').forEach(x => x.classList.remove('selected'));
+          item.classList.add('selected');
+          document.getElementById('wifi-ssid').value = ap.ssid;
+          document.getElementById('wifi-psk').focus();
+        });
+        list.appendChild(item);
+      });
+    }
+  } catch (e) {
+    list.innerHTML = '<div class="muted" style="text-align:center;padding:12px;color:var(--red)">' + e + '</div>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '重新扫描';
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ===== 保存 WiFi =====
+async function submitWifi() {
+  const ssid = document.getElementById('wifi-ssid').value.trim();
+  const psk = document.getElementById('wifi-psk').value;
+  if (!ssid) {
+    showAlert('请输入 WiFi SSID', 'error');
+    return;
+  }
+  const btn = document.getElementById('wifi-btn');
+  btn.disabled = true;
+  btn.textContent = '保存中...';
+  try {
+    const r = await fetch('/api/wifi', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ssid, psk })
+    });
+    const j = await r.json();
+    if (j.ok) {
+      showAlert('WiFi 凭据已保存，ESP32 正在重启连接...', 'success');
+      btn.textContent = '已保存（重启中）';
+    } else {
+      showAlert('保存失败: ' + (j.error || '未知'), 'error');
+      btn.disabled = false;
+      btn.textContent = '保存并连接（重启）';
+    }
+  } catch (e) {
+    showAlert('网络错误: ' + e, 'error');
+    btn.disabled = false;
+    btn.textContent = '保存并连接（重启）';
+  }
+}
+
+// ===== 保存其他配置 =====
+async function submitConfig() {
+  const data = {
+    ble_name: document.getElementById('ble-name').value.trim() || 'elfRadio',
+    brightness: parseInt(getChoiceValue('brightness') || '60'),
+    dim_timeout: parseInt(getChoiceValue('dim_timeout') || '150'),
+    ntp_enabled: getChoiceValue('ntp_enabled') === '1',
+  };
+  // 手动时间（如选了"手动"）
+  if (!data.ntp_enabled) {
+    const t = document.getElementById('manual-time').value;
+    if (t) {
+      // 转成 unix 微秒
+      data.manual_time_us = new Date(t).getTime() * 1000;
+    }
+  }
+  const btn = document.getElementById('config-btn');
+  btn.disabled = true;
+  btn.textContent = '保存中...';
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    const j = await r.json();
+    if (j.ok) {
+      showAlert('配置已保存，ESP32 正在重启应用...', 'success');
+      btn.textContent = '已保存（重启中）';
+    } else {
+      showAlert('保存失败: ' + (j.error || '未知'), 'error');
+      btn.disabled = false;
+      btn.textContent = '保存设置（重启）';
+    }
+  } catch (e) {
+    showAlert('网络错误: ' + e, 'error');
+    btn.disabled = false;
+    btn.textContent = '保存设置（重启）';
+  }
+}
+
+// ===== 退出 SoftAP =====
+async function exitSoftap() {
+  if (!confirm('退出 SoftAP，ESP32 将重启回 STA 模式。继续？')) return;
+  try {
+    const r = await fetch('/api/exit_softap', { method: 'POST' });
+    const j = await r.json();
+    if (j.ok) {
+      showAlert('正在退出 SoftAP，ESP32 重启中...', 'success');
+    } else {
+      showAlert('退出失败: ' + (j.error || '未知'), 'error');
+    }
+  } catch (e) {
+    showAlert('网络错误: ' + e, 'error');
+  }
+}
+
+// ===== 重置 NVS =====
+async function resetNvs() {
+  if (!confirm('⚠️ 警告：将清除所有 WiFi 凭据和配置项，恢复出厂状态！\n\n确认要重置吗？')) return;
+  if (!confirm('再次确认：所有数据将丢失，无法恢复。')) return;
+  try {
+    const r = await fetch('/api/reset', { method: 'POST' });
+    const j = await r.json();
+    if (j.ok) {
+      showAlert('已重置全部 NVS，ESP32 重启中...', 'success');
+    } else {
+      showAlert('重置失败: ' + (j.error || '未知'), 'error');
+    }
+  } catch (e) {
+    showAlert('网络错误: ' + e, 'error');
+  }
+}
+
+// ===== 启动 =====
+loadStatus();
+// 心跳保活：每 60s 调一次 /api/status，更新 LAST_REQUEST_US 避免被 10min watchdog 切掉
+setInterval(loadStatus, 60000);
+</script>
+
+</body>
+</html>

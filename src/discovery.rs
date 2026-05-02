@@ -17,7 +17,7 @@ use esp_idf_svc::sys::*;
 use std::net::UdpSocket;
 
 const PORT: u16 = 4534;
-const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.1.0";  // pub: softap.rs::GET /api/status 复用
 const RIGTYPE: &str = "TH-9800";
 const MAGIC_REQ: &[u8] = b"ELFRADIO?";
 

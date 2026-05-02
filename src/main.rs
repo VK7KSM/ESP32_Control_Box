@@ -19,6 +19,10 @@ mod pc_tcp;
 mod rigctld;
 mod ble;
 mod button;
+mod nvs_cfg;
+mod softap;
+mod dns_server;
+mod web_config;
 
 // 必须显式 extern：esp_idf_svc::sys 通过 wildcard 引入了一个叫 `log` 的 struct，
 // 与 `log` crate 冲突。extern crate log 把 log crate 强制放到 root namespace，
@@ -276,11 +280,12 @@ fn main() {
     render_splash_tiled(&mut fb);
     // 点亮背光（60% 亮度）
     let max_duty = backlight.get_max_duty();
-    // 防烧屏：normal 60%（正常）/ dim 0（PWM duty=0 完全断 LED，效果如断屏电源）
-    let bl_normal: u32 = max_duty * 60 / 100;
+    // 防烧屏：normal=用户配置（默认 60%）/ dim 0（PWM duty=0 完全断 LED，效果如断屏电源）
+    // bl_normal 启动用 60% 默认，加载 NVS cfg 后会重新赋值（mut）
+    let mut bl_normal: u32 = max_duty * 60 / 100;
     let bl_dim: u32 = 0;
     backlight.set_duty(bl_normal).unwrap();
-    ::log::info!("开机画面已显示，背光 60%");
+    ::log::info!("开机画面已显示，背光 60%（待 NVS cfg 加载后调整）");
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
     // ===== 共享状态 =====
@@ -348,11 +353,12 @@ fn main() {
     }
     ::log::info!("GPIO 8 (开关机光耦) 初始化完成");
 
-    // ===== GPIO 2 物理按钮（长按 3 秒触发电台开关机）=====
+    // ===== GPIO 2 物理按钮（长按 3 秒触发电台开关机 / 短按重启 BLE / 双击进退 SoftAP）=====
     button::start_button_thread(shared.clone());
     ::log::info!("[Button] 按钮线程已启动 (CPU 0)");
 
     // ===== PC 通信线程（共口二进制协议，绑 CPU 0：UART 实时通信，与 main loop 同核）=====
+    // SoftAP 模式也保留：用户仍能通过 USB CDC 调试 / 用上位机 PC 配置
     pc_comm::init_pc_comm();
     let state_c = shared.clone();
     let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
@@ -368,22 +374,70 @@ fn main() {
         .expect("PC 通信线程启动失败");
     ::log::info!("PC 通信线程已启动 (CPU 0)");
 
-    // ===== WiFi STA 后台线程 =====
-    wifi::start_wifi_thread(peripherals.modem, shared.clone());
+    // ===== NVS 初始化 + SoftAP 模式判定 + 加载 cfg 到 state（C 功能）=====
+    // 必须在 wifi.rs 之前完成，以决定后续启动哪些线程
+    nvs_cfg::nvs_init_safe();
+    let (is_softap, no_credentials) = nvs_cfg::should_enter_softap();
+    ::log::info!("[启动模式] SoftAP={} no_credentials={}", is_softap, no_credentials);
+
+    // 加载 NVS cfg → state（覆盖 state.rs::new() 默认值）
+    {
+        let mut s = shared.lock().unwrap();
+        if let Some(name) = nvs_cfg::read_string(nvs_cfg::NS_CFG, nvs_cfg::KEY_BLE_NAME, 17) {
+            if !name.is_empty() {
+                s.cfg_ble_name.clear();
+                let _ = s.cfg_ble_name.push_str(name.as_str());
+            }
+        }
+        if let Some(b) = nvs_cfg::read_u8(nvs_cfg::NS_CFG, nvs_cfg::KEY_BRIGHTNESS) {
+            s.cfg_brightness = b;
+        }
+        if let Some(t) = nvs_cfg::read_u16(nvs_cfg::NS_CFG, nvs_cfg::KEY_DIM_TIMEOUT) {
+            s.cfg_dim_timeout_secs = t;
+        }
+        if let Some(n) = nvs_cfg::read_u8(nvs_cfg::NS_CFG, nvs_cfg::KEY_NTP_ENABLED) {
+            s.cfg_ntp_enabled = n != 0;
+        }
+        if let Some(t) = nvs_cfg::read_u64(nvs_cfg::NS_CFG, nvs_cfg::KEY_MANUAL_TIME) {
+            s.cfg_manual_time_us = t;
+        }
+        ::log::info!("[NVS cfg] ble_name=\"{}\" brightness={} dim_timeout={}s ntp={}",
+            s.cfg_ble_name.as_str(), s.cfg_brightness, s.cfg_dim_timeout_secs, s.cfg_ntp_enabled);
+    }
+
+    // 应用 cfg_brightness 到 PWM 背光（覆盖默认 60%）
+    {
+        let cfg_brightness = shared.lock().unwrap().cfg_brightness.max(10).min(100);
+        bl_normal = max_duty * (cfg_brightness as u32) / 100;
+        backlight.set_duty(bl_normal).unwrap();
+        ::log::info!("[屏幕] 应用 cfg 亮度 {}%", cfg_brightness);
+    }
+
+    // ===== WiFi 后台线程（STA 或 SoftAP，由 NVS 决定）=====
+    let softap_param = wifi::SoftApMode { enabled: is_softap, no_credentials };
+    wifi::start_wifi_thread(peripherals.modem, shared.clone(), softap_param);
     ::log::info!("WiFi 线程已启动");
 
-    // ===== LAN 设备发现（UDP 4534）=====
-    discovery::start_discovery_thread(shared.clone());
+    if !is_softap {
+        // ===== STA 模式：启动 LAN / rigctld / BLE 等所有网络服务 =====
+        // ===== LAN 设备发现（UDP 4534）=====
+        discovery::start_discovery_thread(shared.clone());
 
-    // ===== PC 通信 LAN 通道（TCP 4533，CRC16 协议与 USB 字节级一致）=====
-    pc_tcp::start_pc_tcp_thread(shared.clone(), 8);
+        // ===== PC 通信 LAN 通道（TCP 4533，CRC16 协议与 USB 字节级一致）=====
+        pc_tcp::start_pc_tcp_thread(shared.clone(), 8);
 
-    // ===== Hamlib rigctld 文本协议服务器（TCP 4532）+ 频率步进线程 =====
-    rigctld::start_rigctld_thread(shared.clone());
-    rigctld::start_freq_stepper_thread(shared.clone());
+        // ===== Hamlib rigctld 文本协议服务器（TCP 4532）+ 频率步进线程 =====
+        rigctld::start_rigctld_thread(shared.clone());
+        rigctld::start_freq_stepper_thread(shared.clone());
 
-    // ===== BLE 广播（手机 DTrac 直连用）— 阶段 2: GATT + rigctld 透传 =====
-    ble::start_ble_thread(shared.clone());
+        // ===== BLE 广播（手机 DTrac 直连用）— 阶段 2: GATT + rigctld 透传 =====
+        ble::start_ble_thread(shared.clone());
+    } else {
+        // ===== SoftAP 模式：跳过 BLE / rigctld / pc_tcp / discovery 启动 =====
+        // 释放 ~48KB 内部 SRAM 给 HTTP server + DNS hijack（详见 plan 内存图）
+        // softap.rs HTTP server + dns_server.rs UDP hijack 由 wifi.rs::ap_main 启动
+        ::log::info!("[启动模式] SoftAP：跳过 BLE/rigctld/pc_tcp/discovery，仅启动 wifi+softap+dns_server+button+ui+pc_comm");
+    }
 
     // ===== 初始绘制（2 tile 循环刷新，强制全部 dirty 确保完整画面）=====
     fb.invalidate_all();
@@ -426,7 +480,18 @@ fn main() {
     //   - MAIN freq 变化: 用户调台（DTrac/手动）影响主操作侧（心跳只动非 MAIN 侧不会触发）
     //   - S 上升沿 ≥3: 强信号到达瞬间（≥3 是经验值，1-2 视为弱噪声不打扰）
     // S 持续 ≥3 期间暂停 dim 计时（信号期间保持亮屏，避免边沿触发后又被调暗）
-    const DIM_AFTER_TICKS: u32 = 3000;       // 3000 × 50ms = 150s
+    // DIM_AFTER_TICKS 由 NVS cfg_dim_timeout_secs 决定：默认 150s（C4 前硬编码 3000 ticks）
+    // 0 = 禁用（永不熄屏）；其他 = 秒 × 20（50ms tick → 1 秒 = 20 ticks）
+    let dim_after_ticks: u32 = {
+        let s = shared.lock().unwrap();
+        if s.cfg_dim_timeout_secs == 0 {
+            u32::MAX  // 禁用熄屏
+        } else {
+            (s.cfg_dim_timeout_secs as u32).saturating_mul(20)
+        }
+    };
+    ::log::info!("[屏幕] cfg 熄屏超时 = {} ticks ({} 秒)",
+        dim_after_ticks, if dim_after_ticks == u32::MAX { 0 } else { dim_after_ticks / 20 });
     const SIGNAL_WAKE_THRESHOLD: u32 = 3;    // S ≥ 3 视为真实信号
     let mut no_user_activity_ticks: u32 = 0;
     let mut backlight_dimmed: bool = false;
@@ -609,7 +674,7 @@ fn main() {
             } else if !dim_pause {
                 no_user_activity_ticks = no_user_activity_ticks.saturating_add(1);
                 // 用 == 触发：精确 150s 时关 LED 一次，之后 backlight_dimmed 防重入
-                if no_user_activity_ticks == DIM_AFTER_TICKS && !backlight_dimmed {
+                if no_user_activity_ticks == dim_after_ticks && !backlight_dimmed {
                     let _ = backlight.set_duty(bl_dim);
                     backlight_dimmed = true;
                     ::log::info!("[屏幕] 150 秒无用户活动且无信号无 BUSY，关闭背光");

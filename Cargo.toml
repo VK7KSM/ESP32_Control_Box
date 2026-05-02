@@ -30,6 +30,9 @@ embedded-graphics = "0.8"       # 绘图库：画文字、矩形、圆等
 profont = "0.7"                 # 高质量等宽字体 (7pt ~ 24pt)
 heapless = "0.8"               # 嵌入式定长容器（无堆分配）
 esp32-nimble = { path = "vendor/esp32-nimble" }  # BLE 协议栈（vendor 自 0.10.0，修了 ble_error.rs 的 inline_const_pat 不兼容问题）
+embedded-svc = "0.28"           # esp-idf-svc 的 trait 库（HTTP server Headers/Method/io 等）
+serde = { version = "1", features = ["derive"] }  # SoftAP HTTP API JSON 序列化
+serde_json = "1"                # serde_json 序列化/反序列化
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }

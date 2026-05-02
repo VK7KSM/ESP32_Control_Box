@@ -12,6 +12,7 @@
 // ===================================================================
 
 use crate::ble;
+use crate::nvs_cfg;
 use crate::state::{SharedState, StatusMsgColor};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -22,6 +23,8 @@ const POWER_GPIO: i32 = 8;
 const LONG_PRESS_DURATION: Duration = Duration::from_secs(3);
 const SHORT_PRESS_MIN: Duration = Duration::from_millis(50);  // 去抖下限
 const POLL_INTERVAL: Duration = Duration::from_millis(20);  // 50Hz 轮询自带去抖
+/// 双击窗口：第一次释放后多长时间内再次按下算双击（典型用户双击 200~500ms，300ms 兼顾响应速度与误触）
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(300);
 const PULSE_DURATION: Duration = Duration::from_millis(1200);  // GPIO 8 脉冲（沿用 pc_comm.rs 1.2s）
 const POST_PULSE_WAIT: Duration = Duration::from_millis(1500);  // 等电台真正完成关机
 const PROBE_GAP: Duration = Duration::from_millis(600);  // 单帧注入到响应到达
@@ -98,16 +101,71 @@ fn button_main(state: SharedState) {
     let mut press_start: Option<Instant> = None;
     let mut already_triggered_long = false;  // 避免按住不放期间重复触发长按
     let mut last_countdown_secs: u64 = 0;    // 长按倒计时已显示到第几秒（1/2/3，0=未显示）
+    // 双击检测状态：上次释放时刻 + duration（用于第二次按下时计算窗口）
+    let mut last_release_time: Option<Instant> = None;
+    let mut last_release_was_short_press: bool = false; // 上次释放是合法短按（>=50ms 且 <3s 且非长按已触发）
 
     loop {
         let pressed = unsafe { gpio_get_level(BUTTON_GPIO) } == 0;
         let now = Instant::now();
 
+        // 双击窗口超时检查：上次合法短按释放后超过 DOUBLE_CLICK_WINDOW 仍未二次按下 → 执行短按动作
+        // （此时确认为单按，可触发"唤醒屏幕 + 重启 BLE 广播"）
+        if last_release_was_short_press {
+            if let Some(t) = last_release_time {
+                if now.duration_since(t) > DOUBLE_CLICK_WINDOW {
+                    ::log::info!("[Button] 短按确认（无后续双击）→ 唤醒屏幕 + 重启 BLE 广播");
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.head_count = s.head_count.wrapping_add(1);
+                    }
+                    ble::request_advertising_restart();
+                    last_release_was_short_press = false;
+                    last_release_time = None;
+                }
+            }
+        }
+
         match (pressed, press_start) {
             (true, None) => {
+                // 检查是否双击：上次释放是合法短按 + 在 DOUBLE_CLICK_WINDOW 内再次按下
+                let is_double_click = last_release_was_short_press
+                    && last_release_time
+                        .map(|t| now.duration_since(t) <= DOUBLE_CLICK_WINDOW)
+                        .unwrap_or(false);
+
+                if is_double_click {
+                    // === 双击：检查 SoftAP 状态决定进入或退出 ===
+                    let in_softap = state.lock().map(|s| s.softap_active).unwrap_or(false);
+                    let switch_msg: &str;
+                    if in_softap {
+                        ::log::info!("[Button] 双击（SoftAP 模式）→ 清 boot_mode + 重启回 STA");
+                        match nvs_cfg::erase_boot_mode() {
+                            Ok(_) => ::log::info!("[Button] erase_boot_mode 成功"),
+                            Err(e) => ::log::error!("[Button] erase_boot_mode 失败: {}", e),
+                        }
+                        switch_msg = "-> STA";
+                    } else {
+                        ::log::info!("[Button] 双击（STA 模式）→ 写 boot_mode=softap + 重启进 SoftAP");
+                        match nvs_cfg::write_boot_mode_softap() {
+                            Ok(_) => ::log::info!("[Button] write_boot_mode_softap 成功"),
+                            Err(e) => ::log::error!("[Button] write_boot_mode_softap 失败: {}", e),
+                        }
+                        switch_msg = "-> SoftAP";
+                    }
+                    // 屏幕显示"切换中"提示，避免用户以为是崩溃（双击 esp_restart 是预期行为）
+                    // sleep 1s 让用户看清提示文字（主循环 50ms tick + 200ms redraw 节流，1s 内会重绘 4-5 次）
+                    set_status(&state, switch_msg, StatusMsgColor::Amber, 0);
+                    std::thread::sleep(Duration::from_millis(1000));
+                    unsafe { esp_restart(); }
+                }
+
                 press_start = Some(now);
                 already_triggered_long = false;
                 last_countdown_secs = 0;
+                // 双击检测后清除标志（避免连击 3+ 次）
+                last_release_was_short_press = false;
+                last_release_time = None;
             }
             (true, Some(start)) if !already_triggered_long && now - start >= LONG_PRESS_DURATION => {
                 // 长按 3 秒触发（每次按下只触发一次）
@@ -151,19 +209,22 @@ fn button_main(state: SharedState) {
             (false, Some(start)) => {
                 // 释放：分类短按 vs 已触发的长按
                 let duration = now - start;
-                if !already_triggered_long
+                let is_short_press = !already_triggered_long
                     && duration >= SHORT_PRESS_MIN
-                    && duration < LONG_PRESS_DURATION
-                {
-                    // === 短按：唤醒屏幕 + 重启 BLE 广播 ===
-                    ::log::info!("[Button] 短按 ({} ms) → 唤醒屏幕 + 重启 BLE 广播",
-                        duration.as_millis());
-                    {
-                        let mut s = state.lock().unwrap();
-                        s.head_count = s.head_count.wrapping_add(1);
-                    }
-                    ble::request_advertising_restart();
+                    && duration < LONG_PRESS_DURATION;
+
+                if is_short_press {
+                    // 注意：短按"动作"（唤醒+BLE 重启）不在这里执行，留到下面双击窗口超时后再决定
+                    // 这是因为本次释放可能是双击的第一次释放，需等 DOUBLE_CLICK_WINDOW 内是否第二次按下
+                    // 记录释放时刻供双击检测
+                    last_release_time = Some(now);
+                    last_release_was_short_press = true;
+                } else {
+                    // 长按已触发 / 抖动（< 50ms） → 清双击状态，避免与之前合法短按形成误判
+                    last_release_was_short_press = false;
+                    last_release_time = None;
                 }
+
                 // 释放后清除可能残留的倒计时显示（< 1s 短按时 last_countdown_secs=0 跳过；
                 // 长按已触发时 worker 接管 status_msg，无需此处清除）
                 if last_countdown_secs > 0 && !already_triggered_long {

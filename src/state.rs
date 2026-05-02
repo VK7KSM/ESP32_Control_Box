@@ -241,9 +241,15 @@ pub struct RadioState {
     // ===== BLE 连接状态（手机 DTrac 直连用）=====
     pub ble_advertising: bool,      // 当前是否在 BLE 广播
     pub ble_clients: u32,           // 当前 BLE 客户端连接数（GATT 已连接）
-    // ===== SoftAP 状态（C 功能未来落地，本期 stub 永远 false/0）=====
+    // ===== SoftAP 状态（C 功能落地：wifi.rs::ap_main 设置）=====
     pub softap_active: bool,        // SoftAP 模式启动中（影响 WiFi 图标橙/蓝 + 底栏 IP 显示）
     pub softap_clients: u32,        // 连接到 SoftAP 的客户端数（影响底栏 IP 颜色橙/蓝）
+    // ===== NVS 配置项（C 功能 main.rs 启动时从 nvs_cfg 加载）=====
+    pub cfg_ble_name: heapless::String<16>,    // BLE 设备名（默认 "elfRadio"）
+    pub cfg_brightness: u8,                    // 屏幕亮度 30/60/100（默认 60）
+    pub cfg_dim_timeout_secs: u16,             // 防烧屏熄屏超时秒（60/150/300/600，0=禁用，默认 150）
+    pub cfg_ntp_enabled: bool,                 // NTP 自动同步开关（默认 true，NTP 暂未实现）
+    pub cfg_manual_time_us: u64,               // 手动设置时间（unix 微秒，仅 ntp_enabled=false 用）
     // ===== rigctld 连接状态 =====
     pub rigctld_clients: u32,       // 当前活跃 rigctld 客户端数（>0 → IP 显示橙色）
     pub rigctld_ctcss_tone: u32,    // 最后设置的 CTCSS 频率（0.1 Hz 单位，0=OFF）
@@ -345,6 +351,15 @@ impl RadioState {
             ble_clients: 0,
             softap_active: false,
             softap_clients: 0,
+            cfg_ble_name: {
+                let mut s: heapless::String<16> = heapless::String::new();
+                let _ = s.push_str("elfRadio");
+                s
+            },
+            cfg_brightness: 60,
+            cfg_dim_timeout_secs: 150,
+            cfg_ntp_enabled: true,
+            cfg_manual_time_us: 0,
             rigctld_clients: 0,
             rigctld_ctcss_tone: 0,
             rigctld_initial_freq_done: false,

@@ -37,8 +37,8 @@ pub fn request_advertising_restart() {
     SHOULD_RESTART_ADV.store(true, Ordering::Relaxed);
 }
 
-/// BLE 设备名（用户在 SoftAP 网页可改，当前固定为 elfRadio）
-const BLE_DEVICE_NAME: &str = "elfRadio";
+/// BLE 设备名默认值（用户在 SoftAP 网页可改，启动时从 state.cfg_ble_name 读取）
+const BLE_DEVICE_NAME_DEFAULT: &str = "elfRadio";
 
 /// GATT Service UUID（DTrac 兼容，BLE 模块通用 Nordic UART 风格）
 const SERVICE_UUID: u16 = 0xFFF0;
@@ -278,12 +278,23 @@ fn ble_main(state: SharedState) {
     });
 
     // 广播配置：设备名 + Service UUID 0xFFF0
+    // 设备名从 state.cfg_ble_name 读取（C4：网页可配置；空或未设置时用默认 BLE_DEVICE_NAME_DEFAULT）
+    let device_name: heapless::String<16> = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.cfg_ble_name.is_empty() {
+            let mut d: heapless::String<16> = heapless::String::new();
+            let _ = d.push_str(BLE_DEVICE_NAME_DEFAULT);
+            d
+        } else {
+            s.cfg_ble_name.clone()
+        }
+    };
     let advertising = device.get_advertising();
     {
         let mut adv = advertising.lock();
         if let Err(e) = adv.set_data(
             BLEAdvertisementData::new()
-                .name(BLE_DEVICE_NAME)
+                .name(device_name.as_str())
                 .add_service_uuid(BleUuid::Uuid16(SERVICE_UUID)),
         ) {
             ::log::warn!("[BLE] 设置广播数据失败: {:?}", e);
@@ -294,7 +305,7 @@ fn ble_main(state: SharedState) {
         "[BLE] GATT 服务就绪: Service=0x{:04X} Write=0x{:04X} Notify=0x{:04X}",
         SERVICE_UUID, WRITE_CHAR_UUID, NOTIFY_CHAR_UUID
     );
-    ::log::info!("[BLE] 设备名 '{}'，开始广播 (5 分钟超时)", BLE_DEVICE_NAME);
+    ::log::info!("[BLE] 设备名 '{}'，开始广播 (5 分钟超时)", device_name.as_str());
 
     // 主循环：广播 5 分钟 → 关闭 → 等待外部触发重启
     loop {
