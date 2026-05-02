@@ -141,6 +141,11 @@ where D::Error: core::fmt::Debug,
 //
 // `softap_active` / `softap_clients` 本期由 state.rs 默认 false/0，C 功能落地后由
 // wifi.rs 切到 SoftAP 模式时设置；UI 自动切换 WiFi 图标颜色 + 底栏 IP 显示。
+//
+// `rigctld_clients`：仅 WiFi/TCP rigctld 客户端数（排除 BLE），用于底栏 IP 颜色（橙色 = TCP 客户端连接）
+// `rigctld_clients_total`：所有 rigctld 客户端（含 BLE）数，用于 Radio 状态显示
+//   - rigctld_clients_total > 0 时心跳被关 → Radio 显示灰色 "Radio --"（视觉表达"心跳停，状态由客户端代理"）
+//   - 区别于 wifi_tcp_clients：BLE 也算 rigctld 客户端，但不影响 IP 颜色
 pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
     display: &mut D,
     left: &BandState,
@@ -156,6 +161,7 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
     ble_clients: u32,
     softap_active: bool,
     softap_clients: u32,
+    rigctld_clients_total: u32,
 ) where D::Error: core::fmt::Debug,
 {
     display.clear(BG).unwrap();
@@ -238,8 +244,11 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
             .draw(display).unwrap();
     }
 
-    // Radio 状态
-    if radio_alive {
+    // Radio 状态：rigctld 客户端（BLE/TCP 任一）连接期间显示灰色 "Radio --"
+    // 视觉语义：客户端连接 → 心跳已关（uart.rs:371 由 rigctld_clients>0 门控）→ ESP32 不再主动检测电台
+    //          → Radio 状态由客户端代理（DTrac 自己感知电台），ESP32 屏不再表达 OK
+    // alive 字段语义不动（仍服务 BLE 初始化 Guard2 / inject_menu_set 等内部判断）
+    if radio_alive && rigctld_clients_total == 0 {
         Text::with_alignment("Radio OK", Point::new(234, 314),
             MonoTextStyleBuilder::new().font(&PROFONT_12_POINT).text_color(AMBER).build(),
             Alignment::Right).draw(display).unwrap();

@@ -115,6 +115,7 @@ fn render_tiled<F: FnMut(&mut framebuf::FrameBuf)>(fb: &mut framebuf::FrameBuf, 
 ///   - BT 图标：`ble_clients > 0` → 橙色，否则蓝色
 /// `ble_advertising` 当前未参与图标渲染（保留参数避免再改签名）
 /// 底栏 IP：`softap_active` → 显示 192.168.4.1（softap_clients>0 橙否则蓝），否则按 wifi_state 走 STA 路径
+/// 底栏 Radio：`rigctld_clients_total > 0` → 灰色 "Radio --"（任何 rigctld 客户端连接期间，含 BLE+TCP）
 fn render_main_ui_tiled(
     fb: &mut framebuf::FrameBuf,
     left: &state::BandState,
@@ -130,11 +131,12 @@ fn render_main_ui_tiled(
     ble_clients: u32,
     softap_active: bool,
     softap_clients: u32,
+    rigctld_clients_total: u32,
 ) {
     render_tiled(fb, |fb| {
         ui::draw_main_ui(fb, left, right, radio_alive, pc_alive, wifi_state, wifi_ip, wifi_tcp_clients,
             status_msg, status_msg_color, ble_advertising, ble_clients,
-            softap_active, softap_clients);
+            softap_active, softap_clients, rigctld_clients_total);
     });
 }
 
@@ -390,6 +392,7 @@ fn main() {
         // tcp_only：仅 WiFi/TCP rigctld 客户端数（排除 BLE）。BLE 客户端虽计入
         // rigctld_clients 用于触发 freq_stepper setup，但 IP 颜色应仅反映 LAN 活动
         let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
+        let rc_total = s.rigctld_clients;
         let (left, right, alive, pc, ws, ip, smsg, scolor, ble_adv, ble_n, sap_a, sap_n) = (
             s.left.clone(), s.right.clone(),
             s.radio_alive, s.pc_alive,
@@ -400,7 +403,7 @@ fn main() {
         );
         drop(s);
         render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only,
-            smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n);
+            smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total);
     }
 
     // ===== 主循环: 双缓冲 + DMA 异步 =====
@@ -433,6 +436,16 @@ fn main() {
     let mut last_max_s_level: u32 = 0;
     let mut last_left_busy: bool = false;
     let mut last_right_busy: bool = false;
+
+    // ===== 启动宽限期 + 自动开机（Bug 1 修复）=====
+    // 通电 ESP32 时若电台未开机，radio_alive=false 默认；不能立即关屏装死。
+    // 给电台开机后"主动发首帧"留 8 秒窗口（电台启动 2-5s + 首帧到达 ~1s + 安全余量）。
+    // 8s 内屏幕保持亮等待 radio_alive 自然变 true（每收到下行帧 protocol.rs:145 置 true）。
+    // 8s 后仍 false → 自动 spawn power_toggle_worker(true)：发 GPIO 8 脉冲启动电台 → 电台首帧 → alive=true。
+    // 仅触发 1 次（auto_boot_attempted），避免循环故障；硬件故障时 30s "Radio On FAIL" 红字提示。
+    let boot_us = unsafe { esp_timer_get_time() } as u64;
+    const BOOT_GRACE_US: u64 = 8_000_000; // 启动 8 秒宽限期
+    let mut auto_boot_attempted: bool = false;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -483,17 +496,41 @@ fn main() {
             let power_toggling = button::POWER_TOGGLE_IN_PROGRESS
                 .load(std::sync::atomic::Ordering::Relaxed);
 
+            // 启动宽限期判定：8 秒内不关屏 + 8 秒后 alive=false 自动开机
+            let since_boot_us = now_us.saturating_sub(boot_us);
+            let in_boot_grace = since_boot_us < BOOT_GRACE_US;
+
+            // 启动 8s 后仍 alive=false → 自动 spawn 开机流程（仅一次）
+            // 不在 power_toggling 期间触发（避免与手动长按或本次自动重复）
+            if !s.radio_alive && !auto_boot_attempted && !in_boot_grace && !power_toggling {
+                auto_boot_attempted = true;
+                drop(s);
+                ::log::info!("[自动开机] 启动 {}s 后未收到电台下行帧，触发自动开机流程",
+                    BOOT_GRACE_US / 1_000_000);
+                if button::try_acquire_power_lock() {
+                    let st = shared.clone();
+                    std::thread::spawn(move || {
+                        button::power_toggle_worker(st, true);  // is_auto=true，fail 显示 30s
+                        button::release_power_lock();
+                    });
+                } else {
+                    ::log::warn!("[自动开机] 已有 PowerToggle 进行中，跳过自动开机");
+                }
+                continue;  // 让下次循环处理新状态（power_toggling 已 true）
+            }
+
             // 电台离线 → 强制关背光（覆盖 user_activity 唤醒）
-            // 例外：power_toggling=true 时允许唤醒（让用户长按时屏幕亮起反馈）
-            if !s.radio_alive && !backlight_dimmed && !power_toggling {
+            // 例外 1：power_toggling=true 时允许唤醒（让用户长按/自动开机时屏幕亮起反馈）
+            // 例外 2：in_boot_grace（启动 8s 内）保持亮屏，等电台开机后下行帧自然到达
+            if !s.radio_alive && !backlight_dimmed && !power_toggling && !in_boot_grace {
                 let _ = backlight.set_duty(bl_dim);
                 backlight_dimmed = true;
                 ::log::info!("[屏幕] 电台离线，关闭背光");
             }
 
             // 用户活动 → 立即恢复背光（独立于 can_redraw 节流）
-            // 仅在电台 alive 或 power_toggling 时唤醒；否则即使有活动也保持关屏
-            if user_activity && backlight_dimmed && (s.radio_alive || power_toggling) {
+            // 唤醒条件：alive 或 power_toggling 或 in_boot_grace；否则即使有活动也保持关屏
+            if user_activity && backlight_dimmed && (s.radio_alive || power_toggling || in_boot_grace) {
                 let _ = backlight.set_duty(bl_normal);
                 backlight_dimmed = false;
                 ::log::info!("[屏幕] 检测到活动，背光恢复 60%");
@@ -524,6 +561,7 @@ fn main() {
                 no_data_ticks = 0;
                 // tcp_only：仅 WiFi/TCP 客户端，排除 BLE（BLE 用 GATT 不用 IP）
                 let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
+                let rc_total = s.rigctld_clients;
                 let (left, right, alive, pc, ws, ip, smsg, scolor, ble_adv, ble_n, sap_a, sap_n) = (
                     s.left.clone(), s.right.clone(),
                     s.radio_alive, s.pc_alive,
@@ -534,7 +572,7 @@ fn main() {
                 );
                 drop(s);
                 render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only,
-                    smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n);
+                    smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total);
                 last_redraw_us = now_us;
             } else if !any_change {
                 no_data_ticks += 1;
@@ -548,6 +586,7 @@ fn main() {
                 if no_data_ticks == 300 && s.rigctld_clients == 0 {  // 300 × 50ms = 15s
                     s.radio_alive = false;
                     let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
+                    let rc_total = s.rigctld_clients;
                     let (left, right, pc, ws, ip, smsg, scolor, ble_adv, ble_n, sap_a, sap_n) = (
                         s.left.clone(), s.right.clone(), s.pc_alive,
                         s.wifi_state.clone(), s.wifi_ip.clone(),
@@ -557,7 +596,7 @@ fn main() {
                     );
                     drop(s);
                     render_main_ui_tiled(&mut fb, &left, &right, false, pc, &ws, ip.as_str(), tcp_only,
-                        smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n);
+                        smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total);
                 }
             }
 

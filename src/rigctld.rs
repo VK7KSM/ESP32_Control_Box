@@ -593,8 +593,8 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
                         }
                     }
                     let now_us = unsafe { esp_timer_get_time() } as u64;
-                    if now_us.saturating_sub(last_line_us) >= 10_000_000 {
-                        log::info!("[Rigctld] 10s 无命令，关闭空闲 client (read_timeout/无 DTrac F/I/S)，handler_session={:?}", handler_session_id);
+                    if now_us.saturating_sub(last_line_us) >= 60_000_000 {
+                        log::info!("[Rigctld] 60s 无命令，关闭空闲 client (read_timeout/无 DTrac F/I/S)，handler_session={:?}", handler_session_id);
                         return handler_session_id;
                     }
                     continue;
@@ -950,7 +950,7 @@ fn bind_sat_session(s: &mut RadioState, rx_is_left: bool) {
     log::info!("[SatSession #{}] 绑定本次 DTrac 会话: RX={} TX={}（连接时 MAIN 作为 RX）", s.rigctld_session_id, side_name(rx_is_left), side_name(tx_is_left));
 }
 
-fn clear_sat_session(s: &mut RadioState) {
+pub fn clear_sat_session(s: &mut RadioState) {
     let session_id = s.rigctld_session_id;
     reset_sat_setup_state(s);
     s.rigctld_sat_active = false;

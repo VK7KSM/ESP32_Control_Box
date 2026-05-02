@@ -125,7 +125,7 @@ fn button_main(state: SharedState) {
                     }
                     let st = state.clone();
                     std::thread::spawn(move || {
-                        power_toggle_worker(st);
+                        power_toggle_worker(st, false);  // 手动长按，fail 显示 5s
                         release_power_lock();
                     });
                 }
@@ -214,7 +214,10 @@ fn probe_radio_alive(state: &SharedState) -> bool {
 /// 电源切换 worker
 /// 关机检测（was_alive=true）：1.5s 等待 + 主动探针 3 次 → 5s 内确认
 /// 开机检测（was_alive=false）：等 ≤8s 看 body_count++（电台启动发首帧）
-fn power_toggle_worker(state: SharedState) {
+///
+/// `is_auto`：true = 由 main.rs 启动宽限期触发的自动开机（失败显示 30s 让用户有时间看清）；
+///            false = 用户长按按钮触发的手动开关机（失败显示 5s）
+pub fn power_toggle_worker(state: SharedState, is_auto: bool) {
     let (was_alive, body_before) = {
         let s = state.lock().unwrap();
         (s.radio_alive, s.body_count)
@@ -298,7 +301,10 @@ fn power_toggle_worker(state: SharedState) {
         }
     }
     ::log::error!("[PowerToggle] 共 {} 次尝试后仍无法确认状态变化（硬件故障？）", MAX_ATTEMPTS);
-    // 全部失败 → 按 v4 计划显示红字（关机/开机分别为 Radio Off FAIL / Radio On FAIL），5 秒后自动清除
+    // 全部失败 → 显示红字（关机/开机分别为 Radio Off FAIL / Radio On FAIL）
+    // 自动开机（is_auto=true）失败显示 30s（让用户有时间看到错误信息）
+    // 手动长按（is_auto=false）失败显示 5s（用户主动操作时通常已盯着屏幕）
     let fail_text: &str = if was_alive { "Radio Off FAIL" } else { "Radio On FAIL" };
-    set_status(&state, fail_text, StatusMsgColor::Red, 5000);
+    let fail_duration_ms: u64 = if is_auto { 30000 } else { 5000 };
+    set_status(&state, fail_text, StatusMsgColor::Red, fail_duration_ms);
 }

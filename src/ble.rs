@@ -13,8 +13,8 @@
 // ===================================================================
 
 use crate::rigctld::{
-    begin_sat_session, capture_rx_side, command_name, dispatch, handler_session_is_current,
-    is_stateful_dtrac_command, DispatchOut,
+    begin_sat_session, capture_rx_side, clear_sat_session, command_name, dispatch,
+    handler_session_is_current, is_stateful_dtrac_command, DispatchOut,
 };
 use crate::state::SharedState;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -125,8 +125,14 @@ fn ble_main(state: SharedState) {
             let recv_data = args.recv_data();
             let mut buf = buffer.lock().unwrap_or_else(|e| e.into_inner());
             if buf.len() + recv_data.len() > LINE_BUFFER_MAX {
-                ::log::warn!("[BLE] 行缓冲溢出，清空（异常客户端？）");
+                // 溢出：清缓冲 + 丢弃当前 recv_data（避免立即再次溢出 / 死循环）
+                // 等下一行完整数据到达再恢复正常处理
+                ::log::warn!(
+                    "[BLE] 行缓冲溢出（buf={} + recv={} > {}），清空并丢弃当前包",
+                    buf.len(), recv_data.len(), LINE_BUFFER_MAX
+                );
                 buf.clear();
+                return;
             }
             buf.extend_from_slice(recv_data);
 
@@ -188,9 +194,21 @@ fn ble_main(state: SharedState) {
                     continue;
                 }
                 // 通过 Notify 发回响应（按 MTU 切片）
+                // 分片间检查 ble_clients > 0：客户端断开时 break，避免 NimBLE 内部 spam
+                // notify error 日志（节省 CPU 和日志带宽）
                 let reply_bytes = reply.as_bytes();
                 let mut offset = 0;
                 while offset < reply_bytes.len() {
+                    // 每分片前检查客户端是否还在
+                    let still_connected = {
+                        let s = state_w.lock().unwrap_or_else(|e| e.into_inner());
+                        s.ble_clients > 0
+                    };
+                    if !still_connected {
+                        ::log::info!("[BLE] 响应分片中客户端已断开，丢弃剩余 {} 字节",
+                            reply_bytes.len() - offset);
+                        break;
+                    }
                     let end = (offset + NOTIFY_CHUNK_SIZE).min(reply_bytes.len());
                     notify.lock().set_value(&reply_bytes[offset..end]).notify();
                     offset = end;
@@ -231,11 +249,28 @@ fn ble_main(state: SharedState) {
     let session_disc = handler_session_id.clone();
     server.on_disconnect(move |conn_desc, reason| {
         ::log::info!("[BLE] 客户端断开: addr={:?} reason={:?}", conn_desc.address(), reason);
+
+        // 先取本 handler 的 session_id 副本，再持有 state 锁（避免锁顺序问题）
+        let was_session = *session_disc.lock().unwrap_or_else(|e| e.into_inner());
+
         let mut s = state_disc.lock().unwrap_or_else(|e| e.into_inner());
         s.ble_clients = s.ble_clients.saturating_sub(1);
         s.rigctld_clients = s.rigctld_clients.saturating_sub(1); // 配套递减
         s.head_count = s.head_count.wrapping_add(1);
+
+        // === 完整清理（与 TCP rigctld.rs:522-536 对齐）===
+        // clear_sat_session 是纯字段操作（无 sleep / 网络 / UART），可在 NimBLE host task callback 中安全执行。
+        // 副作用：设 sql_close_pending + tone_off_pending → freq_stepper 在 rigctld_clients=0 时
+        // 跑 maintenance 注入帧 → TH-9800 回应下行帧 → radio_alive 持续 true → 屏幕不会被 15s 超时关掉。
+        s.ptt_override = false;
+        s.rigctld_target_hz = None;
+        s.rigctld_setup_running = false;
+        // BLE 单连接（sdkconfig MAX_CONNECTIONS=1）：handler_session 存在或全断开时都做完整 sat 清理
+        if was_session.is_some() || s.rigctld_clients == 0 {
+            clear_sat_session(&mut s);
+        }
         drop(s);
+
         buffer_disc.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *session_disc.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // 设信号让主循环异步重启广播，不阻塞 NimBLE host task
