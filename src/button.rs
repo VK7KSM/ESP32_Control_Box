@@ -246,7 +246,7 @@ fn button_main(state: SharedState) {
 /// 返回 true = 电台仍活着（响应了），false = 电台无响应
 /// 复用 s.knob_inject 现有机制（uart.rs::relay_up_thread 既有支持）
 /// 单次调用 ~1.2 秒（CW 600ms + CCW 600ms）
-fn probe_radio_alive(state: &SharedState) -> bool {
+pub fn probe_radio_alive(state: &SharedState) -> bool {
     // 选非 MAIN 侧（与心跳设计一致，避免干扰主操作侧）
     let (use_right, body_before) = {
         let s = state.lock().unwrap();

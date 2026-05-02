@@ -565,17 +565,32 @@ fn main() {
             let since_boot_us = now_us.saturating_sub(boot_us);
             let in_boot_grace = since_boot_us < BOOT_GRACE_US;
 
-            // 启动 8s 后仍 alive=false → 自动 spawn 开机流程（仅一次）
+            // 启动 8s 后仍 alive=false → 先发主动探针，电台若已开机会响应（跳过脉冲）
+            // 否则才发开机脉冲。避免"电台已开机但静默"被误判为关机后被脉冲关掉
             // 不在 power_toggling 期间触发（避免与手动长按或本次自动重复）
             if !s.radio_alive && !auto_boot_attempted && !in_boot_grace && !power_toggling {
                 auto_boot_attempted = true;
                 drop(s);
-                ::log::info!("[自动开机] 启动 {}s 后未收到电台下行帧，触发自动开机流程",
-                    BOOT_GRACE_US / 1_000_000);
                 if button::try_acquire_power_lock() {
                     let st = shared.clone();
                     std::thread::spawn(move || {
-                        button::power_toggle_worker(st, true);  // is_auto=true，fail 显示 30s
+                        ::log::info!("[自动开机] 启动 {}s 后未收到下行帧，先发主动探针确认电台是否真的关机",
+                            BOOT_GRACE_US / 1_000_000);
+                        let mut radio_responded = false;
+                        for probe_attempt in 0..3u8 {
+                            if button::probe_radio_alive(&st) {
+                                radio_responded = true;
+                                ::log::info!("[自动开机] 探针 {}/3 有响应，电台已开机，跳过自动开机脉冲",
+                                    probe_attempt + 1);
+                                break;
+                            }
+                            ::log::info!("[自动开机] 探针 {}/3 无响应", probe_attempt + 1);
+                        }
+                        if !radio_responded {
+                            ::log::info!("[自动开机] 3 次探针均无响应，电台真的关机，触发自动开机脉冲");
+                            button::power_toggle_worker(st, true);  // is_auto=true，FAIL 显示 30s
+                        }
+                        // 探针响应：响应帧已让 protocol.rs 设 radio_alive=true，无需额外动作
                         button::release_power_lock();
                     });
                 } else {
