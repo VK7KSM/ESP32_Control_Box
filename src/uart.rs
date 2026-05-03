@@ -345,15 +345,61 @@ pub fn relay_up_thread(
                         state.lock().unwrap().main_probed = true; // 立即标记防重入
                         log::info!("[MAIN探测] MAIN 位置未知，发送 P1 键触发 CmdID=0x14");
 
-                        // P1 按下
+                        // ===== Step 1: P1 按下 → 电台回发 CmdID=0x14（标记新 MAIN）+ 新 MAIN 侧 freq 帧 =====
                         let _ = uart_host.write(&build_key_frame(0x10));
                         std::thread::sleep(std::time::Duration::from_millis(200));
                         // P1 松开（空闲帧）
                         let _ = uart_host.write(&build_knob_frame(0xFF));
                         std::thread::sleep(std::time::Duration::from_millis(350));
-                        // TH-9800 已发送 CmdID=0x14，SharedState.is_main 已更新
-                        log::info!("[MAIN探测] 完成，等待 STATE_REPORT 同步到上位机");
-                        // 跳过本次心跳，下次 100 ticks 后恢复
+                        // 此时 SharedState.is_main 已更新，且新 MAIN 侧 freq 已缓存
+                        // 但**另一侧**（原 MAIN 现非 MAIN）的 freq 仍是 default → ESP32 屏幕只显示一侧
+                        log::info!("[MAIN探测] P1 完成，CmdID=0x14 + 新 MAIN 侧 freq 已缓存");
+
+                        // ===== Step 2: 向 MAIN 侧注入 CW+CCW（净零步进）触发 MAIN 侧再发一帧 freq =====
+                        // 配合现有心跳逻辑：心跳只步进非 MAIN 侧（避免干扰用户 MAIN 操作）
+                        // 但启动时为缓存两侧 freq，必须主动让 MAIN 侧也发一帧
+                        // CW+CCW 净零步进，电台 LCD 上 MAIN 频率值短暂闪一下后回原值，无副作用
+                        // 注意：必须读已被 P1 触发更新的 is_main 字段，所以这里不能在 lock 内同步等待
+                        let main_is_right = {
+                            let s = state.lock().unwrap();
+                            if s.left.is_main {
+                                Some(false)  // LEFT=MAIN → 步进 LEFT
+                            } else if s.right.is_main {
+                                Some(true)   // RIGHT=MAIN → 步进 RIGHT
+                            } else {
+                                None  // 极端：P1 注入后 0x14 仍未解析（可能下行 UART 拥塞），跳过
+                            }
+                        };
+
+                        if let Some(use_right) = main_is_right {
+                            let (cw_step, ccw_step) = if use_right {
+                                (0x82u8, 0x81u8)
+                            } else {
+                                (0x02u8, 0x01u8)
+                            };
+                            let cw_frame   = build_knob_frame(cw_step);
+                            let ccw_frame  = build_knob_frame(ccw_step);
+                            let idle_frame = build_knob_frame(0xFF);
+
+                            log::info!("[MAIN探测] 追加注入 MAIN={} 侧 CW+CCW，触发该侧 freq 帧",
+                                if use_right { "RIGHT" } else { "LEFT" });
+
+                            // 时序参考下方正常心跳：idle→100ms→CW→150ms→CCW→50ms→idle
+                            // 不发 S-meter 闪烁帧（启动探测期间无需视觉反馈）
+                            let _ = uart_host.write(&idle_frame);
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            let _ = uart_host.write(&cw_frame);
+                            std::thread::sleep(std::time::Duration::from_millis(150));
+                            let _ = uart_host.write(&ccw_frame);
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            let _ = uart_host.write(&idle_frame);
+
+                            log::info!("[MAIN探测] 完成两侧频率刷新");
+                        } else {
+                            log::warn!("[MAIN探测] P1 后 is_main 仍未识别，跳过 MAIN 侧步进（屏幕暂只显示一侧）");
+                        }
+
+                        // 跳过本次心跳剩余流程，下次 100 ticks 后恢复正常心跳
                         continue;
                     }
 
