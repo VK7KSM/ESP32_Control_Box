@@ -551,18 +551,26 @@ fn main() {
     // 未同步时 synced=false → 不触发，屏幕静态显示 "--:--:--" 省 CPU
     let mut last_displayed_sec: i64 = -1;
 
+    // Fix 4a：跟踪 radio_alive 边沿（false→true）
+    // 触发场景：电台外部 power-cycle 后帧到达使 alive 转 true，若有 sat_active session 则需 invalidate
+    let mut last_radio_alive: bool = false;
+
+    // Fix A：跟踪 alive 转 false 的时刻，给用户 5 秒看到 "Radio --" 后才允许 force-dim
+    // 0 表示当前 alive=true 或未记录；非 0 表示 alive=false 且记录了转变时间
+    let mut radio_offline_since_us: u64 = 0;
+    /// alive 转 false 后多久才允许强制关背光（让用户看清 Radio -- 状态）
+    const RADIO_OFFLINE_GRACE_US: u64 = 5_000_000;  // 5s
+
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let now_us = unsafe { esp_timer_get_time() } as u64;
         let can_redraw = now_us.saturating_sub(last_redraw_us) >= MIN_REDRAW_INTERVAL_US;
 
         // 时钟 tick 检测：每 50ms 取 unix 秒（gettimeofday 不需要锁）
-        // 仅 last_ntp_sync_us != 0 时认为 synced；secs 变化才触发
+        // Fix C-2：始终触发（去掉 synced 守护），让未同步的 wall clock 也每秒刷新
+        // current_clock 内部按 last_ntp_sync_us 决定显示颜色（Gray=未同步 / Orange=已同步）
         let cur_unix_sec = timesync::current_unix_sec();
-        let synced_for_clock = shared.try_lock()
-            .map(|s| s.last_ntp_sync_us != 0)
-            .unwrap_or(false);
-        let clock_tick = synced_for_clock && cur_unix_sec != last_displayed_sec;
+        let clock_tick = cur_unix_sec != last_displayed_sec;
 
         if let Ok(mut s) = shared.try_lock() {
             // 顶栏 status_msg 自动过期清理（如 "Power Toggle FAILED" 5 秒后清空）
@@ -583,8 +591,11 @@ fn main() {
             let pc_changed = s.pc_alive != last_pc_alive;
             let wifi_changed = s.wifi_state != last_wifi_state || s.wifi_ip != last_wifi_ip;
             let rc_changed = s.rigctld_clients != last_rigctld_clients;
-            // clock_tick 加入 redraw 触发：每秒重绘时间区
-            let any_change = radio_changed || pc_changed || wifi_changed || rc_changed || clock_tick;
+            // real_change：真实活动（决定 alive 超时计时器是否重置）
+            // clock_tick 不算真实活动——它只是时钟跳秒，不代表电台/PC/WiFi/rigctld 有数据流
+            let real_change = radio_changed || pc_changed || wifi_changed || rc_changed;
+            // any_change：redraw 触发条件（含 clock_tick，因为时间区每秒变需要刷新）
+            let any_change = real_change || clock_tick;
 
             // ===== 防烧屏：识别真实用户活动（排除心跳响应）=====
             // 心跳: body_count++ + 非 MAIN 侧 freq 变化（不算活动）
@@ -647,18 +658,68 @@ fn main() {
                 continue;  // 让下次循环处理新状态（power_toggling 已 true）
             }
 
-            // 电台离线 → 强制关背光（覆盖 user_activity 唤醒）
-            // 例外 1：power_toggling=true 时允许唤醒（让用户长按/自动开机时屏幕亮起反馈）
-            // 例外 2：in_boot_grace（启动 8s 内）保持亮屏，等电台开机后下行帧自然到达
-            if !s.radio_alive && !backlight_dimmed && !power_toggling && !in_boot_grace {
-                let _ = backlight.set_duty(bl_dim);
-                backlight_dimmed = true;
-                ::log::info!("[屏幕] 电台离线，关闭背光");
+            // Fix 2c：rigctld 客户端连接边沿（数量增加）+ 电台关机 → 触发自动开机
+            // 独立于 8s 启动宽限期 auto_boot_attempted（仅一次性触发）
+            // try_acquire_power_lock 单例锁防止多 tick 内重复 spawn
+            let client_count_increased = s.rigctld_clients > last_rigctld_clients;
+            if client_count_increased && !s.radio_alive && !power_toggling {
+                drop(s);
+                if button::try_acquire_power_lock() {
+                    ::log::info!("[自动开机] 客户端连接 + 电台关机 → 触发自动开机脉冲");
+                    let st = shared.clone();
+                    std::thread::spawn(move || {
+                        button::power_toggle_worker(st, true);  // is_auto=true，FAIL 显示 30s
+                        button::release_power_lock();
+                    });
+                } else {
+                    ::log::warn!("[自动开机] 已有 PowerToggle 进行中，跳过客户端触发开机");
+                }
+                continue;  // 下个 tick 处理新状态（power_toggling=true → 屏幕保持亮）
             }
 
-            // 用户活动 → 立即恢复背光（独立于 can_redraw 节流）
-            // 唤醒条件：alive 或 power_toggling 或 in_boot_grace；否则即使有活动也保持关屏
-            if user_activity && backlight_dimmed && (s.radio_alive || power_toggling || in_boot_grace) {
+            // Fix 4a：电台 alive 转 true 边沿 + 活跃 sat 会话 → invalidate 让客户端刷新 session
+            // 触发场景：DTrac 长时间连着活跃 session，电台被外部 power-cycle，alive 转 true 时 session stale
+            // 仅 sat_active=true 时触发（避免破坏 Fix 2c 自动开机刚连入的 fresh client）
+            let alive_just_came_up = !last_radio_alive && s.radio_alive;
+            let has_stale_session = s.rigctld_sat_active;
+            last_radio_alive = s.radio_alive;
+            if alive_just_came_up && has_stale_session {
+                drop(s);
+                ::log::info!("[Auto] 电台 alive 转 true + 活跃 sat 会话 → invalidate session 让客户端刷新");
+                rigctld::invalidate_handler_sessions(&shared);
+                // 不调 BLE force disconnect：BLE 客户端继续工作，下个命令自动重新 begin_sat_session
+                continue;
+            }
+
+            // Fix A：跟踪 alive 转 false 的时刻（grace 计时器起点）
+            // alive 恢复 true → 重置；alive=false 且未记录 → 记录当前时刻
+            if s.radio_alive {
+                radio_offline_since_us = 0;
+            } else if radio_offline_since_us == 0 {
+                radio_offline_since_us = now_us;
+            }
+
+            // Fix 2a：电台离线 → 强制关背光（覆盖 user_activity 唤醒）
+            // 例外 1：power_toggling=true 时允许唤醒（让用户长按/自动开机时屏幕亮起反馈）
+            // 例外 2：in_boot_grace（启动 8s 内）保持亮屏，等电台开机后下行帧自然到达
+            // 例外 3：rigctld_clients>0 时不强制关屏（DTrac 等客户端连接期，让用户看到 ESP32 在工作）
+            // 例外 4（Fix A）：alive 转 false 后 5s grace 期保持亮屏，让用户看清 "Radio --" 状态
+            let offline_grace_passed = radio_offline_since_us != 0
+                && now_us.saturating_sub(radio_offline_since_us) >= RADIO_OFFLINE_GRACE_US;
+            if !s.radio_alive && !backlight_dimmed && !power_toggling && !in_boot_grace
+                && s.rigctld_clients == 0 && offline_grace_passed
+            {
+                let _ = backlight.set_duty(bl_dim);
+                backlight_dimmed = true;
+                ::log::info!("[屏幕] 电台离线 5s grace 已过，关闭背光");
+            }
+
+            // Fix 2b：用户活动 → 立即恢复背光（独立于 can_redraw 节流）
+            // 唤醒条件：alive 或 power_toggling 或 in_boot_grace 或 rigctld_clients>0
+            // （新增 rigctld_clients>0：DTrac 连接时即使 alive=false 也要唤醒屏幕，让用户看到自动开机过程）
+            if user_activity && backlight_dimmed
+                && (s.radio_alive || power_toggling || in_boot_grace || s.rigctld_clients > 0)
+            {
                 let _ = backlight.set_duty(bl_normal);
                 backlight_dimmed = false;
                 ::log::info!("[屏幕] 检测到活动，背光恢复 60%");
@@ -687,7 +748,10 @@ fn main() {
                 let _ = last_wifi_ip.push_str(s.wifi_ip.as_str());
                 last_rigctld_clients = s.rigctld_clients;
                 last_displayed_sec = cur_unix_sec;  // 标记本次 redraw 已显示该秒
-                no_data_ticks = 0;
+                // 仅真实活动重置 no_data_ticks；clock_tick 单独触发的 redraw 不影响 alive 超时计时
+                if real_change {
+                    no_data_ticks = 0;
+                }
                 // tcp_only：仅 WiFi/TCP 客户端，排除 BLE（BLE 用 GATT 不用 IP）
                 let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
                 let rc_total = s.rigctld_clients;
@@ -705,7 +769,9 @@ fn main() {
                     smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total,
                     tstr.as_str(), tcol);
                 last_redraw_us = now_us;
-            } else if !any_change {
+            } else if !real_change {
+                // 关键：用 !real_change（不是 !any_change），否则 NTP 同步后 clock_tick 每秒
+                // 进入 if 分支跳过 else，no_data_ticks 永远不递增 → alive 永不超时变 false
                 no_data_ticks += 1;
                 // 仅在没有 rigctld 客户端时才超时置 alive=false
                 // rigctld 客户端（含 BLE）连接时认为电台一直 alive：
@@ -714,6 +780,18 @@ fn main() {
                 //     表现为"BLE 初始化卡死，需按机头键解除"
                 //   - 真正下行响应到达时 protocol::apply_to_state 会自动重置 alive=true
                 //   - 真正掉线场景：DTrac 自己会 timeout 报错，无需 ESP32 端探测
+                // Fix 4b：60s ungated alive 超时（独立于 15s gated 检查，覆盖外部 power-cycle 场景）
+                // 当客户端连着但电台被外部 power-cycle，15s gated 闸门让 alive 永真，无 alive 边沿
+                // → Fix 4a 不触发。60s ungated 阈值打破死锁，配合 Fix 4a 形成完整闭环。
+                // 60s 安全于 BLE 多阶段 setup 静默窗口（≤30s，CLAUDE.md 历史记录）
+                // 注意：放在 15s gated 检查之前（避免 borrow checker 抱怨 drop(s) 后的重借）
+                // 两个检查在不同 tick 触发（300 vs 1200），顺序不影响行为
+                if no_data_ticks == 1200 {  // 1200 × 50ms = 60s
+                    s.radio_alive = false;
+                    s.head_count = s.head_count.wrapping_add(1);
+                    ::log::info!("[Auto] 60s 无电台下行帧（rigctld_clients={}），强制设 alive=false",
+                        s.rigctld_clients);
+                }
                 if no_data_ticks == 300 && s.rigctld_clients == 0 {  // 300 × 50ms = 15s
                     s.radio_alive = false;
                     let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);

@@ -86,26 +86,30 @@ pub fn current_unix_sec() -> i64 {
 }
 
 /// 取当前时钟显示文本 + 颜色
-/// 未同步（last_ntp_sync_us==0）→ "--:--:--" + Gray
+/// Fix C：总是格式化 wall clock（即使未同步也显示时间在走，让用户看到时钟工作中）
+/// 未同步（last_ntp_sync_us==0）→ "HH:MM:SS"（boot epoch+uptime localized to TZ）+ Gray
 /// 已同步 ≤24h → "HH:MM:SS" + Orange
 /// 已同步 >24h → "HH:MM:SS" + Blue
 pub fn current_clock(state: &SharedState) -> (heapless::String<8>, ClockColor) {
     let last_sync = state.lock().map(|s| s.last_ntp_sync_us).unwrap_or(0);
     let mut s: heapless::String<8> = heapless::String::new();
-    if last_sync == 0 {
-        let _ = s.push_str("--:--:--");
-        return (s, ClockColor::Gray);
-    }
-    let now_us = unsafe { esp_timer_get_time() } as u64;
-    let age_us = now_us.saturating_sub(last_sync);
-    let color = if age_us > DAY_US { ClockColor::Blue } else { ClockColor::Orange };
 
+    // 总是从 gettimeofday 取 wall clock 并格式化
     let mut tv: timeval = unsafe { core::mem::zeroed() };
     unsafe { gettimeofday(&mut tv, core::ptr::null_mut()); }
     let mut t: tm = unsafe { core::mem::zeroed() };
     let sec = tv.tv_sec;
     unsafe { localtime_r(&sec, &mut t); }
     let _ = write!(s, "{:02}:{:02}:{:02}", t.tm_hour, t.tm_min, t.tm_sec);
+
+    // 颜色按同步状态区分
+    let color = if last_sync == 0 {
+        ClockColor::Gray  // 未同步：显示 wall clock 但用灰色提示用户未校准
+    } else {
+        let now_us = unsafe { esp_timer_get_time() } as u64;
+        let age_us = now_us.saturating_sub(last_sync);
+        if age_us > DAY_US { ClockColor::Blue } else { ClockColor::Orange }
+    };
     (s, color)
 }
 

@@ -31,10 +31,23 @@ use esp32_nimble::{
 /// 避免在 NimBLE host task callback 内 sleep+start 阻塞协议栈
 static SHOULD_RESTART_ADV: AtomicBool = AtomicBool::new(false);
 
+/// 外部模块（如 button.rs 长按 Fix 3）请求强制断开所有 BLE 客户端
+/// 主循环每 500ms 检查此信号，遍历 server.connections() 调 disconnect(conn_handle)
+/// 与 SHOULD_RESTART_ADV 同样的 swap 模式（不在调用方等待，异步生效）
+static FORCE_DISCONNECT_BLE: AtomicBool = AtomicBool::new(false);
+
 /// 外部模块（如 button.rs 短按）请求重启 BLE 广播
 /// 主循环每 500ms 检查 SHOULD_RESTART_ADV，等 100ms 后调 advertising.start()
 pub fn request_advertising_restart() {
     SHOULD_RESTART_ADV.store(true, Ordering::Relaxed);
+}
+
+/// 外部模块（如 button.rs::power_toggle_worker Fix 3）请求强制断开所有 BLE 客户端
+/// 主循环异步处理：≤500ms 检查间隔 + ble_gap_terminate ~100-200ms = ≤700ms 实际断开延迟
+/// on_disconnect handler 会被 NimBLE 异步触发：减 ble_clients/rigctld_clients + 设 sat pending
+pub fn force_disconnect_all_ble() {
+    FORCE_DISCONNECT_BLE.store(true, Ordering::Relaxed);
+    ::log::info!("[BLE] 请求强制断开所有 BLE 客户端");
 }
 
 /// BLE 设备名默认值（用户在 SoftAP 网页可改，启动时从 state.cfg_ble_name 读取）
@@ -327,6 +340,25 @@ fn ble_main(state: SharedState) {
         loop {
             std::thread::sleep(Duration::from_millis(500));
 
+            // Fix 3：异步处理外部"强制断开 BLE"信号
+            // 触发场景：button.rs 长按关机时调 force_disconnect_all_ble，需要真断 socket
+            // 让 rigctld_clients 减小，以便屏幕能正常息屏
+            if FORCE_DISCONNECT_BLE.swap(false, Ordering::Relaxed) {
+                let server = device.get_server();
+                let conn_handles: Vec<u16> = server.connections().map(|c| c.conn_handle()).collect();
+                if conn_handles.is_empty() {
+                    ::log::info!("[BLE] 强制断开请求：当前无活跃连接");
+                } else {
+                    for h in conn_handles {
+                        match server.disconnect(h) {
+                            Ok(_)  => ::log::info!("[BLE] disconnect conn_handle={} OK", h),
+                            Err(e) => ::log::warn!("[BLE] disconnect conn_handle={} 失败: {:?}", h, e),
+                        }
+                    }
+                }
+                // 不在此设置 SHOULD_RESTART_ADV：on_disconnect handler 会自己设
+            }
+
             // 异步处理 on_disconnect 设的"重启广播"信号
             if SHOULD_RESTART_ADV.swap(false, Ordering::Relaxed) {
                 // 等 100ms 让 NimBLE 释放 LL/连接 slot
@@ -364,9 +396,17 @@ fn ble_main(state: SharedState) {
             s.ble_advertising = false;
             s.head_count = s.head_count.wrapping_add(1);
         }
-        ::log::info!("[BLE] 广播超时关闭，等待外部触发重启");
+        ::log::info!("[BLE] 广播超时关闭，等待外部触发重启（如短按物理按钮）");
 
-        // 当前阶段：60s 自动重启（实体按钮触发待第三步）
-        std::thread::sleep(Duration::from_secs(60));
+        // 真的等外部触发：每 500ms 检查 SHOULD_RESTART_ADV 信号
+        // 短按物理按钮（button.rs::request_advertising_restart）/ on_disconnect 都会 set 此信号
+        // 不再自动 60s 重启（之前的临时实现违反"等待外部触发"语义，导致广播在用户不知情下重启）
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if SHOULD_RESTART_ADV.swap(false, Ordering::Relaxed) {
+                ::log::info!("[BLE] 收到外部重启信号，恢复广播 5 分钟窗口");
+                break;
+            }
+        }
     }
 }

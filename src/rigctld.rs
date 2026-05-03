@@ -926,6 +926,12 @@ pub fn begin_sat_session(state: &SharedState, rx_is_left_at_accept: bool) -> u32
         s.rigctld_tone_off_rx_done = false;
         s.rigctld_tone_off_tx_done = false;
     }
+    // Fix B-2：sql_close pending 也清（避免新 session 与旧 maintenance 注入冲突）
+    if s.rigctld_sql_close_left_pending || s.rigctld_sql_close_right_pending {
+        log::warn!("[SatSession #{}] 新会话开始，取消上次断开后的 SQL close pending", session_id);
+        s.rigctld_sql_close_left_pending = false;
+        s.rigctld_sql_close_right_pending = false;
+    }
     clear_pending_injections(&mut s);
     bind_sat_session(&mut s, rx_is_left_at_accept);
     session_id
@@ -964,6 +970,24 @@ pub fn clear_sat_session(s: &mut RadioState) {
     s.rigctld_tone_off_rx_done = false;
     s.rigctld_tone_off_tx_done = false;
     log::info!("[SatSession #{}] 会话结束，无条件排队 RX/TX 亚音 OFF 检查", session_id);
+}
+
+/// 让所有当前 rigctld handler 的 session 失效（Fix 3 / Fix 4 共用）
+///
+/// 复用现有 stale session 检测机制：
+///   - TCP handler (rigctld.rs:588-594, 616-620) 在 ≤3s timeout 周期或下个命令时
+///     检查 `handler_session_is_current`，若 session_id 不匹配 → return → close socket
+///   - BLE handler (ble.rs:157-167) 在下个命令时检查相同条件，stale → reset local id
+///     → 下个 stateful 命令重新 `begin_sat_session`
+///
+/// 注意：BLE socket 不会被此函数关闭（handler 没有 close 能力）。若需要真断 BLE socket
+/// （让 rigctld_clients 减小，比如让屏幕能关），调用方需另外触发 `ble::force_disconnect_all_ble`。
+pub fn invalidate_handler_sessions(state: &SharedState) {
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    clear_sat_session(&mut s);
+    s.rigctld_session_id = s.rigctld_session_id.wrapping_add(1);
+    log::info!("[Rigctld] invalidate_handler_sessions：session_id 已 bump 到 #{}，handlers 将自动失效",
+        s.rigctld_session_id);
 }
 
 fn clear_side_menu_display(s: &mut RadioState, is_left: bool) {
@@ -1264,6 +1288,10 @@ fn set_side_tone_mode(state: &SharedState, is_left: bool, target: ToneMode, labe
 }
 
 fn run_tone_off_maintenance(state: &SharedState) -> bool {
+    // Fix 3 防御 1：电台关机时 inject_menu 等 3s 超时浪费时间，且无法成功
+    if !state.lock().unwrap_or_else(|e| e.into_inner()).radio_alive { return false; }
+    // Fix 3 防御 2：worker 关机进行中时不抢 UART（避免 MAIN 切换干扰关机脉冲序列）
+    if crate::button::POWER_TOGGLE_IN_PROGRESS.load(Ordering::Relaxed) { return false; }
     let target = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         if !s.rigctld_tone_off_pending || s.rigctld_clients > 0 || s.macro_running || s.rigctld_setup_running || s.ptt_override || s.left.is_tx || s.right.is_tx {
@@ -1299,6 +1327,10 @@ fn run_tone_off_maintenance(state: &SharedState) -> bool {
 }
 
 fn run_sql_close_maintenance(state: &SharedState) -> bool {
+    // Fix 3 防御 1：电台关机时无意义
+    if !state.lock().unwrap_or_else(|e| e.into_inner()).radio_alive { return false; }
+    // Fix 3 防御 2：worker 关机进行中时不抢 UART
+    if crate::button::POWER_TOGGLE_IN_PROGRESS.load(Ordering::Relaxed) { return false; }
     let target = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         if s.rigctld_clients > 0

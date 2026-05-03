@@ -137,8 +137,10 @@ where D::Error: core::fmt::Debug,
 
 // ===== 主界面绘制 =====
 //
-// `ble_advertising` 当前未参与图标渲染（保留参数避免再改签名）；
-// BT 图标颜色仅由 `ble_clients > 0` 决定。
+// BT 图标三态：
+//   - ble_clients > 0：橙色（已连接）
+//   - ble_advertising && ble_clients=0：蓝色（广播中等待连接）
+//   - !ble_advertising && ble_clients=0：不画（BLE 已关闭，节能 + 隐私）
 //
 // `softap_active` / `softap_clients` 本期由 state.rs 默认 false/0，C 功能落地后由
 // wifi.rs 切到 SoftAP 模式时设置；UI 自动切换 WiFi 图标颜色 + 底栏 IP 显示。
@@ -158,7 +160,7 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
     rigctld_clients: u32,
     status_msg: &str,
     status_msg_color: StatusMsgColor,
-    _ble_advertising: bool,
+    ble_advertising: bool,
     ble_clients: u32,
     softap_active: bool,
     softap_clients: u32,
@@ -203,12 +205,18 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
             .draw(display).unwrap();
         // 中间 WiFi + BT 双图标，居中并排（16+4+16 = 36px，居中起 x=102）
         // 顶栏 22px 高，16×16 图标垂直居中 y=(22-16)/2 = 3
+        // BT 图标三态：
+        //   - ble_clients > 0：橙色（已连接）
+        //   - ble_advertising=true && ble_clients=0：蓝色（广播中等待连接）
+        //   - !ble_advertising && ble_clients=0：不画（BLE 已关，节能 + 隐私）
         let wifi_data = if softap_active { WIFI_ORANGE_DATA } else { WIFI_BLUE_DATA };
-        let bt_data   = if ble_clients > 0 { BT_ORANGE_DATA } else { BT_BLUE_DATA };
         let wifi_raw = ImageRawLE::<Rgb565>::new(wifi_data, ICON_W);
-        let bt_raw   = ImageRawLE::<Rgb565>::new(bt_data,   ICON_W);
         Image::new(&wifi_raw, Point::new(102, 3)).draw(display).unwrap();
-        Image::new(&bt_raw,   Point::new(122, 3)).draw(display).unwrap();
+        if ble_advertising || ble_clients > 0 {
+            let bt_data = if ble_clients > 0 { BT_ORANGE_DATA } else { BT_BLUE_DATA };
+            let bt_raw  = ImageRawLE::<Rgb565>::new(bt_data, ICON_W);
+            Image::new(&bt_raw, Point::new(122, 3)).draw(display).unwrap();
+        }
     }
 
     // 波段1
@@ -252,11 +260,11 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
             .draw(display).unwrap();
     }
 
-    // Radio 状态：rigctld 客户端（BLE/TCP 任一）连接期间显示灰色 "Radio --"
-    // 视觉语义：客户端连接 → 心跳已关（uart.rs:371 由 rigctld_clients>0 门控）→ ESP32 不再主动检测电台
-    //          → Radio 状态由客户端代理（DTrac 自己感知电台），ESP32 屏不再表达 OK
-    // alive 字段语义不动（仍服务 BLE 初始化 Guard2 / inject_menu_set 等内部判断）
-    if radio_alive && rigctld_clients_total == 0 {
+    // Fix 1.5：Radio 状态直接反映电台真实电气状态（alive=true → OK 橙；false → -- 灰）
+    // Fix 1（worker 显式更新 alive）后 alive 字段已精确，不再需要 "客户端连接 → 状态未知 → 灰"
+    // 的保守显示。客户端连接语义由顶栏 BT/WiFi 图标橙色 + 底栏 IP 橙色专门表达，UI 各元素职责清晰
+    let _ = rigctld_clients_total;  // 参数保留以避免改动 main.rs 调用点签名（向后兼容）
+    if radio_alive {
         Text::with_alignment("Radio OK", Point::new(234, 314),
             MonoTextStyleBuilder::new().font(&PROFONT_12_POINT).text_color(AMBER).build(),
             Alignment::Right).draw(display).unwrap();

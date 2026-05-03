@@ -13,6 +13,7 @@
 
 use crate::ble;
 use crate::nvs_cfg;
+use crate::rigctld;
 use crate::state::{SharedState, StatusMsgColor};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -22,9 +23,18 @@ const BUTTON_GPIO: i32 = 2;
 const POWER_GPIO: i32 = 8;
 const LONG_PRESS_DURATION: Duration = Duration::from_secs(3);
 const SHORT_PRESS_MIN: Duration = Duration::from_millis(50);  // 去抖下限
-const POLL_INTERVAL: Duration = Duration::from_millis(20);  // 50Hz 轮询自带去抖
+const POLL_INTERVAL: Duration = Duration::from_millis(20);  // 50Hz 轮询
+/// 软件去抖：连续 N 次相同采样才算稳定状态变化（3 × 20ms = 60ms）
+/// 滤除机械/电气抖动（典型 5-30ms 弹跳）；真实双击周期 ≥240ms 远大于此，不影响双击检测
+const DEBOUNCE_SAMPLES: u8 = 3;
 /// 双击窗口：第一次释放后多长时间内再次按下算双击（典型用户双击 200~500ms，300ms 兼顾响应速度与误触）
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(300);
+/// 倒计时显示 auto-clear 兜底（防 race 卡死）：用户主动释放时 release 分支会立即 clear，
+/// 这是异常路径的保护，正常情况下永远不到
+const COUNTDOWN_AUTOCLEAR_MS: u64 = 5_000;
+/// PowerToggle worker 持续状态 auto-clear 兜底：正常 worker success/fail 时立即 clear/覆盖，
+/// 仅 panic / 死锁等异常路径下 60s 才生效
+const WORKER_STATUS_AUTOCLEAR_MS: u64 = 60_000;
 const PULSE_DURATION: Duration = Duration::from_millis(1200);  // GPIO 8 脉冲（沿用 pc_comm.rs 1.2s）
 const POST_PULSE_WAIT: Duration = Duration::from_millis(1500);  // 等电台真正完成关机
 const PROBE_GAP: Duration = Duration::from_millis(600);  // 单帧注入到响应到达
@@ -105,8 +115,27 @@ fn button_main(state: SharedState) {
     let mut last_release_time: Option<Instant> = None;
     let mut last_release_was_short_press: bool = false; // 上次释放是合法短按（>=50ms 且 <3s 且非长按已触发）
 
+    // ===== 软件去抖状态（连续 DEBOUNCE_SAMPLES 次同电平才更新 stable_state）=====
+    // 滤除机械抖动 + 手指轻触瞬间脱离（5-30ms 弹跳被完全过滤）
+    // 60ms 之上的真实释放无法识别为"用户其实想继续按"——交给 Fix 3b（last_countdown_secs 抑制）兜底
+    let mut last_raw_state: bool = false;          // 上次原始 GPIO 读数
+    let mut state_consistent_count: u8 = 0;        // 当前原始状态连续次数
+    let mut stable_state: bool = false;            // 已确认稳定状态（喂给状态机）
+
     loop {
-        let pressed = unsafe { gpio_get_level(BUTTON_GPIO) } == 0;
+        let raw_pressed = unsafe { gpio_get_level(BUTTON_GPIO) } == 0;
+        // 去抖累加：与上次原始读数相同 → 计数+1；不同 → 重置为 1
+        if raw_pressed == last_raw_state {
+            state_consistent_count = state_consistent_count.saturating_add(1);
+        } else {
+            state_consistent_count = 1;
+            last_raw_state = raw_pressed;
+        }
+        // 仅在连续 N 次相同时才更新稳定状态
+        if state_consistent_count >= DEBOUNCE_SAMPLES {
+            stable_state = raw_pressed;
+        }
+        let pressed = stable_state;
         let now = Instant::now();
 
         // 双击窗口超时检查：上次合法短按释放后超过 DOUBLE_CLICK_WINDOW 仍未二次按下 → 执行短按动作
@@ -203,7 +232,8 @@ fn button_main(state: SharedState) {
                     let mut text: heapless::String<32> = heapless::String::new();
                     use core::fmt::Write;
                     let _ = write!(text, "Radio {} {}..", action, countdown);
-                    set_status(&state, text.as_str(), StatusMsgColor::Amber, 0);
+                    // auto-clear 5s 兜底：正常 release 分支会立即清，仅异常 race 路径下 5s 自愈
+                    set_status(&state, text.as_str(), StatusMsgColor::Amber, COUNTDOWN_AUTOCLEAR_MS);
                 }
             }
             (false, Some(start)) => {
@@ -213,14 +243,17 @@ fn button_main(state: SharedState) {
                     && duration >= SHORT_PRESS_MIN
                     && duration < LONG_PRESS_DURATION;
 
-                if is_short_press {
+                // Fix 3b：用户已看到倒计时（last_countdown_secs > 0）说明长按意图明确，
+                // 中途松开应视为"取消长按"，不记录 short press（避免 jitter 被判双击进 SoftAP）
+                if is_short_press && last_countdown_secs == 0 {
                     // 注意：短按"动作"（唤醒+BLE 重启）不在这里执行，留到下面双击窗口超时后再决定
                     // 这是因为本次释放可能是双击的第一次释放，需等 DOUBLE_CLICK_WINDOW 内是否第二次按下
                     // 记录释放时刻供双击检测
                     last_release_time = Some(now);
                     last_release_was_short_press = true;
                 } else {
-                    // 长按已触发 / 抖动（< 50ms） → 清双击状态，避免与之前合法短按形成误判
+                    // 长按已触发 / 抖动（< 50ms）/ 倒计时显示后释放（取消长按）
+                    // → 清双击状态，避免与之前合法短按形成误判
                     last_release_was_short_press = false;
                     last_release_time = None;
                 }
@@ -287,11 +320,25 @@ pub fn power_toggle_worker(state: SharedState, is_auto: bool) {
         was_alive, body_before,
         if was_alive { "三次探针无响应 (关机)" } else { "body_count++ (开机)" });
 
+    // Fix 3：长按关机时若有 rigctld 客户端连接 → 让所有 session 失效 + 真断 BLE
+    // 跳过清理流程（maintenance 由防御短路），用户原话："只是断开连接，而不是关闭 wifi 和蓝牙"
+    if was_alive {
+        let has_clients = state.lock().map(|s| s.rigctld_clients > 0).unwrap_or(false);
+        if has_clients {
+            ::log::info!("[PowerToggle] 长按关机检测到 rigctld 客户端连接，使 session 失效 + 强断 BLE");
+            rigctld::invalidate_handler_sessions(&state);  // TCP 在 ≤3s 内自动 close
+            ble::force_disconnect_all_ble();               // BLE 在 ≤700ms 内真断
+            // 不 sleep 等待：worker 接下来 ~5s 关机流程，client 断开异步完成
+        }
+    }
+
     for attempt in 0..MAX_ATTEMPTS {
         // 更新顶栏状态消息（v4 计划文字：Radio Off... / Radio On...）
         // 重试期间不在 UI 显示次数（避免增加复杂度，重试详情在 log 里看）
+        // auto_clear 60s 是兜底：正常 success/fail 路径会立即 clear/覆盖，
+        // 仅 worker panic / 死锁等异常路径下 60s 自愈，避免"Radio Off..." 永久卡住
         let status_text: &str = if was_alive { "Radio Off..." } else { "Radio On..." };
-        set_status(&state, status_text, StatusMsgColor::Amber, 0);
+        set_status(&state, status_text, StatusMsgColor::Amber, WORKER_STATUS_AUTOCLEAR_MS);
 
         ::log::info!("[PowerToggle] 第 {} 次脉冲（GPIO {} → HIGH {}ms → LOW）",
             attempt + 1, POWER_GPIO, PULSE_DURATION.as_millis());
@@ -340,14 +387,31 @@ pub fn power_toggle_worker(state: SharedState, is_auto: bool) {
 
         if success {
             if was_alive {
-                // 关机确认：worker 内部决策不依赖 alive 字段（基于 3 次探针无响应）
-                // 此时 main loop 的 15s 超时尚未触发 alive=false，~15s 后才会转 false 并自动关屏
-                ::log::info!("[PowerToggle] 第 {} 次成功（关机确认：三次探针无响应；alive 将在 ~15s 后由主循环转 false）",
+                // Fix 1：关机确认 → 立即设 alive=false（覆盖 15s 主循环超时延迟，
+                // 也绕过 rigctld_clients > 0 时主循环不超时的守护，确保 UI 立即反映关机状态）
+                // Fix B-1：电台关机 = 所有 setup 状态重置，下次开机视为全新。清 maintenance pending
+                // 防止 Fix 3 invalidate 内 clear_sat_session 设的 pending 在重开机后跑 → 与新 DTrac
+                // session 的 setup 抢 UART → 循环注入 menu/MAIN
+                if let Ok(mut s) = state.lock() {
+                    s.radio_alive = false;
+                    s.rigctld_sql_close_left_pending = false;
+                    s.rigctld_sql_close_right_pending = false;
+                    s.rigctld_tone_off_pending = false;
+                    s.rigctld_tone_off_rx_done = false;
+                    s.rigctld_tone_off_tx_done = false;
+                    s.head_count = s.head_count.wrapping_add(1);
+                }
+                ::log::info!("[PowerToggle] 第 {} 次成功（关机确认：alive 已立即设为 false，所有 maintenance pending 已清）",
                     attempt + 1);
             } else {
-                // 开机确认：靠 body_count 增加触发
+                // Fix 1：开机确认 → 显式设 alive=true + head_count++ 触发 UI 立即重绘
+                // protocol.rs 收到首帧时也会幂等设 alive=true，但显式设可避免一两帧的延迟
                 let body_now = state.lock().unwrap().body_count;
-                ::log::info!("[PowerToggle] 第 {} 次成功（开机确认：body_count {} → {}）",
+                if let Ok(mut s) = state.lock() {
+                    s.radio_alive = true;
+                    s.head_count = s.head_count.wrapping_add(1);
+                }
+                ::log::info!("[PowerToggle] 第 {} 次成功（开机确认：body_count {} → {}，alive=true）",
                     attempt + 1, body_before, body_now);
             }
             // 成功 → 立即清除顶栏状态消息恢复默认标题
