@@ -12,6 +12,7 @@ use embedded_graphics::text::{Alignment, Text};
 use profont::{PROFONT_24_POINT, PROFONT_14_POINT, PROFONT_12_POINT, PROFONT_9_POINT};
 
 use crate::state::{BandState, PowerLevel, StatusMsgColor, WifiState};
+use crate::timesync::ClockColor;
 
 // ===== 配色 =====
 pub const BG:     Rgb565 = Rgb565::BLACK;
@@ -162,6 +163,8 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
     softap_active: bool,
     softap_clients: u32,
     rigctld_clients_total: u32,
+    time_str: &str,
+    time_color: ClockColor,
 ) where D::Error: core::fmt::Debug,
 {
     display.clear(BG).unwrap();
@@ -172,10 +175,15 @@ pub fn draw_main_ui<D: DrawTarget<Color = Rgb565>>(
         .draw(display).unwrap();
     hline(display, 22, BORDER);
 
-    // 右侧时间占位（E2.A 阶段固定 GRAY "--:--:--"，E2.B 接入 NTP 后再上色）
+    // 右侧时间显示（三色：橙=已校准≤24h, 蓝=已漂移>24h, 灰=从未同步 "--:--:--"）
     // PROFONT_14 = 10×17 px，8 chars = 80px，右对齐 x=234 → 起 x=154
-    Text::with_alignment("--:--:--", Point::new(234, 16),
-        MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(GRAY).build(),
+    let clock_rgb = match time_color {
+        ClockColor::Orange => AMBER,
+        ClockColor::Blue   => CYAN,
+        ClockColor::Gray   => GRAY,
+    };
+    Text::with_alignment(time_str, Point::new(234, 16),
+        MonoTextStyleBuilder::new().font(&PROFONT_14_POINT).text_color(clock_rgb).build(),
         Alignment::Right).draw(display).unwrap();
 
     if !status_msg.is_empty() {

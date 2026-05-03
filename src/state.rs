@@ -248,8 +248,12 @@ pub struct RadioState {
     pub cfg_ble_name: heapless::String<16>,    // BLE 设备名（默认 "elfRadio"）
     pub cfg_brightness: u8,                    // 屏幕亮度 30/60/100（默认 60）
     pub cfg_dim_timeout_secs: u16,             // 防烧屏熄屏超时秒（60/150/300/600，0=禁用，默认 150）
-    pub cfg_ntp_enabled: bool,                 // NTP 自动同步开关（默认 true，NTP 暂未实现）
+    pub cfg_ntp_enabled: bool,                 // NTP 自动同步开关（默认 true）
     pub cfg_manual_time_us: u64,               // 手动设置时间（unix 微秒，仅 ntp_enabled=false 用）
+    pub cfg_tz_posix: heapless::String<48>,    // POSIX TZ 字符串（默认 Hobart "AEST-10AEDT,M10.1.0,M4.1.0/3"）
+    pub cfg_ntp_server: heapless::String<48>,  // NTP 服务器主机名（默认 "au.pool.ntp.org"）
+    // ===== 时间同步状态（timesync.rs 维护）=====
+    pub last_ntp_sync_us: u64,                 // 上次成功 NTP/手动同步时的 esp_timer_get_time() uptime（0 = 从未同步）
     // ===== rigctld 连接状态 =====
     pub rigctld_clients: u32,       // 当前活跃 rigctld 客户端数（>0 → IP 显示橙色）
     pub rigctld_ctcss_tone: u32,    // 最后设置的 CTCSS 频率（0.1 Hz 单位，0=OFF）
@@ -360,6 +364,17 @@ impl RadioState {
             cfg_dim_timeout_secs: 150,
             cfg_ntp_enabled: true,
             cfg_manual_time_us: 0,
+            cfg_tz_posix: {
+                let mut s: heapless::String<48> = heapless::String::new();
+                let _ = s.push_str("AEST-10AEDT,M10.1.0,M4.1.0/3");
+                s
+            },
+            cfg_ntp_server: {
+                let mut s: heapless::String<48> = heapless::String::new();
+                let _ = s.push_str("au.pool.ntp.org");
+                s
+            },
+            last_ntp_sync_us: 0,
             rigctld_clients: 0,
             rigctld_ctcss_tone: 0,
             rigctld_initial_freq_done: false,

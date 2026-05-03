@@ -131,6 +131,115 @@ hr { border: none; border-top: 1px solid var(--input-border); margin: 16px 0; }
     <input type="text" id="ble-name" placeholder="elfRadio" maxlength="16">
   </div>
   <div class="row">
+    <label>时区（保存后重启生效）</label>
+    <select id="tz-posix">
+      <optgroup label="UTC">
+        <option value="UTC0">UTC (协调世界时, UTC+0)</option>
+      </optgroup>
+      <optgroup label="Australia 大洋洲">
+        <option value="AEST-10AEDT,M10.1.0,M4.1.0/3">Hobart / Sydney / Melbourne / Canberra (UTC+10/+11 DST) ★默认</option>
+        <option value="AEST-10">Brisbane / Lindeman (UTC+10)</option>
+        <option value="ACST-9:30ACDT,M10.1.0,M4.1.0/3">Adelaide / Broken Hill (UTC+9:30/+10:30 DST)</option>
+        <option value="ACST-9:30">Darwin (UTC+9:30)</option>
+        <option value="AWST-8">Perth (UTC+8)</option>
+        <option value="&lt;+1030&gt;-10:30&lt;+11&gt;-11,M10.1.0,M4.1.0/3">Lord Howe (UTC+10:30/+11 DST)</option>
+        <option value="NZST-12NZDT,M9.5.0,M4.1.0/3">Auckland / Wellington (UTC+12/+13 DST)</option>
+        <option value="&lt;+1245&gt;-12:45&lt;+1345&gt;,M9.5.0/2:45,M4.1.0/3:45">Chatham Is. (UTC+12:45/+13:45 DST)</option>
+        <option value="&lt;+13&gt;-13">Tonga / Apia / Samoa / Phoenix (UTC+13)</option>
+        <option value="&lt;+14&gt;-14">Kiritimati (UTC+14)</option>
+        <option value="&lt;+12&gt;-12">Fiji / Marshall / Tarawa / Wallis (UTC+12)</option>
+        <option value="&lt;+11&gt;-11">Bougainville / Pohnpei / Noumea (UTC+11)</option>
+        <option value="ChST-10">Guam / Chuuk (UTC+10)</option>
+        <option value="&lt;-09&gt;9">Marquesas / Gambier (UTC-9)</option>
+        <option value="&lt;-10&gt;10">Tahiti / Cook (UTC-10)</option>
+        <option value="HST10">Honolulu (UTC-10)</option>
+        <option value="&lt;-11&gt;11">Niue / Pago Pago (UTC-11)</option>
+      </optgroup>
+      <optgroup label="Asia 亚洲">
+        <option value="CST-8">Shanghai / Beijing / Chongqing (UTC+8)</option>
+        <option value="HKT-8">Hong Kong (UTC+8)</option>
+        <option value="CST-8">Taipei (UTC+8)</option>
+        <option value="&lt;+08&gt;-8">Singapore / Kuala Lumpur / Manila / Brunei / Ulaanbaatar (UTC+8)</option>
+        <option value="WITA-8">Makassar (UTC+8)</option>
+        <option value="JST-9">Tokyo (UTC+9)</option>
+        <option value="KST-9">Seoul / Pyongyang (UTC+9)</option>
+        <option value="WIT-9">Jayapura (UTC+9)</option>
+        <option value="&lt;+07&gt;-7">Bangkok / Jakarta / Hanoi / HCMC / Vientiane (UTC+7)</option>
+        <option value="&lt;+0630&gt;-6:30">Yangon / Cocos (UTC+6:30)</option>
+        <option value="&lt;+06&gt;-6">Dhaka / Almaty / Bishkek / Thimphu (UTC+6)</option>
+        <option value="&lt;+0545&gt;-5:45">Kathmandu (UTC+5:45)</option>
+        <option value="&lt;+0530&gt;-5:30">Kolkata / Mumbai / Delhi / Colombo (UTC+5:30)</option>
+        <option value="PKT-5">Karachi (UTC+5)</option>
+        <option value="&lt;+05&gt;-5">Tashkent / Yekaterinburg / Maldives (UTC+5)</option>
+        <option value="&lt;+0430&gt;-4:30">Kabul (UTC+4:30)</option>
+        <option value="&lt;+04&gt;-4">Dubai / Muscat / Baku / Tbilisi / Yerevan (UTC+4)</option>
+        <option value="&lt;+0330&gt;-3:30&lt;+0430&gt;,J79/24,J263/24">Tehran (UTC+3:30/+4:30 DST)</option>
+        <option value="&lt;+03&gt;-3">Riyadh / Baghdad / Kuwait / Doha / Bahrain (UTC+3)</option>
+        <option value="IST-2IDT,M3.4.4/26,M10.5.0">Jerusalem (UTC+2/+3 DST)</option>
+      </optgroup>
+      <optgroup label="Europe 欧洲">
+        <option value="GMT0BST,M3.5.0/1,M10.5.0">London / Dublin / Belfast / Lisbon (UTC+0/+1 DST)</option>
+        <option value="WET0WEST,M3.5.0/1,M10.5.0">Faroe / Canary / Madeira (UTC+0/+1 DST)</option>
+        <option value="CET-1CEST,M3.5.0,M10.5.0/3">Berlin / Paris / Madrid / Rome / Amsterdam / Brussels / Vienna / Zurich (UTC+1/+2 DST)</option>
+        <option value="CET-1CEST,M3.5.0,M10.5.0/3">Stockholm / Warsaw / Prague / Oslo / Copenhagen (UTC+1/+2 DST)</option>
+        <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Athens / Helsinki / Bucharest / Sofia / Vilnius / Riga / Tallinn (UTC+2/+3 DST)</option>
+        <option value="&lt;+03&gt;-3">Istanbul / Minsk (UTC+3)</option>
+        <option value="MSK-3">Moscow / Volgograd / Simferopol (UTC+3)</option>
+        <option value="&lt;+04&gt;-4">Samara (UTC+4)</option>
+        <option value="&lt;+05&gt;-5">Yekaterinburg (UTC+5)</option>
+        <option value="&lt;+07&gt;-7">Krasnoyarsk / Novosibirsk (UTC+7)</option>
+        <option value="&lt;+08&gt;-8">Irkutsk (UTC+8)</option>
+        <option value="&lt;+09&gt;-9">Yakutsk (UTC+9)</option>
+        <option value="&lt;+10&gt;-10">Vladivostok (UTC+10)</option>
+        <option value="&lt;+11&gt;-11">Magadan / Sakhalin (UTC+11)</option>
+        <option value="&lt;+12&gt;-12">Kamchatka / Anadyr (UTC+12)</option>
+      </optgroup>
+      <optgroup label="Africa 非洲">
+        <option value="GMT0">Accra / Abidjan / Dakar / Bamako (UTC+0)</option>
+        <option value="WAT-1">Lagos / Bangui / Douala / Kinshasa (UTC+1)</option>
+        <option value="CET-1">Algiers / Tunis (UTC+1)</option>
+        <option value="&lt;+01&gt;-1&lt;+00&gt;,M5.5.0,M10.5.0">Casablanca / El Aaiun (UTC+1/+0 DST)</option>
+        <option value="CAT-2">Lusaka / Bujumbura / Harare / Khartoum / Maputo (UTC+2)</option>
+        <option value="EET-2EEST,M4.5.5/0,M10.5.5/24">Cairo (UTC+2/+3 DST)</option>
+        <option value="EET-2">Tripoli (UTC+2)</option>
+        <option value="SAST-2">Johannesburg / Maseru / Mbabane (UTC+2)</option>
+        <option value="EAT-3">Nairobi / Addis Ababa / Asmara / Dar es Salaam / Mogadishu (UTC+3)</option>
+      </optgroup>
+      <optgroup label="Americas 美洲">
+        <option value="EST5EDT,M3.2.0,M11.1.0">New York / Toronto / Detroit / Indianapolis (UTC-5/-4 DST)</option>
+        <option value="EST5">Atikokan / Cancun / Jamaica / Panama (UTC-5)</option>
+        <option value="CST6CDT,M3.2.0,M11.1.0">Chicago / Mexico City / Winnipeg (UTC-6/-5 DST)</option>
+        <option value="CST6">Belize / Costa Rica / Regina / Guatemala / Tegucigalpa (UTC-6)</option>
+        <option value="MST7MDT,M3.2.0,M11.1.0">Denver / Edmonton / Chihuahua (UTC-7/-6 DST)</option>
+        <option value="MST7">Phoenix (Arizona, UTC-7)</option>
+        <option value="PST8PDT,M3.2.0,M11.1.0">Los Angeles / Vancouver / Tijuana (UTC-8/-7 DST)</option>
+        <option value="AKST9AKDT,M3.2.0,M11.1.0">Anchorage / Juneau (UTC-9/-8 DST)</option>
+        <option value="AST4ADT,M3.2.0,M11.1.0">Halifax / Bermuda (UTC-4/-3 DST)</option>
+        <option value="AST4">Caracas / La Paz / Santo Domingo / San Juan (UTC-4)</option>
+        <option value="NST3:30NDT,M3.2.0,M11.1.0">St. Johns (Newfoundland, UTC-3:30/-2:30 DST)</option>
+        <option value="&lt;-03&gt;3">Buenos Aires / Sao Paulo / Cayenne / Montevideo (UTC-3)</option>
+        <option value="&lt;-03&gt;3&lt;-02&gt;,M10.1.0/0,M2.3.0/0">Santiago (UTC-3/-2 DST)</option>
+        <option value="&lt;-04&gt;4">La Paz / Asuncion / Manaus (UTC-4)</option>
+        <option value="&lt;-05&gt;5">Lima / Bogota / Quito / Guayaquil (UTC-5)</option>
+        <option value="&lt;-02&gt;2">South Georgia / Noronha (UTC-2)</option>
+        <option value="&lt;-01&gt;1&lt;+00&gt;,M3.5.0/0,M10.5.0/1">Azores (UTC-1/+0 DST)</option>
+      </optgroup>
+      <optgroup label="Indian Ocean 印度洋">
+        <option value="&lt;+04&gt;-4">Mauritius / Reunion / Mahe (UTC+4)</option>
+        <option value="&lt;+05&gt;-5">Maldives / Kerguelen (UTC+5)</option>
+        <option value="&lt;+06&gt;-6">Chagos (UTC+6)</option>
+      </optgroup>
+      <optgroup label="Atlantic 大西洋">
+        <option value="&lt;-01&gt;1">Cape Verde (UTC-1)</option>
+        <option value="AST4ADT,M3.2.0,M11.1.0">Bermuda (UTC-4/-3 DST)</option>
+      </optgroup>
+    </select>
+  </div>
+  <div class="row">
+    <label>NTP 服务器（默认 au.pool.ntp.org）</label>
+    <input type="text" id="ntp-server" placeholder="au.pool.ntp.org" maxlength="47">
+  </div>
+  <div class="row">
     <label>时间同步</label>
     <div class="choice-group" data-name="ntp_enabled">
       <div class="choice" data-value="1">NTP 自动</div>
@@ -138,7 +247,7 @@ hr { border: none; border-top: 1px solid var(--input-border); margin: 16px 0; }
     </div>
   </div>
   <div class="row" id="manual-time-row" style="display:none">
-    <label>手动设置时间（保存后立即生效）</label>
+    <label>手动设置时间（保存后立即生效；浏览器时区须与上方时区一致）</label>
     <input type="datetime-local" id="manual-time">
   </div>
   <button class="primary btn-full" onclick="submitConfig()" id="config-btn">保存设置（重启）</button>
@@ -221,6 +330,14 @@ async function loadStatus() {
     setChoiceValue('brightness', j.cfg.brightness);
     setChoiceValue('dim_timeout', j.cfg.dim_timeout);
     setChoiceValue('ntp_enabled', j.cfg.ntp_enabled ? 1 : 0);
+    if (j.cfg.tz_posix) {
+      const tzSel = document.getElementById('tz-posix');
+      // 选中匹配项；不存在则保持当前选中（默认 Hobart）
+      for (let i = 0; i < tzSel.options.length; i++) {
+        if (tzSel.options[i].value === j.cfg.tz_posix) { tzSel.selectedIndex = i; break; }
+      }
+    }
+    document.getElementById('ntp-server').value = j.cfg.ntp_server || 'au.pool.ntp.org';
   } catch (e) {
     console.warn('loadStatus failed:', e);
   }
@@ -309,12 +426,15 @@ async function submitConfig() {
     brightness: parseInt(getChoiceValue('brightness') || '60'),
     dim_timeout: parseInt(getChoiceValue('dim_timeout') || '150'),
     ntp_enabled: getChoiceValue('ntp_enabled') === '1',
+    tz_posix: document.getElementById('tz-posix').value,
+    ntp_server: document.getElementById('ntp-server').value.trim() || 'au.pool.ntp.org',
   };
   // 手动时间（如选了"手动"）
   if (!data.ntp_enabled) {
     const t = document.getElementById('manual-time').value;
     if (t) {
-      // 转成 unix 微秒
+      // 转成 unix 微秒（注意：JS new Date 用浏览器本地时区解析；
+      // 必须保证浏览器时区与上方下拉选的时区一致，否则会错 N 小时）
       data.manual_time_us = new Date(t).getTime() * 1000;
     }
   }

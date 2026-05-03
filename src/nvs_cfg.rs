@@ -28,6 +28,8 @@ pub const KEY_BRIGHTNESS:  &[u8] = b"brightness\0";
 pub const KEY_DIM_TIMEOUT: &[u8] = b"dim_timeout\0";
 pub const KEY_NTP_ENABLED: &[u8] = b"ntp_enabled\0";
 pub const KEY_MANUAL_TIME: &[u8] = b"manual_time\0";
+pub const KEY_TZ_POSIX:    &[u8] = b"tz_posix\0";
+pub const KEY_NTP_SERVER:  &[u8] = b"ntp_server\0";
 
 /// 启动早期初始化 NVS（idempotent，重复调用安全）
 /// EspDefaultNvsPartition::take() 内部也会调，重复调返回 OK

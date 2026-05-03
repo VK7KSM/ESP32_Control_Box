@@ -243,6 +243,21 @@ pub fn start_http_server(state: SharedState, no_credentials: bool) {
                         errors.push(format!("manual_time: {}", e));
                     }
                 }
+                if let Some(tz) = data.tz_posix {
+                    // POSIX TZ 字符串最长 ~35 字符，限到 47 防 NVS 溢出（state.rs heapless::String<48>）
+                    if tz.len() > 47 {
+                        errors.push(format!("tz_posix: too long ({} > 47)", tz.len()));
+                    } else if let Err(e) = nvs_cfg::write_string(nvs_cfg::NS_CFG, nvs_cfg::KEY_TZ_POSIX, tz) {
+                        errors.push(format!("tz_posix: {}", e));
+                    }
+                }
+                if let Some(srv) = data.ntp_server {
+                    if srv.len() > 47 {
+                        errors.push(format!("ntp_server: too long ({} > 47)", srv.len()));
+                    } else if let Err(e) = nvs_cfg::write_string(nvs_cfg::NS_CFG, nvs_cfg::KEY_NTP_SERVER, srv) {
+                        errors.push(format!("ntp_server: {}", e));
+                    }
+                }
                 if errors.is_empty() {
                     let mut resp = req.into_ok_response()?;
                     resp.write_all(b"{\"ok\":true,\"action\":\"restart\"}")?;
@@ -474,6 +489,10 @@ struct ConfigData<'a> {
     dim_timeout: Option<u16>,
     ntp_enabled: Option<bool>,
     manual_time_us: Option<u64>,
+    #[serde(borrow)]
+    tz_posix: Option<&'a str>,
+    #[serde(borrow)]
+    ntp_server: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -493,6 +512,8 @@ struct CurrentCfg {
     brightness: u8,
     dim_timeout: u16,
     ntp_enabled: bool,
+    tz_posix: String,
+    ntp_server: String,
 }
 
 #[derive(Serialize)]
@@ -524,6 +545,12 @@ fn build_status_json(state: &SharedState, no_credentials: bool) -> String {
     let brightness = nvs_cfg::read_u8(nvs_cfg::NS_CFG, nvs_cfg::KEY_BRIGHTNESS).unwrap_or(60);
     let dim_timeout = nvs_cfg::read_u16(nvs_cfg::NS_CFG, nvs_cfg::KEY_DIM_TIMEOUT).unwrap_or(150);
     let ntp_enabled = nvs_cfg::read_u8(nvs_cfg::NS_CFG, nvs_cfg::KEY_NTP_ENABLED).unwrap_or(1) != 0;
+    let tz_posix = nvs_cfg::read_string(nvs_cfg::NS_CFG, nvs_cfg::KEY_TZ_POSIX, 49)
+        .map(|v| v.as_str().to_string())
+        .unwrap_or_else(|| "AEST-10AEDT,M10.1.0,M4.1.0/3".to_string());
+    let ntp_server = nvs_cfg::read_string(nvs_cfg::NS_CFG, nvs_cfg::KEY_NTP_SERVER, 49)
+        .map(|v| v.as_str().to_string())
+        .unwrap_or_else(|| "au.pool.ntp.org".to_string());
 
     let suffix = nvs_cfg::ssid_suffix();
     let st = StatusJson {
@@ -532,7 +559,7 @@ fn build_status_json(state: &SharedState, no_credentials: bool) -> String {
         no_credentials,
         softap_clients: s.softap_clients,
         ssid_suffix: suffix.as_str().to_string(),
-        cfg: CurrentCfg { ble_name, brightness, dim_timeout, ntp_enabled },
+        cfg: CurrentCfg { ble_name, brightness, dim_timeout, ntp_enabled, tz_posix, ntp_server },
         wifi: WifiSummary { ssid: saved_ssid },
     };
     serde_json::to_string(&st).unwrap_or_else(|_| "{}".into())

@@ -23,6 +23,7 @@ mod nvs_cfg;
 mod softap;
 mod dns_server;
 mod web_config;
+mod timesync;
 
 // 必须显式 extern：esp_idf_svc::sys 通过 wildcard 引入了一个叫 `log` 的 struct，
 // 与 `log` crate 冲突。extern crate log 把 log crate 强制放到 root namespace，
@@ -136,11 +137,14 @@ fn render_main_ui_tiled(
     softap_active: bool,
     softap_clients: u32,
     rigctld_clients_total: u32,
+    time_str: &str,
+    time_color: timesync::ClockColor,
 ) {
     render_tiled(fb, |fb| {
         ui::draw_main_ui(fb, left, right, radio_alive, pc_alive, wifi_state, wifi_ip, wifi_tcp_clients,
             status_msg, status_msg_color, ble_advertising, ble_clients,
-            softap_active, softap_clients, rigctld_clients_total);
+            softap_active, softap_clients, rigctld_clients_total,
+            time_str, time_color);
     });
 }
 
@@ -401,8 +405,33 @@ fn main() {
         if let Some(t) = nvs_cfg::read_u64(nvs_cfg::NS_CFG, nvs_cfg::KEY_MANUAL_TIME) {
             s.cfg_manual_time_us = t;
         }
-        ::log::info!("[NVS cfg] ble_name=\"{}\" brightness={} dim_timeout={}s ntp={}",
-            s.cfg_ble_name.as_str(), s.cfg_brightness, s.cfg_dim_timeout_secs, s.cfg_ntp_enabled);
+        if let Some(tz) = nvs_cfg::read_string(nvs_cfg::NS_CFG, nvs_cfg::KEY_TZ_POSIX, 49) {
+            if !tz.is_empty() {
+                s.cfg_tz_posix.clear();
+                let _ = s.cfg_tz_posix.push_str(tz.as_str());
+            }
+        }
+        if let Some(srv) = nvs_cfg::read_string(nvs_cfg::NS_CFG, nvs_cfg::KEY_NTP_SERVER, 49) {
+            if !srv.is_empty() {
+                s.cfg_ntp_server.clear();
+                let _ = s.cfg_ntp_server.push_str(srv.as_str());
+            }
+        }
+        ::log::info!("[NVS cfg] ble_name=\"{}\" brightness={} dim_timeout={}s ntp={} tz=\"{}\" ntp_server=\"{}\"",
+            s.cfg_ble_name.as_str(), s.cfg_brightness, s.cfg_dim_timeout_secs, s.cfg_ntp_enabled,
+            s.cfg_tz_posix.as_str(), s.cfg_ntp_server.as_str());
+    }
+
+    // ===== 应用 TZ + 手动时间（必须在第一次 localtime_r/clock 渲染前完成）=====
+    {
+        let (tz, manual_us, ntp_on) = {
+            let s = shared.lock().unwrap();
+            (s.cfg_tz_posix.as_str().to_string(), s.cfg_manual_time_us, s.cfg_ntp_enabled)
+        };
+        timesync::apply_tz(&tz);
+        if !ntp_on && manual_us != 0 {
+            timesync::apply_manual_time(&shared, manual_us);
+        }
     }
 
     // 应用 cfg_brightness 到 PWM 背光（覆盖默认 60%）
@@ -432,6 +461,9 @@ fn main() {
 
         // ===== BLE 广播（手机 DTrac 直连用）— 阶段 2: GATT + rigctld 透传 =====
         ble::start_ble_thread(shared.clone());
+
+        // ===== NTP 时间同步（仅 STA 模式；线程内部等 WiFi Connected）=====
+        timesync::start_ntp_thread(shared.clone());
     } else {
         // ===== SoftAP 模式：跳过 BLE / rigctld / pc_tcp / discovery 启动 =====
         // 释放 ~48KB 内部 SRAM 给 HTTP server + DNS hijack（详见 plan 内存图）
@@ -456,8 +488,10 @@ fn main() {
             s.softap_active, s.softap_clients,
         );
         drop(s);
+        let (init_time_str, init_time_color) = timesync::current_clock(&shared);
         render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only,
-            smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total);
+            smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total,
+            init_time_str.as_str(), init_time_color);
     }
 
     // ===== 主循环: 双缓冲 + DMA 异步 =====
@@ -512,10 +546,23 @@ fn main() {
     const BOOT_GRACE_US: u64 = 8_000_000; // 启动 8 秒宽限期
     let mut auto_boot_attempted: bool = false;
 
+    // ===== 时钟每秒 tick（用于驱动右上角 HH:MM:SS 每秒刷新）=====
+    // last_displayed_sec 跟踪上次渲染时的 unix 秒数；秒数变化且已同步 → 触发 clock_tick → redraw
+    // 未同步时 synced=false → 不触发，屏幕静态显示 "--:--:--" 省 CPU
+    let mut last_displayed_sec: i64 = -1;
+
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let now_us = unsafe { esp_timer_get_time() } as u64;
         let can_redraw = now_us.saturating_sub(last_redraw_us) >= MIN_REDRAW_INTERVAL_US;
+
+        // 时钟 tick 检测：每 50ms 取 unix 秒（gettimeofday 不需要锁）
+        // 仅 last_ntp_sync_us != 0 时认为 synced；secs 变化才触发
+        let cur_unix_sec = timesync::current_unix_sec();
+        let synced_for_clock = shared.try_lock()
+            .map(|s| s.last_ntp_sync_us != 0)
+            .unwrap_or(false);
+        let clock_tick = synced_for_clock && cur_unix_sec != last_displayed_sec;
 
         if let Ok(mut s) = shared.try_lock() {
             // 顶栏 status_msg 自动过期清理（如 "Power Toggle FAILED" 5 秒后清空）
@@ -536,7 +583,8 @@ fn main() {
             let pc_changed = s.pc_alive != last_pc_alive;
             let wifi_changed = s.wifi_state != last_wifi_state || s.wifi_ip != last_wifi_ip;
             let rc_changed = s.rigctld_clients != last_rigctld_clients;
-            let any_change = radio_changed || pc_changed || wifi_changed || rc_changed;
+            // clock_tick 加入 redraw 触发：每秒重绘时间区
+            let any_change = radio_changed || pc_changed || wifi_changed || rc_changed || clock_tick;
 
             // ===== 防烧屏：识别真实用户活动（排除心跳响应）=====
             // 心跳: body_count++ + 非 MAIN 侧 freq 变化（不算活动）
@@ -638,6 +686,7 @@ fn main() {
                 last_wifi_ip.clear();
                 let _ = last_wifi_ip.push_str(s.wifi_ip.as_str());
                 last_rigctld_clients = s.rigctld_clients;
+                last_displayed_sec = cur_unix_sec;  // 标记本次 redraw 已显示该秒
                 no_data_ticks = 0;
                 // tcp_only：仅 WiFi/TCP 客户端，排除 BLE（BLE 用 GATT 不用 IP）
                 let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
@@ -651,8 +700,10 @@ fn main() {
                     s.softap_active, s.softap_clients,
                 );
                 drop(s);
+                let (tstr, tcol) = timesync::current_clock(&shared);
                 render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only,
-                    smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total);
+                    smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total,
+                    tstr.as_str(), tcol);
                 last_redraw_us = now_us;
             } else if !any_change {
                 no_data_ticks += 1;
@@ -675,8 +726,10 @@ fn main() {
                         s.softap_active, s.softap_clients,
                     );
                     drop(s);
+                    let (tstr, tcol) = timesync::current_clock(&shared);
                     render_main_ui_tiled(&mut fb, &left, &right, false, pc, &ws, ip.as_str(), tcp_only,
-                        smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total);
+                        smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total,
+                        tstr.as_str(), tcol);
                 }
             }
 
