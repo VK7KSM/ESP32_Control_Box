@@ -23,11 +23,14 @@ except ImportError:  # pragma: no cover - handled at runtime
 
 
 RE_ANSI = re.compile(r"\x1b\[[0-9;]*m")
-RE_ACCEPT = re.compile(r"\[Rigctld\] 接受连接：(?P<peer>\S+) clients_before=(?P<clients_before>\d+) session_before=(?P<session_before>\d+) RX采样=(?P<rx_sample>\S+)")
-RE_CLOSE = re.compile(r"\[Rigctld\] 连接 (?P<peer>\S+) 已关闭，handler_session=(?P<handler_session>\S+) current_session=(?P<current_session>\d+) 剩余 (?P<remaining>\d+) 客户端")
+RE_ACCEPT = re.compile(r"\[Rigctld\] 接受连接：(?P<peer>\S+) clients_before=(?P<clients_before>\d+)(?: ble_clients_before=(?P<ble_clients_before>\d+))? session_before=(?P<session_before>\d+) RX采样=(?P<rx_sample>\S+)(?: uptime_ms=(?P<uptime_ms>\d+))?")
+RE_CLOSE = re.compile(r"\[Rigctld\] 连接 (?P<peer>\S+) 已关闭，(?:reason=(?P<reason>\S+) )?handler_session=(?P<handler_session>\S+) current_session=(?P<current_session>\d+) 剩余 (?P<remaining>\d+) 客户端")
 RE_REASON_FIN = re.compile(r"\[Rigctld\] 对端 TCP 正常关闭 .*handler_session=(?P<handler_session>\S+)")
 RE_REASON_IDLE = re.compile(r"\[Rigctld\] 10s 无命令，关闭空闲 client .*handler_session=(?P<handler_session>\S+)")
 RE_REASON_ERR = re.compile(r"\[Rigctld\] 对端异常断开 kind=(?P<kind>\S+) err=(?P<err>.*?) handler_session=(?P<handler_session>\S+)")
+RE_TCP_REASON = re.compile(r"\[RigctldTCP\] peer=(?P<peer>\S+) close_reason=(?P<reason>\S+)(?: .*?)?handler_session=(?P<handler_session>\S+)")
+RE_TCP_IDLE = re.compile(r"\[RigctldTCP\] peer=(?P<peer>\S+) idle=(?P<idle_ms>\d+)ms handler_session=(?P<handler_session>\S+) waiting_for_command")
+RE_TCP_CMD = re.compile(r"\[RigctldTCP\] peer=(?P<peer>\S+) cmd_name=\"?(?P<cmd_name>[^\"\s]+)\"? stateful=(?P<stateful>\S+) since_last=(?P<since_last_ms>\d+)ms handler_session=(?P<handler_session>\S+)")
 RE_SESSION_START = re.compile(r"\[RigctldGate\].*启动 SatSession #(?P<session>\d+)")
 RE_SESSION_BIND = re.compile(r"\[SatSession #(?P<session>\d+)\] 绑定本次 DTrac 会话: RX=(?P<rx>\S+) TX=(?P<tx>[^（\s]+)")
 RE_SETUP_EXHAUSTED = re.compile(r"\[SatGate #(?P<session>\d+)\] setup attempts exhausted")
@@ -122,8 +125,27 @@ class EventDetector:
             ev = add("rigctld_disconnect_reason", "warn", {"reason": "tcp_error", **fields})
             self.last_disconnect_reason = ev
 
+        if m := RE_TCP_IDLE.search(parse_line):
+            add("rigctld_tcp_idle", "info", m.groupdict())
+
+        if m := RE_TCP_CMD.search(parse_line):
+            add("rigctld_tcp_command", "info", m.groupdict())
+
+        if m := RE_TCP_REASON.search(parse_line):
+            fields = m.groupdict()
+            ev = add("rigctld_disconnect_reason", "warn", fields)
+            self.last_disconnect_reason = ev
+
         if m := RE_CLOSE.search(parse_line):
             fields = m.groupdict()
+            if fields.get("reason") and not self.last_disconnect_reason:
+                self.last_disconnect_reason = Event(
+                    ts=ts,
+                    event="rigctld_disconnect_reason",
+                    severity="warn",
+                    raw=line,
+                    fields={"reason": fields["reason"], "handler_session": fields.get("handler_session")},
+                )
             self.last_peer = fields.get("peer")
             close_event = add("rigctld_client_closed", "warn", fields)
             if fields.get("remaining") == "0":
@@ -235,6 +257,8 @@ REPORT_EVENTS = {
     "esp32_crash_marker",
     "intentional_restart",
     "rigctld_accept",
+    "rigctld_tcp_idle",
+    "rigctld_tcp_command",
     "sat_session_started",
     "sat_session_bound",
     "rigctld_disconnect_reason",
@@ -248,7 +272,7 @@ REPORT_EVENTS = {
 
 
 def now_iso() -> str:
-    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    return dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
 def file_stamp() -> str:
@@ -428,7 +452,7 @@ def handle_line(line: str, source: str, detector: EventDetector, outputs: RunOut
     ts = now_iso()
     outputs.write_raw(ts, line, source=source)
     if not args.no_terminal_log and source != "parse":
-        print(line)
+        print(f"{ts} {line}")
     for event in detector.process(line, ts):
         outputs.write_event(event)
         outputs.append_report(event)
@@ -538,11 +562,13 @@ def write_self_test_log(out_dir: Path) -> Path:
                 "I (1234) elfradio_hwnode: ElfRadio HwNode 启动中...",
                 "[Rigctld] 接受连接：192.168.2.208:43640 clients_before=0 session_before=0 RX采样=LEFT",
                 "[RigctldGate] cmd=\"F 145902500\" name=Some(\"set_freq\") 启动 SatSession #1",
+                "[RigctldTCP] peer=192.168.2.208:43640 cmd_name=\"F\" stateful=true since_last=1234ms handler_session=None",
+                "[RigctldTCP] peer=192.168.2.208:43640 idle=3002ms handler_session=Some(1) waiting_for_command",
                 "[SatSession #1] 绑定本次 DTrac 会话: RX=LEFT TX=RIGHT（连接时 MAIN 作为 RX）",
                 "[MenuNav] Guard2 fail #28 alive=false tx=false busy=true",
                 "[SatGate #1] setup attempts exhausted",
-                "[Rigctld] 10s 无命令，关闭空闲 client (read_timeout/无 DTrac F/I/S)，handler_session=Some(1)",
-                "[Rigctld] 连接 192.168.2.208:43640 已关闭，handler_session=Some(1) current_session=1 剩余 0 客户端",
+                "[RigctldTCP] peer=192.168.2.208:43640 close_reason=IDLE_NO_COMMAND_10S idle=10005ms handler_session=Some(1)",
+                "[Rigctld] 连接 192.168.2.208:43640 已关闭，reason=IDLE_NO_COMMAND_10S handler_session=Some(1) current_session=1 剩余 0 客户端",
                 "***ERROR*** A stack overflow in task pthread has been detected.",
                 "[SatSession] 断开后 RX/TX SQL 关闭注入完成",
             ]

@@ -32,14 +32,23 @@ const SAT_RX_SQL_OPEN_ADC: u16 = 20;
 const SAT_RX_SQL_CLOSE_ADC: u16 = 564;  // 60% 安全关闭，断开后注入两侧
 const SAT_SETUP_RETRY_US: u64 = 10_000_000;
 const SAT_REWRITE_RETRY_US: u64 = 1_000_000;
+const SAT_FREQ_RETRY_LATER_US: u64 = 1_000_000;
 const SAT_SETUP_SNAPSHOT_US: u64 = 800_000;
 const SAT_SETUP_MAX_ATTEMPTS: u8 = 20;
 const SAT_FREQ_CONFIRM_MAX_RETRIES: u8 = 3;
 const SAT_GATE_LOG_INTERVAL_US: u64 = 5_000_000;
 const SAT_MISSING_TX_I_FALLBACK_US: u64 = 2_000_000;
+const TCP_IDLE_CLOSE_US: u64 = 10_000_000;
+const TCP_IDLE_LOG_STEP_US: u64 = 3_000_000;
 const TX_PLACEHOLDER_HZ: u64 = 0;
 const SAT_KEYBOARD_ACCEPT_HZ: u64 = 6_000;
 const SAT_REWRITE_THRESHOLD_HZ: u64 = SAT_KEYBOARD_ACCEPT_HZ;
+
+#[derive(Clone, Copy)]
+struct RigctldClientEnd {
+    handler_session_id: Option<u32>,
+    reason: &'static str,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum ToneMode {
@@ -506,27 +515,50 @@ fn rigctld_main(state: SharedState) {
                         continue;
                     }
                     let now_us = unsafe { esp_timer_get_time() } as u64;
-                    let (rx_is_left_at_accept, clients_before, session_before) = {
+                    let (rx_is_left_at_accept, clients_before, ble_before, session_before) = {
                         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                         if s.rigctld_clients > 0 {
                             let owner_name = if s.ble_clients > 0 { "BLE" } else { "TCP" };
+                            let clients = s.rigctld_clients;
+                            let ble_clients = s.ble_clients;
+                            let session_id = s.rigctld_session_id;
                             drop(s);
                             let msg = format!("RPRT -1\nCONFLICT: rigctld already in use by {}\n", owner_name);
                             let _ = stream.write_all(msg.as_bytes());
                             let _ = stream.flush();
-                            log::warn!("[Rigctld] 拒绝 {}：rigctld 已被 {} 占用", peer, owner_name);
+                            log::warn!(
+                                "[Rigctld] 拒绝 {}：rigctld 已被 {} 占用 clients={} ble_clients={} current_session={}",
+                                peer,
+                                owner_name,
+                                clients,
+                                ble_clients,
+                                session_id
+                            );
                             drop(stream);
                             continue;
                         }
                         set_connection_status_if_idle(&mut s, "Rigctld WiFi", now_us);
-                        let captured = (capture_rx_side(&s, s.rigctld_session_id), s.rigctld_clients, s.rigctld_session_id);
+                        let captured = (
+                            capture_rx_side(&s, s.rigctld_session_id),
+                            s.rigctld_clients,
+                            s.ble_clients,
+                            s.rigctld_session_id,
+                        );
                         s.rigctld_clients = s.rigctld_clients.saturating_add(1);
                         captured
                     };
                     active.fetch_add(1, Ordering::SeqCst);
                     let st = state.clone();
                     let act = active.clone();
-                    log::info!("[Rigctld] 接受连接：{} clients_before={} session_before={} RX采样={}", peer, clients_before, session_before, side_name(rx_is_left_at_accept));
+                    log::info!(
+                        "[Rigctld] 接受连接：{} clients_before={} ble_clients_before={} session_before={} RX采样={} uptime_ms={}",
+                        peer,
+                        clients_before,
+                        ble_before,
+                        session_before,
+                        side_name(rx_is_left_at_accept),
+                        now_us / 1000
+                    );
                     // per-client handler 也绑 CPU 1（与 acceptor 同核）
                     let _ = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
                         pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
@@ -536,11 +568,11 @@ fn rigctld_main(state: SharedState) {
                         .name(format!("rigctld_{}", peer.port()))
                         .stack_size(4096)
                         .spawn(move || {
-                            let handler_session_id = handle_client(stream, &st, rx_is_left_at_accept);
+                            let end = handle_client(stream, &st, rx_is_left_at_accept, peer.to_string());
                             act.fetch_sub(1, Ordering::SeqCst);
                             let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
                             s.rigctld_clients = s.rigctld_clients.saturating_sub(1);
-                            if handler_session_id == Some(s.rigctld_session_id) {
+                            if end.handler_session_id == Some(s.rigctld_session_id) {
                                 s.rigctld_target_hz = None;
                                 s.rigctld_setup_running = false;
                                 s.ptt_override = false;
@@ -549,11 +581,18 @@ fn rigctld_main(state: SharedState) {
                                 s.rigctld_target_hz = None;
                                 s.rigctld_setup_running = false;
                                 s.ptt_override = false;
-                                if handler_session_id.is_none() {
+                                if end.handler_session_id.is_none() {
                                     clear_sat_session(&mut s);
                                 }
                             }
-                            log::info!("[Rigctld] 连接 {} 已关闭，handler_session={:?} current_session={} 剩余 {} 客户端", peer, handler_session_id, s.rigctld_session_id, s.rigctld_clients);
+                            log::info!(
+                                "[Rigctld] 连接 {} 已关闭，reason={} handler_session={:?} current_session={} 剩余 {} 客户端",
+                                peer,
+                                end.reason,
+                                end.handler_session_id,
+                                s.rigctld_session_id,
+                                s.rigctld_clients
+                            );
                         });
                     if let Err(e) = spawn_result {
                         active.fetch_sub(1, Ordering::SeqCst);
@@ -582,15 +621,17 @@ fn rigctld_main(state: SharedState) {
     }
 }
 
-fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: bool) -> Option<u32> {
+fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: bool, peer: String) -> RigctldClientEnd {
     let _ = stream.set_nodelay(true);
-    // 3s read timeout 只用于轮询检查 stale session；不能因 DTrac 暂时无命令就主动断开 TCP。
+    // 3s read timeout 用于轮询检查 stale session 和 TCP 空闲回收。
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     // ESP-IDF lwip 不可靠支持 TcpStream::try_clone()。改用单一 stream + BufReader 包装，
     // 通过 BufReader::get_mut() 写回原 stream（buffered read + raw write 共用同一句柄）
     let mut reader = BufReader::new(stream);
     let mut buf: Vec<u8> = Vec::new();
     let mut line = String::new();
+    let mut last_line_us = unsafe { esp_timer_get_time() } as u64;
+    let mut last_idle_log_step: u64 = 0;
     let mut handler_session_id: Option<u32> = None;
 
     loop {
@@ -598,23 +639,44 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
         // 用 read_until 而非 read_line：避免单字节 TCP 噪音 (非 UTF-8) 杀掉整个连接
         match reader.read_until(b'\n', &mut buf) {
             Ok(0) => {
-                log::info!("[Rigctld] 对端 TCP 正常关闭 (Ok(0)/FIN)，handler_session={:?}", handler_session_id);
-                return handler_session_id;
+                log::info!("[RigctldTCP] peer={} close_reason=FIN_OK0 handler_session={:?}", peer, handler_session_id);
+                return RigctldClientEnd { handler_session_id, reason: "FIN_OK0" };
             }
             Ok(_) => {}
             Err(e) => match e.kind() {
                 ErrorKind::TimedOut | ErrorKind::WouldBlock => {
                     if let Some(id) = handler_session_id {
                         if !handler_session_is_current(state, id) {
-                            log::info!("[Rigctld] handler session #{} 已过期，关闭旧 client", id);
-                            return handler_session_id;
+                            log::info!("[RigctldTCP] peer={} close_reason=STALE_SESSION handler_session={:?}", peer, handler_session_id);
+                            return RigctldClientEnd { handler_session_id, reason: "STALE_SESSION" };
                         }
+                    }
+                    let now_us = unsafe { esp_timer_get_time() } as u64;
+                    let idle_us = now_us.saturating_sub(last_line_us);
+                    let idle_step = idle_us / TCP_IDLE_LOG_STEP_US;
+                    if idle_step > last_idle_log_step && idle_us < TCP_IDLE_CLOSE_US {
+                        last_idle_log_step = idle_step;
+                        log::info!(
+                            "[RigctldTCP] peer={} idle={}ms handler_session={:?} waiting_for_command",
+                            peer,
+                            idle_us / 1000,
+                            handler_session_id
+                        );
+                    }
+                    if idle_us >= TCP_IDLE_CLOSE_US {
+                        log::info!(
+                            "[RigctldTCP] peer={} close_reason=IDLE_NO_COMMAND_10S idle={}ms handler_session={:?}",
+                            peer,
+                            idle_us / 1000,
+                            handler_session_id
+                        );
+                        return RigctldClientEnd { handler_session_id, reason: "IDLE_NO_COMMAND_10S" };
                     }
                     continue;
                 }
                 kind => {
-                    log::warn!("[Rigctld] 对端异常断开 kind={:?} err={} handler_session={:?}", kind, e, handler_session_id);
-                    return handler_session_id;
+                    log::warn!("[RigctldTCP] peer={} close_reason=READ_ERROR kind={:?} err={} handler_session={:?}", peer, kind, e, handler_session_id);
+                    return RigctldClientEnd { handler_session_id, reason: "READ_ERROR" };
                 }
             },
         }
@@ -623,13 +685,25 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
         line.push_str(&String::from_utf8_lossy(&buf));
         let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
         if trimmed.is_empty() { continue; }
+        let now_us = unsafe { esp_timer_get_time() } as u64;
+        let since_last_ms = now_us.saturating_sub(last_line_us) / 1000;
+        last_line_us = unsafe { esp_timer_get_time() } as u64;
+        last_idle_log_step = 0;
 
         let cmd_name = command_name(trimmed);
         let is_stateful = is_stateful_dtrac_command(trimmed);
+        log::info!(
+            "[RigctldTCP] peer={} cmd_name={:?} stateful={} since_last={}ms handler_session={:?}",
+            peer,
+            cmd_name,
+            is_stateful,
+            since_last_ms,
+            handler_session_id
+        );
         if let Some(id) = handler_session_id {
             if !handler_session_is_current(state, id) {
-                log::info!("[RigctldGate] cmd={:?} handler_session #{} 已过期，关闭旧 client", trimmed, id);
-                return handler_session_id;
+                log::info!("[RigctldTCP] peer={} close_reason=STALE_SESSION_ON_CMD cmd={:?} handler_session={:?}", peer, trimmed, handler_session_id);
+                return RigctldClientEnd { handler_session_id, reason: "STALE_SESSION_ON_CMD" };
             }
         } else if is_stateful {
             let session_id = begin_sat_session(state, rx_is_left_at_accept);
@@ -641,12 +715,21 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
 
         let resp = match dispatch(trimmed, state) {
             DispatchOut::Reply(s) => s,
-            DispatchOut::Quit => return handler_session_id,
+            DispatchOut::Quit => {
+                log::info!("[RigctldTCP] peer={} close_reason=QUIT_CMD handler_session={:?}", peer, handler_session_id);
+                return RigctldClientEnd { handler_session_id, reason: "QUIT_CMD" };
+            }
         };
         if !resp.is_empty() {
             let inner = reader.get_mut();
-            if inner.write_all(resp.as_bytes()).is_err() { return handler_session_id; }
-            let _ = inner.flush();
+            if let Err(e) = inner.write_all(resp.as_bytes()) {
+                log::warn!("[RigctldTCP] peer={} close_reason=WRITE_ERROR cmd_name={:?} err={} handler_session={:?}", peer, cmd_name, e, handler_session_id);
+                return RigctldClientEnd { handler_session_id, reason: "WRITE_ERROR" };
+            }
+            if let Err(e) = inner.flush() {
+                log::warn!("[RigctldTCP] peer={} close_reason=FLUSH_ERROR cmd_name={:?} err={} handler_session={:?}", peer, cmd_name, e, handler_session_id);
+                return RigctldClientEnd { handler_session_id, reason: "FLUSH_ERROR" };
+            }
         }
     }
 }
@@ -1613,6 +1696,13 @@ struct SatSideSetupResult {
     step_verified: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SatFreqResult {
+    Done,
+    RetryLater,
+    Failed,
+}
+
 fn sat_setup_side(state: &SharedState, is_left: bool, target_hz: u64, role: &str, session_id: u32) -> SatSideSetupResult {
     if !ensure_main_side(state, is_left) {
         return SatSideSetupResult { freq_input_done: false, step_verified: false };
@@ -1689,15 +1779,23 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
     };
 
     log::info!("[SatSession #{}] 单阶段初始化 {} {}", session_id, stage, side_name(is_left));
-    let ok = match stage {
-        "PREFLIGHT_SQL_CLOSE_LEFT" | "PREFLIGHT_SQL_CLOSE_RIGHT" => sat_preflight_sql_close(state, is_left),
-        "RX_FREQ" | "TX_FREQ" => sat_setup_frequency_only(state, is_left, target_hz, stage, session_id),
-        "RX_STEP" | "TX_STEP" => sat_setup_step_only(state, is_left, stage, session_id),
-        "RX_TONE_CLEAR" => sat_clear_rx_tone_if_needed(state, is_left),
-        "TX_CTCSS_FREQ" => sat_set_tx_ctcss_freq(state, is_left),
-        "TX_TONE_MODE" => sat_set_tx_tone_mode(state, is_left),
-        "RX_SQL_OPEN" => sat_open_rx_squelch(state, is_left),
-        _ => false,
+    let freq_result = if matches!(stage, "RX_FREQ" | "TX_FREQ") {
+        Some(sat_setup_frequency_only(state, is_left, target_hz, stage, session_id))
+    } else {
+        None
+    };
+    let ok = match freq_result {
+        Some(SatFreqResult::Done) => true,
+        Some(SatFreqResult::RetryLater | SatFreqResult::Failed) => false,
+        None => match stage {
+            "PREFLIGHT_SQL_CLOSE_LEFT" | "PREFLIGHT_SQL_CLOSE_RIGHT" => sat_preflight_sql_close(state, is_left),
+            "RX_STEP" | "TX_STEP" => sat_setup_step_only(state, is_left, stage, session_id),
+            "RX_TONE_CLEAR" => sat_clear_rx_tone_if_needed(state, is_left),
+            "TX_CTCSS_FREQ" => sat_set_tx_ctcss_freq(state, is_left),
+            "TX_TONE_MODE" => sat_set_tx_tone_mode(state, is_left),
+            "RX_SQL_OPEN" => sat_open_rx_squelch(state, is_left),
+            _ => false,
+        },
     };
 
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1746,6 +1844,9 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
     if ok {
         s.rigctld_setup_attempts = 0;
         log::info!("[SatSession #{}] {} 完成", session_id, stage);
+    } else if freq_result == Some(SatFreqResult::RetryLater) {
+        s.rigctld_sat_retry_after_us = now + SAT_FREQ_RETRY_LATER_US;
+        log::info!("[SatSession #{}] {} 暂时不适合写频，{}ms 后重试", session_id, stage, SAT_FREQ_RETRY_LATER_US / 1000);
     } else {
         s.rigctld_setup_attempts = s.rigctld_setup_attempts.saturating_add(1);
         let freq_stage = matches!(stage, "RX_FREQ" | "TX_FREQ");
@@ -1823,28 +1924,28 @@ fn wait_side_freq_confirmed(state: &SharedState, is_left: bool, target_hz: u64, 
     }
 }
 
-fn reset_rx_freq_input_with_knob(state: &SharedState, rx_is_left: bool, session_id: u32) -> bool {
+fn reset_rx_freq_input_with_knob(state: &SharedState, rx_is_left: bool, session_id: u32) -> SatFreqResult {
     let already_recovered = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.rigctld_rx_input_recovered
     };
     if already_recovered {
-        return true;
+        return SatFreqResult::Done;
     }
     if !ensure_main_side(state, rx_is_left) {
-        return false;
+        return SatFreqResult::RetryLater;
     }
     let start_us = unsafe { esp_timer_get_time() } as u64;
     {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         if s.ptt_override || s.left.is_tx || s.right.is_tx {
             log::warn!("[SatSession #{}] RX {} 频率输入恢复跳过：PTT/TX active", session_id, side_name(rx_is_left));
-            return false;
+            return SatFreqResult::RetryLater;
         }
         let rx = if rx_is_left { &s.left } else { &s.right };
         if rx.is_busy {
-            log::warn!("[SatSession #{}] RX {} busy，延后频率输入恢复", session_id, side_name(rx_is_left));
-            return false;
+            log::info!("[SatSession #{}] RX {} busy，跳过辅助旋钮恢复，继续写频", session_id, side_name(rx_is_left));
+            return SatFreqResult::Done;
         }
         s.key_override = None;
         s.key_release = false;
@@ -1855,16 +1956,19 @@ fn reset_rx_freq_input_with_knob(state: &SharedState, rx_is_left: bool, session_
     inject_knob_wait(state, step);
     if !wait_pending_clear(state, Duration::from_secs(2)) {
         log::warn!("[SatSession #{}] 等待 RX {} 旋钮恢复帧发送超时", session_id, side_name(rx_is_left));
-        return false;
+        return SatFreqResult::RetryLater;
     }
     let ok = wait_side_freq_frame_after(state, rx_is_left, start_us, Duration::from_secs(2), session_id);
     if ok {
         state.lock().unwrap_or_else(|e| e.into_inner()).rigctld_rx_input_recovered = true;
+        SatFreqResult::Done
+    } else {
+        log::warn!("[SatSession #{}] RX {} 辅助旋钮恢复未确认，稍后再试", session_id, side_name(rx_is_left));
+        SatFreqResult::RetryLater
     }
-    ok
 }
 
-fn sat_setup_frequency_only(state: &SharedState, is_left: bool, target_hz: u64, role: &str, session_id: u32) -> bool {
+fn sat_setup_frequency_only(state: &SharedState, is_left: bool, target_hz: u64, role: &str, session_id: u32) -> SatFreqResult {
     let placeholder = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         role == "TX_FREQ" && s.rigctld_tx_placeholder_active && target_hz == TX_PLACEHOLDER_HZ
@@ -1882,17 +1986,28 @@ fn sat_setup_frequency_only(state: &SharedState, is_left: bool, target_hz: u64, 
             side_name(is_left),
             target_hz
         );
-        return true;
+        return SatFreqResult::Done;
     }
 
-    if role == "RX_FREQ" && !reset_rx_freq_input_with_knob(state, is_left, session_id) {
-        return false;
+    if role == "RX_FREQ" {
+        let recover = reset_rx_freq_input_with_knob(state, is_left, session_id);
+        if recover == SatFreqResult::RetryLater {
+            return SatFreqResult::RetryLater;
+        }
     }
     if !ensure_main_side(state, is_left) {
-        return false;
+        return SatFreqResult::RetryLater;
     }
     {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.ptt_override || s.left.is_tx || s.right.is_tx {
+            log::warn!("[SatSession #{}] {} {} 写频暂缓：PTT/TX active", session_id, role, side_name(is_left));
+            return SatFreqResult::RetryLater;
+        }
+        if s.key_override.is_some() || s.key_release || s.knob_inject.is_some() || s.vol_changed || s.sql_changed {
+            log::warn!("[SatSession #{}] {} {} 写频暂缓：注入队列未清", session_id, role, side_name(is_left));
+            return SatFreqResult::RetryLater;
+        }
         s.macro_running = true;
         s.key_override = None;
         s.key_release = false;
@@ -1910,7 +2025,11 @@ fn sat_setup_frequency_only(state: &SharedState, is_left: bool, target_hz: u64, 
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     clear_side_menu_display(&mut s, is_left);
     s.macro_running = false;
-    ok
+    if ok {
+        SatFreqResult::Done
+    } else {
+        SatFreqResult::Failed
+    }
 }
 
 
