@@ -50,6 +50,8 @@ pub struct BandState {
     pub menu_text: String<12>,
     pub menu_in_value: bool,
     pub menu_exit_count: u8,
+    // SET 入口授权截止时间：只有用户/固件按 SET 后的短窗口内，Len=09 文本才可新建菜单态。
+    pub set_entry_armed_until_us: u64,
     // 机头频率区当前非数字文本（Len=09 原始文本）；为空时显示 freq
     pub display_text: String<12>,
     pub last_freq_frame_us: u64,
@@ -89,6 +91,7 @@ impl BandState {
             menu_text: String::new(),
             menu_in_value: false,
             menu_exit_count: 0,
+            set_entry_armed_until_us: 0,
             display_text: String::new(),
             last_freq_frame_us: 0,
         };

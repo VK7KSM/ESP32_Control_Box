@@ -21,6 +21,22 @@
 use crate::state::{PowerLevel, RadioState};
 use esp_idf_svc::sys::esp_timer_get_time;
 
+const SET_ENTRY_ARM_US: u64 = 3_000_000;
+
+fn format_voltage_text(src: &heapless::String<12>) -> heapless::String<12> {
+    let text = src.trim();
+    let mut out: heapless::String<12> = heapless::String::new();
+    let Some(digits) = text.strip_suffix('V') else { return out; };
+    if digits.len() >= 3 && digits.len() <= 4 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        let split = digits.len() - 1;
+        let _ = out.push_str(&digits[..split]);
+        let _ = out.push('.');
+        let _ = out.push_str(&digits[split..]);
+        let _ = out.push('V');
+    }
+    out
+}
+
 /// 根据 6 位频率（kHz 整数）推算末三位（100Hz/10Hz/1Hz），级联尝试所有标准步进网格
 /// TH-9800 协议只传 6 位 ASCII（精度 1kHz），面板 LCD 的末三位由本地计算
 fn compute_sub_khz(freq_khz: u32) -> &'static str {
@@ -365,6 +381,7 @@ impl DownParser {
                     band.menu_text.clear();
                     band.menu_in_value = false;
                     band.menu_exit_count = 0;
+                    band.set_entry_armed_until_us = 0;
                 }
             } else {
                 band.menu_exit_count = 0;
@@ -418,6 +435,8 @@ impl DownParser {
             return;
         }
 
+        let mut suppress_raw_display = false;
+
         // 非频率 + 稳定显示标志 (flag bit6) + 非功率文本 → 菜单名称或菜单值
         if !is_freq && (flag & 0x40) != 0 {
             let mt_start = raw.iter().position(|&c| c > b' ').unwrap_or(6);
@@ -427,25 +446,41 @@ impl DownParser {
                     if c > b' ' && c < 0x7F { let _ = new_text.push(c as char); }
                 }
                 if !new_text.is_empty() {
-                    if new_text != band.menu_text {
-                        band.menu_text = new_text;
+                    let now_us = unsafe { esp_timer_get_time() } as u64;
+                    let can_enter_set = band.is_set || now_us <= band.set_entry_armed_until_us;
+                    if can_enter_set {
+                        if new_text != band.menu_text {
+                            band.menu_text = new_text;
+                        }
+                        band.is_set = true;
+                        band.menu_exit_count = 0;
+                        // had_channel=true → 顶级菜单（Len=06+Len=09 成对）；false → 值编辑（仅 Len=09）
+                        band.menu_in_value = !had_channel;
+                    } else {
+                        let voltage_text = format_voltage_text(&new_text);
+                        if !voltage_text.is_empty() {
+                            band.display_text.clear();
+                            let _ = band.display_text.push_str(voltage_text.as_str());
+                            suppress_raw_display = true;
+                        } else if new_text.as_str() == "BACKLIGHT" {
+                            band.display_text.clear();
+                            suppress_raw_display = true;
+                        }
                     }
-                    band.is_set = true;
-                    band.menu_exit_count = 0;
-                    // had_channel=true → 顶级菜单（Len=06+Len=09 成对）；false → 值编辑（仅 Len=09）
-                    band.menu_in_value = !had_channel;
                 }
             }
         }
 
         let first = raw.iter().position(|&c| c > b' ');
         let last = raw.iter().rposition(|&c| c > b' ');
-        if let (Some(first), Some(last)) = (first, last) {
+        if !suppress_raw_display {
+            if let (Some(first), Some(last)) = (first, last) {
             band.display_text.clear();
             for &c in &raw[first..=last] {
                 if c >= b' ' && c < 0x7F {
                     let _ = band.display_text.push(c as char);
                 }
+            }
             }
         }
     }
@@ -545,7 +580,10 @@ impl UpParser {
                     band.menu_text.clear();
                     band.menu_in_value = false;
                     band.menu_exit_count = 0;
+                    band.set_entry_armed_until_us = 0;
                     band.display_text.clear();
+                } else {
+                    band.set_entry_armed_until_us = (unsafe { esp_timer_get_time() } as u64).saturating_add(SET_ENTRY_ARM_US);
                 }
             }
         }

@@ -565,14 +565,13 @@ fn rigctld_main(state: SharedState) {
 
 fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: bool) -> Option<u32> {
     let _ = stream.set_nodelay(true);
-    // 3s 无数据自动断开（DTrac 断开后尽快还原 IP 状态）
+    // 3s read timeout 只用于轮询检查 stale session；不能因 DTrac 暂时无命令就主动断开 TCP。
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     // ESP-IDF lwip 不可靠支持 TcpStream::try_clone()。改用单一 stream + BufReader 包装，
     // 通过 BufReader::get_mut() 写回原 stream（buffered read + raw write 共用同一句柄）
     let mut reader = BufReader::new(stream);
     let mut buf: Vec<u8> = Vec::new();
     let mut line = String::new();
-    let mut last_line_us = unsafe { esp_timer_get_time() } as u64;
     let mut handler_session_id: Option<u32> = None;
 
     loop {
@@ -592,11 +591,6 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
                             return handler_session_id;
                         }
                     }
-                    let now_us = unsafe { esp_timer_get_time() } as u64;
-                    if now_us.saturating_sub(last_line_us) >= 60_000_000 {
-                        log::info!("[Rigctld] 60s 无命令，关闭空闲 client (read_timeout/无 DTrac F/I/S)，handler_session={:?}", handler_session_id);
-                        return handler_session_id;
-                    }
                     continue;
                 }
                 kind => {
@@ -610,7 +604,6 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
         line.push_str(&String::from_utf8_lossy(&buf));
         let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
         if trimmed.is_empty() { continue; }
-        last_line_us = unsafe { esp_timer_get_time() } as u64;
 
         let cmd_name = command_name(trimmed);
         if let Some(id) = handler_session_id {
@@ -2866,7 +2859,17 @@ fn wait_key_clear(state: &SharedState) {
 
 fn inject_key_wait(state: &SharedState, key: u8) {
     wait_key_clear(state);
-    state.lock().unwrap_or_else(|e| e.into_inner()).key_override = Some(key);
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if key == 0x20 {
+            let is_right = s.right.is_main;
+            let band = if is_right { &mut s.right } else { &mut s.left };
+            if !band.is_set {
+                band.set_entry_armed_until_us = (unsafe { esp_timer_get_time() } as u64).saturating_add(3_000_000);
+            }
+        }
+        s.key_override = Some(key);
+    }
     std::thread::sleep(Duration::from_millis(200));
     // 发送松开帧
     wait_key_clear(state);
