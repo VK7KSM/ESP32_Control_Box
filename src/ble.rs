@@ -16,7 +16,8 @@ use crate::rigctld::{
     begin_sat_session, capture_rx_side, clear_sat_session, command_name, dispatch,
     handler_session_is_current, is_stateful_dtrac_command, DispatchOut,
 };
-use crate::state::SharedState;
+use crate::state::{set_connection_status_if_idle, SharedState};
+use esp_idf_svc::sys::esp_timer_get_time;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -122,6 +123,7 @@ fn ble_main(state: SharedState) {
     //   - handler_session_id: 第一个 stateful 命令时调 begin_sat_session 创建
     let rx_is_left_at_accept: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
     let handler_session_id: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let connection_counted: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     // Write characteristic (0xFFF2) — 客户端 → ESP32 发命令
     let write_char = service.lock().create_characteristic(
@@ -164,6 +166,7 @@ fn ble_main(state: SharedState) {
 
                 // ===== Gate 逻辑（与 TCP handle_client 行 600-612 完全一致）=====
                 let cmd_name = command_name(line_trim);
+                let is_stateful = is_stateful_dtrac_command(line_trim);
                 let mut session_guard = session.lock().unwrap_or_else(|e| e.into_inner());
                 let rx_left_val = *rx_left.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -178,7 +181,7 @@ fn ble_main(state: SharedState) {
                         *session_guard = None;
                         continue;
                     }
-                } else if is_stateful_dtrac_command(line_trim) {
+                } else if is_stateful {
                     // 第一个 stateful 命令 → 启动新 sat session
                     let session_id = begin_sat_session(&state_w, rx_left_val);
                     *session_guard = Some(session_id);
@@ -238,14 +241,33 @@ fn ble_main(state: SharedState) {
     let state_conn = state.clone();
     let rx_left_conn = rx_is_left_at_accept.clone();
     let session_conn = handler_session_id.clone();
-    server.on_connect(move |_, conn_desc| {
+    let counted_conn = connection_counted.clone();
+    server.on_connect(move |server, conn_desc| {
+        let conn_handle = conn_desc.conn_handle();
+        let now_us = unsafe { esp_timer_get_time() } as u64;
+        *counted_conn.lock().unwrap_or_else(|e| e.into_inner()) = false;
         let mut s = state_conn.lock().unwrap_or_else(|e| e.into_inner());
+        if s.rigctld_clients > 0 {
+            let owner_name = if s.ble_clients > 0 { "BLE" } else { "TCP" };
+            drop(s);
+            ::log::warn!(
+                "[BLE] 拒绝客户端 {:?}：rigctld 已被 {} 占用",
+                conn_desc.address(),
+                owner_name
+            );
+            if let Err(e) = server.disconnect(conn_handle) {
+                ::log::warn!("[BLE] 冲突断开 conn_handle={} 失败: {:?}", conn_handle, e);
+            }
+            return;
+        }
+        set_connection_status_if_idle(&mut s, "Rigctld BLE", now_us);
         let session_id = s.rigctld_session_id;
         let rx_left = capture_rx_side(&s, session_id);
         s.ble_clients = s.ble_clients.saturating_add(1);
         s.rigctld_clients = s.rigctld_clients.saturating_add(1); // BLE 也是 rigctld 协议客户端
         s.head_count = s.head_count.wrapping_add(1);
         drop(s);
+        *counted_conn.lock().unwrap_or_else(|e| e.into_inner()) = true;
         *rx_left_conn.lock().unwrap_or_else(|e| e.into_inner()) = rx_left;
         *session_conn.lock().unwrap_or_else(|e| e.into_inner()) = None;
         ::log::info!(
@@ -260,11 +282,25 @@ fn ble_main(state: SharedState) {
     let state_disc = state.clone();
     let buffer_disc = line_buffer.clone();
     let session_disc = handler_session_id.clone();
+    let counted_disc = connection_counted.clone();
     server.on_disconnect(move |conn_desc, reason| {
         ::log::info!("[BLE] 客户端断开: addr={:?} reason={:?}", conn_desc.address(), reason);
 
         // 先取本 handler 的 session_id 副本，再持有 state 锁（避免锁顺序问题）
         let was_session = *session_disc.lock().unwrap_or_else(|e| e.into_inner());
+        let was_counted = {
+            let mut counted = counted_disc.lock().unwrap_or_else(|e| e.into_inner());
+            let v = *counted;
+            *counted = false;
+            v
+        };
+
+        if !was_counted {
+            buffer_disc.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            *session_disc.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            SHOULD_RESTART_ADV.store(true, Ordering::Relaxed);
+            return;
+        }
 
         let mut s = state_disc.lock().unwrap_or_else(|e| e.into_inner());
         s.ble_clients = s.ble_clients.saturating_sub(1);

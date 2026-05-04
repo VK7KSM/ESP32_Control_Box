@@ -778,26 +778,8 @@ fn main() {
                 // 仅在没有 rigctld 客户端时才超时置 alive=false。
                 // 追星会话里 TH-9800 空闲本来就可能长期不发下行帧，不能用静默推断关机；
                 // 否则会制造 false→true 边沿触发 Fix 4a，让 DTrac/TCP/BLE 被错误断开。
-                // Fix 4b：追星会话 120s 静默只进入 Radio Error 暂停态：
-                //   - 保留 DTrac 连接，继续接收最新目标；
-                //   - 暂停物理注入，避免电台链路可疑时乱写；
-                //   - 有效下行帧恢复时由 protocol.rs 清除 Radio Error 并继续追星。
-                // 注意：放在 15s gated 检查之前（避免 borrow checker 抱怨 drop(s) 后的重借）
-                // 两个检查在不同 tick 触发（300 vs 2400），顺序不影响行为
-                if no_data_ticks == 2400
-                    && s.rigctld_clients > 0
-                    && s.rigctld_sat_active
-                    && !s.rigctld_sat_paused
-                {  // 2400 × 50ms = 120s
-                    s.rigctld_sat_paused = true;
-                    s.status_msg.clear();
-                    let _ = s.status_msg.push_str("Radio Error");
-                    s.status_msg_color = state::StatusMsgColor::Amber;
-                    s.status_msg_clear_at_us = 0;
-                    s.head_count = s.head_count.wrapping_add(1);
-                    ::log::warn!("[Rigctld] 120s 无电台下行帧（clients={}，sat_active=1），暂停物理注入并显示 Radio Error",
-                        s.rigctld_clients);
-                }
+                // Fix 4b：追星会话不再用静默时间判断电台离线。
+                // TH-9800 空闲时机身/机头本来就可能长期无通信；Radio Error 只由写频确认失败触发。
                 if no_data_ticks == 300 && s.rigctld_clients == 0 {  // 300 × 50ms = 15s
                     s.radio_alive = false;
                     let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);

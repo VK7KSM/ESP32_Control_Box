@@ -6,7 +6,7 @@
 // 协议: [0xAA][0x55][Type][LenLo][LenHi][Payload...][CRC16-CCITT]
 // ===================================================================
 
-use crate::state::{PowerLevel, RadioState, SharedState};
+use crate::state::{set_connection_status_if_idle, PowerLevel, RadioState, SharedState};
 use crate::uart::{build_key_frame, build_knob_frame};
 use esp_idf_svc::sys::*;
 
@@ -478,6 +478,7 @@ pub fn pc_comm_thread(
     let init_us = unsafe { esp_timer_get_time() } as u64;
     let mut last_report_us = init_us;
     let mut last_pushed_scan_seq: u32 = 0;
+    let mut last_usb_frame_us: u64 = 0;
 
     ::log::info!("[PC通信] TinyUSB CDC-ACM 线程启动");
 
@@ -490,6 +491,13 @@ pub fn pc_comm_thread(
                 if tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, rx_buf.as_mut_ptr(), rx_buf.len(), &mut rx_size) == ESP_OK && rx_size > 0 {
                     for i in 0..rx_size {
                         if let Some(cmd) = parser.feed(rx_buf[i]) {
+                            if last_usb_frame_us == 0
+                                || now_us.saturating_sub(last_usb_frame_us) > PC_HEARTBEAT_TIMEOUT_US
+                            {
+                                let mut s = state.lock().unwrap();
+                                set_connection_status_if_idle(&mut s, "PC USB", now_us);
+                            }
+                            last_usb_frame_us = now_us;
                             // dispatch_command 内部已处理 Heartbeat 设置 pc_last_hb_us
                             let frames = dispatch_command(cmd, &state, power_pin_num, now_us);
                             for (typ, payload) in frames {

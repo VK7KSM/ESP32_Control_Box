@@ -12,7 +12,7 @@ use crate::pc_comm::{
     dispatch_command, encode_frame_vec, make_scan_payload, make_state_payload, PcParser,
     RPT_STATE, RPT_WIFI_SCAN, PC_HEARTBEAT_TIMEOUT_US,
 };
-use crate::state::{SharedState, WifiState};
+use crate::state::{set_connection_status_if_idle, SharedState, WifiState};
 use esp_idf_svc::sys::esp_timer_get_time;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -70,6 +70,10 @@ fn acceptor_main(state: SharedState, power_pin_num: i32) {
                         continue;
                     }
                     active.fetch_add(1, Ordering::SeqCst);
+                    {
+                        let mut s = state.lock().unwrap();
+                        set_connection_status_if_idle(&mut s, "PC WiFi", unsafe { esp_timer_get_time() } as u64);
+                    }
                     let st = state.clone();
                     let act = active.clone();
                     log::info!("[PC-TCP] 接受连接：{}（活跃 {}）", peer, cur + 1);

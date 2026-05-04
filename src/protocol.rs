@@ -160,6 +160,8 @@ impl DownParser {
     pub fn apply_to_state(&mut self, rs: &mut RadioState) {
         if rs.rigctld_sat_paused {
             rs.rigctld_sat_paused = false;
+            rs.rigctld_setup_attempts = 0;
+            rs.rigctld_sat_retry_after_us = 0;
             if rs.status_msg.as_str() == "Radio Error" {
                 rs.status_msg.clear();
                 rs.status_msg_clear_at_us = 0;

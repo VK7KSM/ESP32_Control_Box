@@ -15,7 +15,7 @@
 // 实际写入 TH-9800 仍由后台步进/宏流程按安全节奏执行。
 // ===================================================================
 
-use crate::state::{BandState, RadioState, SharedState, WifiState};
+use crate::state::{set_connection_status_if_idle, BandState, RadioState, SharedState, WifiState};
 use esp_idf_svc::sys::esp_timer_get_time;
 use std::io::{BufRead, BufReader, Write};
 use std::io::ErrorKind;
@@ -34,6 +34,7 @@ const SAT_SETUP_RETRY_US: u64 = 10_000_000;
 const SAT_REWRITE_RETRY_US: u64 = 1_000_000;
 const SAT_SETUP_SNAPSHOT_US: u64 = 800_000;
 const SAT_SETUP_MAX_ATTEMPTS: u8 = 20;
+const SAT_FREQ_CONFIRM_MAX_RETRIES: u8 = 3;
 const SAT_GATE_LOG_INTERVAL_US: u64 = 5_000_000;
 const SAT_MISSING_TX_I_FALLBACK_US: u64 = 2_000_000;
 const TX_PLACEHOLDER_HZ: u64 = 0;
@@ -497,22 +498,32 @@ fn rigctld_main(state: SharedState) {
 
         loop {
             match listener.accept() {
-                Ok((stream, peer)) => {
+                Ok((mut stream, peer)) => {
                     let cur = active.load(Ordering::SeqCst);
                     if cur >= MAX_CLIENTS {
                         log::warn!("[Rigctld] 拒绝 {}：已达最大并发数 {}", peer, MAX_CLIENTS);
                         drop(stream);
                         continue;
                     }
-                    active.fetch_add(1, Ordering::SeqCst);
+                    let now_us = unsafe { esp_timer_get_time() } as u64;
                     let (rx_is_left_at_accept, clients_before, session_before) = {
-                        let s = state.lock().unwrap_or_else(|e| e.into_inner());
-                        (capture_rx_side(&s, s.rigctld_session_id), s.rigctld_clients, s.rigctld_session_id)
-                    };
-                    {
                         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                        if s.rigctld_clients > 0 {
+                            let owner_name = if s.ble_clients > 0 { "BLE" } else { "TCP" };
+                            drop(s);
+                            let msg = format!("RPRT -1\nCONFLICT: rigctld already in use by {}\n", owner_name);
+                            let _ = stream.write_all(msg.as_bytes());
+                            let _ = stream.flush();
+                            log::warn!("[Rigctld] 拒绝 {}：rigctld 已被 {} 占用", peer, owner_name);
+                            drop(stream);
+                            continue;
+                        }
+                        set_connection_status_if_idle(&mut s, "Rigctld WiFi", now_us);
+                        let captured = (capture_rx_side(&s, s.rigctld_session_id), s.rigctld_clients, s.rigctld_session_id);
                         s.rigctld_clients = s.rigctld_clients.saturating_add(1);
-                    }
+                        captured
+                    };
+                    active.fetch_add(1, Ordering::SeqCst);
                     let st = state.clone();
                     let act = active.clone();
                     log::info!("[Rigctld] 接受连接：{} clients_before={} session_before={} RX采样={}", peer, clients_before, session_before, side_name(rx_is_left_at_accept));
@@ -614,12 +625,13 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
         if trimmed.is_empty() { continue; }
 
         let cmd_name = command_name(trimmed);
+        let is_stateful = is_stateful_dtrac_command(trimmed);
         if let Some(id) = handler_session_id {
             if !handler_session_is_current(state, id) {
                 log::info!("[RigctldGate] cmd={:?} handler_session #{} 已过期，关闭旧 client", trimmed, id);
                 return handler_session_id;
             }
-        } else if is_stateful_dtrac_command(trimmed) {
+        } else if is_stateful {
             let session_id = begin_sat_session(state, rx_is_left_at_accept);
             handler_session_id = Some(session_id);
             log::info!("[RigctldGate] cmd={:?} name={:?} 启动 SatSession #{}", trimmed, cmd_name, session_id);
@@ -1736,8 +1748,24 @@ fn sat_setup_one_stage(state: &SharedState, rx_hz: u64, tx_hz: u64, rx_is_left: 
         log::info!("[SatSession #{}] {} 完成", session_id, stage);
     } else {
         s.rigctld_setup_attempts = s.rigctld_setup_attempts.saturating_add(1);
-        s.rigctld_sat_retry_after_us = now + SAT_SETUP_RETRY_US;
-        log::warn!("[SatSession #{}] {} 失败，仅重试当前阶段，{}s 后允许重试", session_id, stage, SAT_SETUP_RETRY_US / 1_000_000);
+        let freq_stage = matches!(stage, "RX_FREQ" | "TX_FREQ");
+        if freq_stage && s.rigctld_setup_attempts > SAT_FREQ_CONFIRM_MAX_RETRIES {
+            s.rigctld_sat_paused = true;
+            s.status_msg.clear();
+            let _ = s.status_msg.push_str("Radio Error");
+            s.status_msg_color = crate::state::StatusMsgColor::Amber;
+            s.status_msg_clear_at_us = 0;
+            s.head_count = s.head_count.wrapping_add(1);
+            log::warn!(
+                "[SatSession #{}] {} 写频确认连续失败 {} 次，进入 Radio Error 暂停态，保留 rigctld 连接和最新目标",
+                session_id,
+                stage,
+                s.rigctld_setup_attempts
+            );
+        } else {
+            s.rigctld_sat_retry_after_us = now + SAT_SETUP_RETRY_US;
+            log::warn!("[SatSession #{}] {} 失败，仅重试当前阶段，{}s 后允许重试", session_id, stage, SAT_SETUP_RETRY_US / 1_000_000);
+        }
     }
 }
 

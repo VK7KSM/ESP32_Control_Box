@@ -150,6 +150,22 @@ pub enum WifiState {
     Failed,          // 多次重试失败
 }
 
+fn is_connection_status_msg(text: &str) -> bool {
+    matches!(text, "Rigctld BLE" | "Rigctld WiFi" | "PC USB" | "PC WiFi")
+}
+
+/// 低优先级连接提示：只覆盖空状态或上一条连接提示，不覆盖 Radio Error / 红色错误 / 电源流程
+pub fn set_connection_status_if_idle(rs: &mut RadioState, text: &str, now_us: u64) {
+    if !rs.status_msg.is_empty() && !is_connection_status_msg(rs.status_msg.as_str()) {
+        return;
+    }
+    rs.status_msg.clear();
+    let _ = rs.status_msg.push_str(text);
+    rs.status_msg_color = StatusMsgColor::Amber;
+    rs.status_msg_clear_at_us = now_us.saturating_add(5_000_000);
+    rs.head_count = rs.head_count.wrapping_add(1);
+}
+
 /// 扫描到的 AP 简要信息
 #[derive(Clone, Debug)]
 pub struct WifiAp {
