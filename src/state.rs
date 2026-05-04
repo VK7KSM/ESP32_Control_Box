@@ -196,6 +196,7 @@ pub struct RadioState {
     // ===== rigctld 临时卫星 split 会话（每次连接重新采样 MAIN，不持久化） =====
     pub rigctld_sat_active: bool,
     pub rigctld_sat_split_enabled: bool,
+    pub rigctld_sat_paused: bool,        // 追星会话中电台链路可疑：保留连接但暂停物理注入
     pub rigctld_sat_rx_is_left: bool,
     pub rigctld_sat_tx_is_left: bool,
     pub rigctld_rx_pending_hz: Option<u64>,
@@ -309,6 +310,7 @@ impl RadioState {
             rigctld_target_hz: None,
             rigctld_sat_active: false,
             rigctld_sat_split_enabled: false,
+            rigctld_sat_paused: false,
             rigctld_sat_rx_is_left: true,
             rigctld_sat_tx_is_left: false,
             rigctld_rx_pending_hz: None,

@@ -176,6 +176,14 @@ fn freq_stepper_main(state: SharedState) {
             continue;
         }
 
+        let sat_paused = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.rigctld_sat_paused && s.rigctld_clients > 0 && s.rigctld_sat_active
+        };
+        if sat_paused {
+            continue;
+        }
+
         let sat_setup = {
             let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
             if !s.rigctld_sat_active || !s.rigctld_sat_split_enabled {
@@ -925,6 +933,14 @@ pub fn begin_sat_session(state: &SharedState, rx_is_left_at_accept: bool) -> u32
         s.rigctld_sql_close_left_pending = false;
         s.rigctld_sql_close_right_pending = false;
     }
+    if s.rigctld_sat_paused {
+        s.rigctld_sat_paused = false;
+        if s.status_msg.as_str() == "Radio Error" {
+            s.status_msg.clear();
+            s.status_msg_clear_at_us = 0;
+            s.head_count = s.head_count.wrapping_add(1);
+        }
+    }
     clear_pending_injections(&mut s);
     bind_sat_session(&mut s, rx_is_left_at_accept);
     session_id
@@ -935,6 +951,7 @@ fn bind_sat_session(s: &mut RadioState, rx_is_left: bool) {
     let pending_tone = s.rigctld_ctcss_tone;
     s.rigctld_sat_active = true;
     s.rigctld_sat_split_enabled = false;
+    s.rigctld_sat_paused = false;
     s.rigctld_sat_rx_is_left = rx_is_left;
     s.rigctld_sat_tx_is_left = tx_is_left;
     reset_sat_setup_state(s);
@@ -954,7 +971,13 @@ pub fn clear_sat_session(s: &mut RadioState) {
     reset_sat_setup_state(s);
     s.rigctld_sat_active = false;
     s.rigctld_sat_split_enabled = false;
+    s.rigctld_sat_paused = false;
     s.rigctld_setup_running = false;
+    if s.status_msg.as_str() == "Radio Error" {
+        s.status_msg.clear();
+        s.status_msg_clear_at_us = 0;
+        s.head_count = s.head_count.wrapping_add(1);
+    }
     s.rigctld_ctcss_tone = 0;
     s.rigctld_sql_close_left_pending = true;
     s.rigctld_sql_close_right_pending = true;

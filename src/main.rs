@@ -479,9 +479,10 @@ fn main() {
         // rigctld_clients 用于触发 freq_stepper setup，但 IP 颜色应仅反映 LAN 活动
         let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
         let rc_total = s.rigctld_clients;
-        let (left, right, alive, pc, ws, ip, smsg, scolor, ble_adv, ble_n, sap_a, sap_n) = (
+        let radio_display_alive = s.radio_alive && !s.rigctld_sat_paused;
+        let (left, right, pc, ws, ip, smsg, scolor, ble_adv, ble_n, sap_a, sap_n) = (
             s.left.clone(), s.right.clone(),
-            s.radio_alive, s.pc_alive,
+            s.pc_alive,
             s.wifi_state.clone(), s.wifi_ip.clone(),
             s.status_msg.clone(), s.status_msg_color,
             s.ble_advertising, s.ble_clients,
@@ -489,7 +490,7 @@ fn main() {
         );
         drop(s);
         let (init_time_str, init_time_color) = timesync::current_clock(&shared);
-        render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only,
+        render_main_ui_tiled(&mut fb, &left, &right, radio_display_alive, pc, &ws, ip.as_str(), tcp_only,
             smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total,
             init_time_str.as_str(), init_time_color);
     }
@@ -755,9 +756,10 @@ fn main() {
                 // tcp_only：仅 WiFi/TCP 客户端，排除 BLE（BLE 用 GATT 不用 IP）
                 let tcp_only = s.rigctld_clients.saturating_sub(s.ble_clients);
                 let rc_total = s.rigctld_clients;
-                let (left, right, alive, pc, ws, ip, smsg, scolor, ble_adv, ble_n, sap_a, sap_n) = (
+                let radio_display_alive = s.radio_alive && !s.rigctld_sat_paused;
+                let (left, right, pc, ws, ip, smsg, scolor, ble_adv, ble_n, sap_a, sap_n) = (
                     s.left.clone(), s.right.clone(),
-                    s.radio_alive, s.pc_alive,
+                    s.pc_alive,
                     s.wifi_state.clone(), s.wifi_ip.clone(),
                     s.status_msg.clone(), s.status_msg_color,
                     s.ble_advertising, s.ble_clients,
@@ -765,7 +767,7 @@ fn main() {
                 );
                 drop(s);
                 let (tstr, tcol) = timesync::current_clock(&shared);
-                render_main_ui_tiled(&mut fb, &left, &right, alive, pc, &ws, ip.as_str(), tcp_only,
+                render_main_ui_tiled(&mut fb, &left, &right, radio_display_alive, pc, &ws, ip.as_str(), tcp_only,
                     smsg.as_str(), scolor, ble_adv, ble_n, sap_a, sap_n, rc_total,
                     tstr.as_str(), tcol);
                 last_redraw_us = now_us;
@@ -773,23 +775,27 @@ fn main() {
                 // 关键：用 !real_change（不是 !any_change），否则 NTP 同步后 clock_tick 每秒
                 // 进入 if 分支跳过 else，no_data_ticks 永远不递增 → alive 永不超时变 false
                 no_data_ticks += 1;
-                // 仅在没有 rigctld 客户端时才超时置 alive=false
-                // rigctld 客户端（含 BLE）连接时认为电台一直 alive：
-                //   - DTrac 多阶段 setup 期间存在 10-30s 静默窗口（阶段间重试节流），
-                //     若此时 alive=false 会导致 inject_menu_set 的 Guard2 拒绝执行，
-                //     表现为"BLE 初始化卡死，需按机头键解除"
-                //   - 真正下行响应到达时 protocol::apply_to_state 会自动重置 alive=true
-                //   - 真正掉线场景：DTrac 自己会 timeout 报错，无需 ESP32 端探测
-                // Fix 4b：60s ungated alive 超时（独立于 15s gated 检查，覆盖外部 power-cycle 场景）
-                // 当客户端连着但电台被外部 power-cycle，15s gated 闸门让 alive 永真，无 alive 边沿
-                // → Fix 4a 不触发。60s ungated 阈值打破死锁，配合 Fix 4a 形成完整闭环。
-                // 60s 安全于 BLE 多阶段 setup 静默窗口（≤30s，CLAUDE.md 历史记录）
+                // 仅在没有 rigctld 客户端时才超时置 alive=false。
+                // 追星会话里 TH-9800 空闲本来就可能长期不发下行帧，不能用静默推断关机；
+                // 否则会制造 false→true 边沿触发 Fix 4a，让 DTrac/TCP/BLE 被错误断开。
+                // Fix 4b：追星会话 120s 静默只进入 Radio Error 暂停态：
+                //   - 保留 DTrac 连接，继续接收最新目标；
+                //   - 暂停物理注入，避免电台链路可疑时乱写；
+                //   - 有效下行帧恢复时由 protocol.rs 清除 Radio Error 并继续追星。
                 // 注意：放在 15s gated 检查之前（避免 borrow checker 抱怨 drop(s) 后的重借）
-                // 两个检查在不同 tick 触发（300 vs 1200），顺序不影响行为
-                if no_data_ticks == 1200 {  // 1200 × 50ms = 60s
-                    s.radio_alive = false;
+                // 两个检查在不同 tick 触发（300 vs 2400），顺序不影响行为
+                if no_data_ticks == 2400
+                    && s.rigctld_clients > 0
+                    && s.rigctld_sat_active
+                    && !s.rigctld_sat_paused
+                {  // 2400 × 50ms = 120s
+                    s.rigctld_sat_paused = true;
+                    s.status_msg.clear();
+                    let _ = s.status_msg.push_str("Radio Error");
+                    s.status_msg_color = state::StatusMsgColor::Amber;
+                    s.status_msg_clear_at_us = 0;
                     s.head_count = s.head_count.wrapping_add(1);
-                    ::log::info!("[Auto] 60s 无电台下行帧（rigctld_clients={}），强制设 alive=false",
+                    ::log::warn!("[Rigctld] 120s 无电台下行帧（clients={}，sat_active=1），暂停物理注入并显示 Radio Error",
                         s.rigctld_clients);
                 }
                 if no_data_ticks == 300 && s.rigctld_clients == 0 {  // 300 × 50ms = 15s

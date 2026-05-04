@@ -158,6 +158,15 @@ impl DownParser {
 
     /// 将完整帧解析并应用到 RadioState
     pub fn apply_to_state(&mut self, rs: &mut RadioState) {
+        if rs.rigctld_sat_paused {
+            rs.rigctld_sat_paused = false;
+            if rs.status_msg.as_str() == "Radio Error" {
+                rs.status_msg.clear();
+                rs.status_msg_clear_at_us = 0;
+            }
+            rs.head_count = rs.head_count.wrapping_add(1);
+            log::info!("[Rigctld] 电台下行帧恢复，清除 Radio Error，继续追星会话");
+        }
         rs.radio_alive = true;
         match self.payload_len {
             2 => {
