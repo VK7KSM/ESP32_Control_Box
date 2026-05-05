@@ -29,7 +29,9 @@ RE_REASON_FIN = re.compile(r"\[Rigctld\] 对端 TCP 正常关闭 .*handler_sessi
 RE_REASON_IDLE = re.compile(r"\[Rigctld\] 10s 无命令，关闭空闲 client .*handler_session=(?P<handler_session>\S+)")
 RE_REASON_ERR = re.compile(r"\[Rigctld\] 对端异常断开 kind=(?P<kind>\S+) err=(?P<err>.*?) handler_session=(?P<handler_session>\S+)")
 RE_TCP_REASON = re.compile(r"\[RigctldTCP\] peer=(?P<peer>\S+) close_reason=(?P<reason>\S+)(?: .*?)?handler_session=(?P<handler_session>\S+)")
-RE_TCP_IDLE = re.compile(r"\[RigctldTCP\] peer=(?P<peer>\S+) idle=(?P<idle_ms>\d+)ms handler_session=(?P<handler_session>\S+) waiting_for_command")
+RE_TCP_IDLE = re.compile(r"\[RigctldKeepalive\] peer=(?P<peer>\S+) idle=(?P<idle_ms>\d+)ms handler_session=None waiting_initial_command")
+RE_TCP_SESSION_IDLE = re.compile(r"\[RigctldKeepalive\] peer=(?P<peer>\S+) session_idle=(?P<idle_ms>\d+)ms handler_session=(?P<handler_session>\S+) tcp_keepalive_active")
+RE_TCP_KEEPALIVE_CFG = re.compile(r"\[RigctldKeepalive\] peer=(?P<peer>\S+) enable=(?P<enable>\S+) idle=(?P<idle_s>\d+)s\((?P<idle_ok>\S+)\) interval=(?P<interval_s>\d+)s\((?P<interval_ok>\S+)\) count=(?P<count>\d+)\((?P<count_ok>\S+)\) fd=(?P<fd>-?\d+)")
 RE_TCP_CMD = re.compile(r"\[RigctldTCP\] peer=(?P<peer>\S+) cmd_name=\"?(?P<cmd_name>[^\"\s]+)\"? stateful=(?P<stateful>\S+) since_last=(?P<since_last_ms>\d+)ms handler_session=(?P<handler_session>\S+)")
 RE_SESSION_START = re.compile(r"\[RigctldGate\].*启动 SatSession #(?P<session>\d+)")
 RE_SESSION_BIND = re.compile(r"\[SatSession #(?P<session>\d+)\] 绑定本次 DTrac 会话: RX=(?P<rx>\S+) TX=(?P<tx>[^（\s]+)")
@@ -37,7 +39,7 @@ RE_SETUP_EXHAUSTED = re.compile(r"\[SatGate #(?P<session>\d+)\] setup attempts e
 RE_GUARD2 = re.compile(r"\[MenuNav\] Guard2 fail #(?P<menu>\d+) alive=(?P<alive>\S+) tx=(?P<tx>\S+) busy=(?P<busy>\S+)")
 RE_U64_SESSION = re.compile(r"#(?P<session>\d+)")
 
-CRASH_MARKERS = ("Backtrace", "stack overflow", "panic", "abort", "CORRUPTED")
+CRASH_MARKERS = ("Backtrace", "stack overflow", "panic", "abort()", "abort() was called", "CORRUPTED")
 BOOT_MARKERS = ("ElfRadio HwNode 启动中", "cpu_start", "Rebooting")
 INTENTIONAL_RESTART_MARKER = "[PC通信] WiFi 凭据已写入 NVS，1 秒后重启"
 RIGCTLD_KEYWORDS = ("[Rigctld]", "[RigctldGate]", "[SatSession", "[SatGate", "[MenuNav]")
@@ -125,8 +127,14 @@ class EventDetector:
             ev = add("rigctld_disconnect_reason", "warn", {"reason": "tcp_error", **fields})
             self.last_disconnect_reason = ev
 
+        if m := RE_TCP_KEEPALIVE_CFG.search(parse_line):
+            add("rigctld_tcp_keepalive_config", "info", m.groupdict())
+
         if m := RE_TCP_IDLE.search(parse_line):
             add("rigctld_tcp_idle", "info", m.groupdict())
+
+        if m := RE_TCP_SESSION_IDLE.search(parse_line):
+            add("rigctld_tcp_keepalive_active", "info", m.groupdict())
 
         if m := RE_TCP_CMD.search(parse_line):
             add("rigctld_tcp_command", "info", m.groupdict())
@@ -257,8 +265,9 @@ REPORT_EVENTS = {
     "esp32_crash_marker",
     "intentional_restart",
     "rigctld_accept",
+    "rigctld_tcp_keepalive_config",
     "rigctld_tcp_idle",
-    "rigctld_tcp_command",
+    "rigctld_tcp_keepalive_active",
     "sat_session_started",
     "sat_session_bound",
     "rigctld_disconnect_reason",
@@ -562,13 +571,14 @@ def write_self_test_log(out_dir: Path) -> Path:
                 "I (1234) elfradio_hwnode: ElfRadio HwNode 启动中...",
                 "[Rigctld] 接受连接：192.168.2.208:43640 clients_before=0 session_before=0 RX采样=LEFT",
                 "[RigctldGate] cmd=\"F 145902500\" name=Some(\"set_freq\") 启动 SatSession #1",
+                "[RigctldKeepalive] peer=192.168.2.208:43640 enable=true idle=60s(true) interval=10s(true) count=6(true) fd=55",
                 "[RigctldTCP] peer=192.168.2.208:43640 cmd_name=\"F\" stateful=true since_last=1234ms handler_session=None",
-                "[RigctldTCP] peer=192.168.2.208:43640 idle=3002ms handler_session=Some(1) waiting_for_command",
+                "[RigctldKeepalive] peer=192.168.2.208:43640 session_idle=30002ms handler_session=Some(1) tcp_keepalive_active",
                 "[SatSession #1] 绑定本次 DTrac 会话: RX=LEFT TX=RIGHT（连接时 MAIN 作为 RX）",
                 "[MenuNav] Guard2 fail #28 alive=false tx=false busy=true",
                 "[SatGate #1] setup attempts exhausted",
-                "[RigctldTCP] peer=192.168.2.208:43640 close_reason=IDLE_NO_COMMAND_10S idle=10005ms handler_session=Some(1)",
-                "[Rigctld] 连接 192.168.2.208:43640 已关闭，reason=IDLE_NO_COMMAND_10S handler_session=Some(1) current_session=1 剩余 0 客户端",
+                "[RigctldTCP] peer=192.168.2.208:43640 close_reason=READ_ERROR kind=ConnectionAborted err=connection aborted handler_session=Some(1)",
+                "[Rigctld] 连接 192.168.2.208:43640 已关闭，reason=READ_ERROR handler_session=Some(1) current_session=1 剩余 0 客户端",
                 "***ERROR*** A stack overflow in task pthread has been detected.",
                 "[SatSession] 断开后 RX/TX SQL 关闭注入完成",
             ]

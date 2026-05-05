@@ -16,11 +16,15 @@
 // ===================================================================
 
 use crate::state::{set_connection_status_if_idle, BandState, RadioState, SharedState, WifiState};
-use esp_idf_svc::sys::esp_timer_get_time;
+use esp_idf_svc::sys::{
+    esp_timer_get_time, lwip_setsockopt, socklen_t, IPPROTO_TCP, SOL_SOCKET, SO_KEEPALIVE,
+    TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL,
+};
 use std::io::{BufRead, BufReader, Write};
 use std::io::ErrorKind;
 use std::time::Duration;
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -40,6 +44,10 @@ const SAT_GATE_LOG_INTERVAL_US: u64 = 5_000_000;
 const SAT_MISSING_TX_I_FALLBACK_US: u64 = 2_000_000;
 const TCP_IDLE_CLOSE_US: u64 = 10_000_000;
 const TCP_IDLE_LOG_STEP_US: u64 = 3_000_000;
+const TCP_SESSION_IDLE_LOG_US: u64 = 30_000_000;
+const TCP_KEEPALIVE_IDLE_SECS: i32 = 60;
+const TCP_KEEPALIVE_INTERVAL_SECS: i32 = 10;
+const TCP_KEEPALIVE_COUNT: i32 = 6;
 const TX_PLACEHOLDER_HZ: u64 = 0;
 const SAT_KEYBOARD_ACCEPT_HZ: u64 = 6_000;
 const SAT_REWRITE_THRESHOLD_HZ: u64 = SAT_KEYBOARD_ACCEPT_HZ;
@@ -48,6 +56,39 @@ const SAT_REWRITE_THRESHOLD_HZ: u64 = SAT_KEYBOARD_ACCEPT_HZ;
 struct RigctldClientEnd {
     handler_session_id: Option<u32>,
     reason: &'static str,
+}
+
+fn set_tcp_opt(fd: i32, level: u32, optname: u32, value: i32) -> bool {
+    let ret = unsafe {
+        lwip_setsockopt(
+            fd,
+            level as i32,
+            optname as i32,
+            (&value as *const i32).cast(),
+            core::mem::size_of::<i32>() as socklen_t,
+        )
+    };
+    ret == 0
+}
+
+fn configure_tcp_keepalive(stream: &TcpStream, peer: &str) {
+    let fd = stream.as_raw_fd();
+    let keepalive = set_tcp_opt(fd, SOL_SOCKET, SO_KEEPALIVE, 1);
+    let idle = set_tcp_opt(fd, IPPROTO_TCP, TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE_SECS);
+    let interval = set_tcp_opt(fd, IPPROTO_TCP, TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL_SECS);
+    let count = set_tcp_opt(fd, IPPROTO_TCP, TCP_KEEPCNT, TCP_KEEPALIVE_COUNT);
+    log::info!(
+        "[RigctldKeepalive] peer={} enable={} idle={}s({}) interval={}s({}) count={}({}) fd={}",
+        peer,
+        keepalive,
+        TCP_KEEPALIVE_IDLE_SECS,
+        idle,
+        TCP_KEEPALIVE_INTERVAL_SECS,
+        interval,
+        TCP_KEEPALIVE_COUNT,
+        count,
+        fd
+    );
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -623,7 +664,8 @@ fn rigctld_main(state: SharedState) {
 
 fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: bool, peer: String) -> RigctldClientEnd {
     let _ = stream.set_nodelay(true);
-    // 3s read timeout 用于轮询检查 stale session 和 TCP 空闲回收。
+    configure_tcp_keepalive(&stream, peer.as_str());
+    // 3s read timeout 只用于轮询 stale session、未建会话空连接和 keepalive 状态日志。
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     // ESP-IDF lwip 不可靠支持 TcpStream::try_clone()。改用单一 stream + BufReader 包装，
     // 通过 BufReader::get_mut() 写回原 stream（buffered read + raw write 共用同一句柄）
@@ -632,6 +674,7 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
     let mut line = String::new();
     let mut last_line_us = unsafe { esp_timer_get_time() } as u64;
     let mut last_idle_log_step: u64 = 0;
+    let mut last_session_idle_log_us: u64 = 0;
     let mut handler_session_id: Option<u32> = None;
 
     loop {
@@ -653,24 +696,32 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
                     }
                     let now_us = unsafe { esp_timer_get_time() } as u64;
                     let idle_us = now_us.saturating_sub(last_line_us);
-                    let idle_step = idle_us / TCP_IDLE_LOG_STEP_US;
-                    if idle_step > last_idle_log_step && idle_us < TCP_IDLE_CLOSE_US {
-                        last_idle_log_step = idle_step;
+                    if handler_session_id.is_none() {
+                        let idle_step = idle_us / TCP_IDLE_LOG_STEP_US;
+                        if idle_step > last_idle_log_step && idle_us < TCP_IDLE_CLOSE_US {
+                            last_idle_log_step = idle_step;
+                            log::info!(
+                                "[RigctldKeepalive] peer={} idle={}ms handler_session=None waiting_initial_command",
+                                peer,
+                                idle_us / 1000
+                            );
+                        }
+                        if idle_us >= TCP_IDLE_CLOSE_US {
+                            log::info!(
+                                "[RigctldTCP] peer={} close_reason=IDLE_NO_COMMAND_10S idle={}ms handler_session=None",
+                                peer,
+                                idle_us / 1000
+                            );
+                            return RigctldClientEnd { handler_session_id, reason: "IDLE_NO_COMMAND_10S" };
+                        }
+                    } else if now_us.saturating_sub(last_session_idle_log_us) >= TCP_SESSION_IDLE_LOG_US {
+                        last_session_idle_log_us = now_us;
                         log::info!(
-                            "[RigctldTCP] peer={} idle={}ms handler_session={:?} waiting_for_command",
+                            "[RigctldKeepalive] peer={} session_idle={}ms handler_session={:?} tcp_keepalive_active",
                             peer,
                             idle_us / 1000,
                             handler_session_id
                         );
-                    }
-                    if idle_us >= TCP_IDLE_CLOSE_US {
-                        log::info!(
-                            "[RigctldTCP] peer={} close_reason=IDLE_NO_COMMAND_10S idle={}ms handler_session={:?}",
-                            peer,
-                            idle_us / 1000,
-                            handler_session_id
-                        );
-                        return RigctldClientEnd { handler_session_id, reason: "IDLE_NO_COMMAND_10S" };
                     }
                     continue;
                 }
@@ -687,19 +738,22 @@ fn handle_client(stream: TcpStream, state: &SharedState, rx_is_left_at_accept: b
         if trimmed.is_empty() { continue; }
         let now_us = unsafe { esp_timer_get_time() } as u64;
         let since_last_ms = now_us.saturating_sub(last_line_us) / 1000;
-        last_line_us = unsafe { esp_timer_get_time() } as u64;
+        last_line_us = now_us;
         last_idle_log_step = 0;
+        last_session_idle_log_us = 0;
 
         let cmd_name = command_name(trimmed);
         let is_stateful = is_stateful_dtrac_command(trimmed);
-        log::info!(
-            "[RigctldTCP] peer={} cmd_name={:?} stateful={} since_last={}ms handler_session={:?}",
-            peer,
-            cmd_name,
-            is_stateful,
-            since_last_ms,
-            handler_session_id
-        );
+        if since_last_ms >= 3_000 || matches!(cmd_name, "q" | "quit" | "exit") {
+            log::info!(
+                "[RigctldTCP] peer={} cmd_name={:?} stateful={} since_last={}ms handler_session={:?}",
+                peer,
+                cmd_name,
+                is_stateful,
+                since_last_ms,
+                handler_session_id
+            );
+        }
         if let Some(id) = handler_session_id {
             if !handler_session_is_current(state, id) {
                 log::info!("[RigctldTCP] peer={} close_reason=STALE_SESSION_ON_CMD cmd={:?} handler_session={:?}", peer, trimmed, handler_session_id);
